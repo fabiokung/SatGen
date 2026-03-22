@@ -11,7 +11,7 @@ import cosmo as co
 import profiles as pr
 
 import numpy as np
-from scipy.interpolate import interp1d,interp2d
+from scipy.interpolate import interp1d,RegularGridInterpolator
 from scipy.optimize import brentq
 
 #########################################################################
@@ -91,18 +91,24 @@ mu_mstar_mesh_EPW18 = np.array([[1.39,1.87,2.35,2.83],
     [1.68,1.8,1.93,2.05]])
 eta_mstar_mesh_EPW18 = np.array([[1.39,1.87,2.35,2.83],
     [1.68,1.8,1.93,2.05]])
-lgxs_leff_interp_EPW18 = interp2d(alpha_grid_EPW18,lefflmax_grid_EPW18,
-    lgxs_leff_mesh_EPW18,kind='linear')
-mu_leff_interp_EPW18 = interp2d(alpha_grid_EPW18,lefflmax_grid_EPW18,
-    mu_leff_mesh_EPW18,kind='linear')
-eta_leff_interp_EPW18 = interp2d(alpha_grid_EPW18,lefflmax_grid_EPW18,
-    eta_leff_mesh_EPW18,kind='linear')
-lgxs_mstar_interp_EPW18 = interp2d(alpha_grid_EPW18,lefflmax_grid_EPW18,
-    lgxs_mstar_mesh_EPW18,kind='linear')
-mu_mstar_interp_EPW18 = interp2d(alpha_grid_EPW18,lefflmax_grid_EPW18,
-    mu_mstar_mesh_EPW18,kind='linear')
-eta_mstar_interp_EPW18 = interp2d(alpha_grid_EPW18,lefflmax_grid_EPW18,
-    eta_mstar_mesh_EPW18,kind='linear')
+lgxs_leff_interp_EPW18 = RegularGridInterpolator(
+    (lefflmax_grid_EPW18,alpha_grid_EPW18),lgxs_leff_mesh_EPW18,
+    method='linear',bounds_error=False,fill_value=None)
+mu_leff_interp_EPW18 = RegularGridInterpolator(
+    (lefflmax_grid_EPW18,alpha_grid_EPW18),mu_leff_mesh_EPW18,
+    method='linear',bounds_error=False,fill_value=None)
+eta_leff_interp_EPW18 = RegularGridInterpolator(
+    (lefflmax_grid_EPW18,alpha_grid_EPW18),eta_leff_mesh_EPW18,
+    method='linear',bounds_error=False,fill_value=None)
+lgxs_mstar_interp_EPW18 = RegularGridInterpolator(
+    (lefflmax_grid_EPW18,alpha_grid_EPW18),lgxs_mstar_mesh_EPW18,
+    method='linear',bounds_error=False,fill_value=None)
+mu_mstar_interp_EPW18 = RegularGridInterpolator(
+    (lefflmax_grid_EPW18,alpha_grid_EPW18),mu_mstar_mesh_EPW18,
+    method='linear',bounds_error=False,fill_value=None)
+eta_mstar_interp_EPW18 = RegularGridInterpolator(
+    (lefflmax_grid_EPW18,alpha_grid_EPW18),eta_mstar_mesh_EPW18,
+    method='linear',bounds_error=False,fill_value=None)
 def g_EPW18(x,alpha=1.,lefflmax=0.1):
     """
     Errani, Penerrubia, & Walker (2018) tidal tracks, i.e., the evolution
@@ -127,12 +133,12 @@ def g_EPW18(x,alpha=1.,lefflmax=0.1):
     
         l_eff(t)/l_eff(0), m_star(t)/m_star(0)
     """
-    xs_leff = 10.**lgxs_leff_interp_EPW18(alpha,lefflmax)
-    mu_leff = mu_leff_interp_EPW18(alpha,lefflmax)
-    eta_leff = eta_leff_interp_EPW18(alpha,lefflmax)
-    xs_mstar = 10.**lgxs_mstar_interp_EPW18(alpha,lefflmax)
-    mu_mstar = mu_mstar_interp_EPW18(alpha,lefflmax)
-    eta_mstar = eta_mstar_interp_EPW18(alpha,lefflmax)
+    xs_leff = 10.**lgxs_leff_interp_EPW18([[lefflmax,alpha]])[0]
+    mu_leff = mu_leff_interp_EPW18([[lefflmax,alpha]])[0]
+    eta_leff = eta_leff_interp_EPW18([[lefflmax,alpha]])[0]
+    xs_mstar = 10.**lgxs_mstar_interp_EPW18([[lefflmax,alpha]])[0]
+    mu_mstar = mu_mstar_interp_EPW18([[lefflmax,alpha]])[0]
+    eta_mstar = eta_mstar_interp_EPW18([[lefflmax,alpha]])[0]
     y_leff = (1.+xs_leff)/(x+xs_leff)
     y_mstar = (1.+xs_mstar)/(x+xs_mstar)
     return y_leff**mu_leff *x**eta_leff, y_mstar**mu_mstar *x**eta_mstar
