@@ -339,6 +339,8 @@ def ltidal(sp,potential,xv,choice='King62'):
     else: 
         sys.exit('Invalid choice of tidal radius type!')
 
+    if not np.isfinite(rhs):
+        return cfg.Rres
     fa = Findlt(a,sp,rhs)
     fb = Findlt(b,sp,rhs)
     if fa*fb>0.:
