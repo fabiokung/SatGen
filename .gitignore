@@ -5,4 +5,6 @@ FIGURE
 # we'll probably put FIGURE in eventually once we have some example figs
 test_*.py
 changelog
+.vscode/
 slurm/
+.venv/

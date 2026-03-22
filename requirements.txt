@@ -1,0 +1,7 @@
+numpy
+scipy
+lmfit
+fast_histogram
+# cosmolopy requires swig (brew install swig) and CFLAGS="-Wno-implicit-function-declaration" due to outdated C code
+# Install with: CFLAGS="-Wno-implicit-function-declaration" pip install cosmolopy
+cosmolopy
