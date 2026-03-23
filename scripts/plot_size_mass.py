@@ -2,8 +2,10 @@
 Plot size-mass relation (R_eff vs M_star) at z=0 from SatEvo output
 and compare to McConnachie+12 Local Group observed dwarfs.
 
+Satellites from multiple files are pooled for better statistics.
+
 Usage:
-    python scripts/plot_size_mass.py <sat_output.npz> [--save]
+    python scripts/plot_size_mass.py <sat_output.npz> [...] [--save]
 
 McConnachie+12 reference data is hardcoded from Table 1 of
 AJ 144 4 (2012) — a selection of well-measured Local Group dwarfs.
@@ -104,20 +106,28 @@ def load_infall_stellar(path):
     return ms_infall[valid], re_infall[valid]
 
 
-def main(path):
-    print(f"\nSize-mass relation: {path}\n")
-    mstar, reff = load_z0_satellites(path)
+def main(paths):
+    if isinstance(paths, str):
+        paths = [paths]
+    print(f"\nSize-mass relation: {', '.join(os.path.basename(p) for p in paths)}\n")
 
+    all_mstar, all_reff = [], []
     z0_label = 'z=0 (evolved)'
-    if mstar is None or len(mstar) == 0:
-        print("  No evolved satellites at z=0 — using infall stellar properties")
-        mstar, reff = load_infall_stellar(path)
-        z0_label = 'at infall (unevolved)'
+    for path in paths:
+        ms, re = load_z0_satellites(path)
+        if ms is None or len(ms) == 0:
+            ms, re = load_infall_stellar(path)
+            z0_label = 'at infall (unevolved)'
+        if ms is not None and len(ms) > 0:
+            all_mstar.append(ms)
+            all_reff.append(re)
 
-    if mstar is None:
-        print("  StellarMass or StellarSize not found in file.")
+    if not all_mstar:
+        print("  StellarMass or StellarSize not found in any file.")
         sys.exit(1)
 
+    mstar = np.concatenate(all_mstar)
+    reff = np.concatenate(all_reff)
     print(f"  N satellites ({z0_label}): {len(mstar)}")
 
     log_ms = np.log10(mstar)
@@ -152,7 +162,8 @@ def main(path):
 
     ax.set_xlabel(r'log$_{10}$(M$_\star$ / M$_\odot$)')
     ax.set_ylabel(r'log$_{10}$(R$_{\rm eff}$ / kpc)')
-    ax.set_title(f'Size-mass relation ({z0_label})\n{os.path.basename(path)}')
+    title_files = ', '.join(os.path.basename(p) for p in paths)
+    ax.set_title(f'Size-mass relation ({z0_label})\n{title_files}')
     ax.legend()
     ax.set_xlim(4, 12)
     ax.set_ylim(-2.5, 1.5)
@@ -171,7 +182,8 @@ if __name__ == '__main__':
     if '--help' in sys.argv or '-h' in sys.argv:
         print(__doc__)
         sys.exit(0)
-    if len(sys.argv) < 2 or sys.argv[1].startswith('--'):
-        print("Usage: python scripts/plot_size_mass.py <sat_output.npz> [--save]")
+    npz_files = [a for a in sys.argv[1:] if not a.startswith('--')]
+    if not npz_files:
+        print("Usage: python scripts/plot_size_mass.py <sat_output.npz> [...] [--save]")
         sys.exit(1)
-    main(sys.argv[1])
+    main(npz_files)
