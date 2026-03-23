@@ -1904,7 +1904,44 @@ def dIdx_Einasto(x,n):
     Integrand for the integral in the velocity dispersion of Einasto.
     """
     return gammainc(3.*n,x)/(np.exp(x)*x**(n+1.))
-        
+
+def _build_MN_Minterp(beta):
+    """
+    Build a normalized enclosed-mass spline for MN profiles with shape
+    ratio beta = b/a.  Returns an InterpolatedUnivariateSpline that maps
+    log10(xi) -> log10(f_norm(xi)), where xi = r/a and
+
+        M(r; Md, a, b) = Md * 10**interp(log10(r/a))
+
+    for any Md and a, as long as b/a == beta.  This allows the 100-point
+    quadrature build to be shared across all MN instances with the same
+    shape ratio instead of being repeated for every new instance.
+
+    Derivation: substituting z = a*xi*u and r = a*xi into the original
+    spherical-mass integral shows that the integral depends only on the
+    dimensionless variables xi and beta = b/a:
+
+        M(r) = Md * (-beta^2 * xi) * integral_0^1 h(u; xi, beta) du
+
+    where h is the dimensionless integrand below.
+    """
+    def h(u, xi):
+        Q = xi * np.sqrt(max(0., 1. - u**2))   # q/a  (q = in-plane offset)
+        X = np.sqrt((xi * u)**2 + beta**2)      # x/a  (x = sqrt(z^2+b^2)/a)
+        S = 1. + X                               # s/a  (s = a+x, normalised)
+        t = Q**2 / S**2
+        top    = S**3 * (-np.expm1(1.5 * np.log1p(t))) + Q**2
+        bottom = X**3 * (Q**2 + S**2)**1.5
+        return top / bottom
+
+    xi_grid = np.logspace(-3, 3.5, 100)
+    f_norm  = np.zeros(len(xi_grid))
+    for i, xi in enumerate(xi_grid):
+        integ, _ = quad(h, 0., 1., args=(xi,))
+        f_norm[i] = -beta**2 * xi * integ
+
+    return InterpolatedUnivariateSpline(np.log10(xi_grid), np.log10(f_norm))
+
 class MN(object):
     """
     Class that implements Miyamoto & Nagai (1975) disk profile:
@@ -1954,6 +1991,10 @@ class MN(object):
     HISTORY: Arthur Fangzhou Jiang (2016-11-03, HUJI)
              Arthur Fangzhou Jiang (2019-08-27, UCSC)
     """
+    # Class-level cache: shape ratio b/a -> normalized mass interpolator.
+    # Populated on first instantiation for each unique b/a value.
+    _Minterp_cache = {}
+
     def __init__(self,M,a,b):
         """
         Initialize Miyamoto-Nagai disk profile
@@ -1970,15 +2011,21 @@ class MN(object):
         """
         # input attributes
         self.Md = M
-        self.Mh = self.Md 
+        self.Mh = self.Md
         self.a = a
         self.b = b
         #
         # supportive attributes repeatedly used by following methods
         self.GMd = cfg.G * self.Md
 
-        # we build the mass profile interpolation lazily
-        self.Minterp = None
+        # Shared normalized mass interpolator keyed by shape ratio b/a.
+        # M(r; Md, a, b) = Md * 10**interp(log10(r/a)) for any Md, a
+        # with the same b/a, so the expensive 100-point quadrature build
+        # is paid only once per unique shape ratio across all instances.
+        ba_key = round(b / a, 10)
+        if ba_key not in MN._Minterp_cache:
+            MN._Minterp_cache[ba_key] = _build_MN_Minterp(b / a)
+        self._shared_Minterp = MN._Minterp_cache[ba_key]
 
     def s1sqr(self,z):
         """
@@ -2029,44 +2076,20 @@ class MN(object):
     def M(self,R,z=0.):
         """
         Mass [M_sun] within spherical radius r = sqrt(R^2 + z^2).
-            
+
         Syntax:
-        
-            .M(R,z=0):   
-        
+
+            .M(R,z=0):
+
         where
-                
+
             R: R-coordinate [kpc] (float or array)
             z: z-coordinate [kpc] (float or array)
-                (default=0., i.e., if z is not specified otherwise, the 
-                first argument R is also the halo-centric radius r)  
+                (default=0., i.e., if z is not specified otherwise, the
+                first argument R is also the halo-centric radius r)
         """
-        if not self.Minterp:
-            # lazy-build interpolator for spherically enclosed mass,
-            # which is not analytical calculable
-            # define the function, integrate it, interpolate
-            def integrand_1d(z, r):
-                q = np.sqrt(r**2 - z**2)
-                x = np.sqrt(z**2 + self.b**2)
-                s = self.a + x
-                t = q**2 / s**2
-                # Reformulation avoids catastrophic cancellation at r << b.
-                # top = s³ + a·q² − (q²+s²)^1.5 = s³·[1−(1+t)^1.5] + a·q²
-                # expm1/log1p give 1−(1+t)^1.5 accurately for all t ≥ 0.
-                top = s**3 * (-np.expm1(1.5 * np.log1p(t))) + self.a * q**2
-                bottom = x**3 * (q**2 + s**2)**1.5
-                return top / bottom
-            interp_rads = self.a * np.logspace(-3, 3.5, 100)
-            interp_mass = np.zeros(len(interp_rads))
-            for i in range(len(interp_rads)):
-                r = interp_rads[i]
-                interp_mass[i] = quad(lambda z: integrand_1d(z, r), 0, r)[0]
-            interp_mass *= (-1. * self.b**2 * self.Md)
-            self.Minterp = InterpolatedUnivariateSpline(np.log10(interp_rads),
-                                                        np.log10(interp_mass))
-
-        r = np.sqrt(R**2.+z**2.) 
-        return 10.**self.Minterp(np.log10(r))
+        r = np.sqrt(R**2.+z**2.)
+        return self.Md * 10.**self._shared_Minterp(np.log10(r / self.a))
     def rhobar(self,R,z=0.):
         """
         Average density [M_sun kpc^-3] within radius r = sqrt(R^2 + z^2). 
