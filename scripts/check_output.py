@@ -2,9 +2,10 @@
 Self-consistency checks on SatEvo output.
 
 Usage:
-    python scripts/check_output.py <sat_output.npz>
+    python scripts/check_output.py <sat_output.npz> [...]
 
-Prints PASS/FAIL for each check and exits with code 1 if any fail.
+Accepts one or more .npz files. Prints PASS/FAIL for each and exits with
+code 1 if any file fails.
 """
 
 import sys
@@ -153,14 +154,17 @@ def main(path):
         print("All checks passed.")
     else:
         print(f"{n_fail} check(s) FAILED.")
-        sys.exit(1)
+    return n_fail == 0
 
 
 if __name__ == '__main__':
     if '--help' in sys.argv or '-h' in sys.argv:
         print(__doc__)
         sys.exit(0)
-    if len(sys.argv) != 2:
-        print("Usage: python scripts/check_output.py <sat_output.npz>")
+    paths = [a for a in sys.argv[1:] if not a.startswith('--')]
+    if not paths:
+        print("Usage: python scripts/check_output.py <sat_output.npz> [...]")
         sys.exit(1)
-    main(sys.argv[1])
+    all_passed = all(main(p) for p in paths)
+    if not all_passed:
+        sys.exit(1)

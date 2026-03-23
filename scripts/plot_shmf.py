@@ -2,8 +2,10 @@
 Plot the subhalo mass function from SatEvo output and compare to N-body
 reference slope (~-1.9 from Springel+08 / Garrison-Kimmel+14).
 
+Satellites from multiple files are pooled for better statistics.
+
 Usage:
-    python scripts/plot_shmf.py <sat_output.npz> [--save]
+    python scripts/plot_shmf.py <sat_output.npz> [...] [--save]
 """
 
 import sys
@@ -61,24 +63,36 @@ def load_infall_subhalos(path):
     return sub_infall, host_mass
 
 
-def main(path):
-    print(f"\nSubhalo mass function: {path}\n")
-    sub_masses, host_mass = load_z0_subhalos(path)
+def main(paths):
+    if isinstance(paths, str):
+        paths = [paths]
+    print(f"\nSubhalo mass function: {', '.join(os.path.basename(p) for p in paths)}\n")
 
+    all_mu = []
+    host_masses = []
     z0_label = 'z=0 (evolved)'
-    if len(sub_masses) < 10:
-        print(f"  No evolved subhalos at z=0 (raw TreeGen input?) — using infall masses")
-        sub_masses, host_mass = load_infall_subhalos(path)
-        z0_label = 'at infall (unevolved)'
+    for path in paths:
+        sub_masses, host_mass = load_z0_subhalos(path)
+        if len(sub_masses) < 10:
+            sub_masses, host_mass = load_infall_subhalos(path)
+            z0_label = 'at infall (unevolved)'
+        if host_mass > 0:
+            all_mu.extend(sub_masses / host_mass)
+            host_masses.append(host_mass)
 
-    print(f"  Host mass at z=0: {host_mass:.2e} M_sun")
-    print(f"  N subhalos: {len(sub_masses)} ({z0_label})")
+    if not host_masses:
+        print("  No usable data found.")
+        sys.exit(1)
 
-    if len(sub_masses) < 10:
+    sub_masses = np.array(all_mu) * np.mean(host_masses)  # for display only
+    host_mass = np.mean(host_masses)
+    print(f"  Trees: {len(paths)}, mean host mass: {host_mass:.2e} M_sun")
+    print(f"  N subhalos total: {len(all_mu)} ({z0_label})")
+    mu = np.array(all_mu)
+
+    if len(mu) < 10:
         print("  Too few subhalos to fit SHMF. Run with a larger tree.")
         sys.exit(0)
-
-    mu = sub_masses / host_mass
 
     # Bin in log(mu)
     bins = np.logspace(-5, 0, 30)
@@ -115,7 +129,8 @@ def main(path):
         ax.loglog(mu_ref, norm * mu_ref**(-1.9), 'r:', label='Reference slope −1.9', lw=2)
     ax.set_xlabel('m / M_host')
     ax.set_ylabel('dN / d ln(m/M_host)')
-    ax.set_title(f'Subhalo mass function ({z0_label})\n{os.path.basename(path)}')
+    title_files = ', '.join(os.path.basename(p) for p in paths)
+    ax.set_title(f'Subhalo mass function ({z0_label})\n{title_files}')
     ax.legend()
     ax.set_xlim(1e-5, 1)
     plt.tight_layout()
@@ -133,7 +148,8 @@ if __name__ == '__main__':
     if '--help' in sys.argv or '-h' in sys.argv:
         print(__doc__)
         sys.exit(0)
-    if len(sys.argv) < 2 or sys.argv[1].startswith('--'):
-        print("Usage: python scripts/plot_shmf.py <sat_output.npz> [--save]")
+    npz_files = [a for a in sys.argv[1:] if not a.startswith('--')]
+    if not npz_files:
+        print("Usage: python scripts/plot_shmf.py <sat_output.npz> [...] [--save]")
         sys.exit(1)
-    main(sys.argv[1])
+    main(npz_files)

@@ -19,20 +19,16 @@ python -m pytest test_evolve_unit.py -v
 
 Covers: `g_P10`, `g_EPW18`, `ltidal`, `msub`, `Dekel2`.
 
-### Tier 2 — Integration test, MW-scale tree (~2–3 min total)
+### Tier 2 — Integration test, MW-scale trees (~5–10 min total)
 
 Generate the test fixture once (only needed when tree format changes):
 
 ```bash
-# In TreeGen.py, temporarily set:
-#   lgM0_lo = 12.0, lgM0_hi = 12.1, Ntree = 1
-#   outdir = 'test_data/'
 source .venv/bin/activate
-python TreeGen.py
-# Then rename/move: test_data/tree0_lgM12.*.npz → test_data/tree_mw_test.npz
+python TreeGen.py --ntree 4 --lgM0_lo 12.0 --lgM0_hi 12.1 --outdir test_data
 ```
 
-Run SatEvo on it (~30–60 sec):
+This writes `test_data/tree{0..3}_lgM12.0?.npz`. Run SatEvo on all 4 (~5 min):
 
 ```bash
 python SatEvo.py --datadir test_data/ --outdir test_data/sat_out/
@@ -41,7 +37,7 @@ python SatEvo.py --datadir test_data/ --outdir test_data/sat_out/
 Then validate output:
 
 ```bash
-python scripts/check_output.py test_data/sat_out/tree_mw_test.npz
+python scripts/check_output.py test_data/sat_out/tree*_lgM12.*.npz
 ```
 
 ### Tier 3 — Single-satellite tidal track plot (~10 sec)
@@ -60,10 +56,10 @@ Run all diagnostics on any SatEvo output file:
 
 ```bash
 source .venv/bin/activate
-python scripts/check_output.py     <sat_output.npz>   # self-consistency
-python scripts/plot_tidal_tracks.py                    # compare to paper fits
-python scripts/plot_shmf.py        <sat_output.npz>   # SHMF power law
-python scripts/plot_size_mass.py   <sat_output.npz>   # size-mass relation
+python scripts/check_output.py     <sat_output.npz> [...]   # self-consistency (one or more files)
+python scripts/plot_tidal_tracks.py                          # compare to paper fits
+python scripts/plot_shmf.py        <sat_output.npz> [...]   # SHMF power law
+python scripts/plot_size_mass.py   <sat_output.npz> [...]   # size-mass relation
 ```
 
 ---
@@ -103,6 +99,8 @@ References: Springel+08 (Aquarius), Garrison-Kimmel+14 (ELVIS)
 Plots `R_eff` vs `M_star` at z=0 for all satellites with `M_star > 0`.
 
 **Pass:** Median relation within ±0.5 dex of McConnachie+12 observed Local Group dwarfs across `M_star ∈ [10⁵, 10¹⁰] M_sun`.
+
+**Known limitation at low masses:** The Jiang+19 size formula (`R_eff = 0.02 (c/10)^-0.7 R_vir`, eq. 6) overestimates sizes by ~0.5–1 dex for ultra-faint dwarfs (log M_star < 7). It was calibrated for log M_halo ≳ 11 and is not expected to match MC12 ultra-faints. Additionally, the low-M_star objects in SatEvo output are stripped remnants of larger halos whose R_eff was set at infall (~0.2–0.5 kpc) and barely decreases during stripping (EPW18 tidal puffing), making the comparison with intrinsically-small observed dwarfs structurally unfair at the low-mass end.
 
 Reference: McConnachie+12, VizieR catalog J/AJ/144/4
 

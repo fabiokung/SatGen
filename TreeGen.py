@@ -17,9 +17,11 @@ import aux
 
 #---python modules
 import numpy as np
-import time 
+import time
 from multiprocessing import Pool, cpu_count
 import sys
+import argparse
+import os
 
 # <<< for clean on-screen prints, use with caution, make sure that 
 # the warning is not prevalent or essential for the result
@@ -29,18 +31,35 @@ warnings.filterwarnings("ignore", category=RuntimeWarning)
 ############################# user control ##############################
 
 #---target halo, desired resolution, number of trees
-lgM0_lo = 14.00
-lgM0_hi = 14.50
+_lgM0_lo_default = 14.00
+_lgM0_hi_default = 14.50
 z0 = 0.
 lgMres = 8.5
-Ntree = 24
+_Ntree_default = 24
 
 #---baryonic-effect choice and output control
 HaloResponse = 'NIHAO'
-outfile1 = './OUTPUT_TREE_CLUSTER_NIHAO/tree%i_lgM%.2f.npz'#%(itree,lgM0)
+_outdir_default = './OUTPUT_TREE_CLUSTER_NIHAO'
 
 #HaloResponse = 'APOSTLE'
-#outfile1 = './OUTPUT_TREE_CLUSTER_APOSTLE/tree%i_lgM%.2f.npz'#%(itree,lgM0)
+#_outdir_default = './OUTPUT_TREE_CLUSTER_APOSTLE'
+
+#---CLI overrides (allows fixture generation without editing this file)
+_parser = argparse.ArgumentParser(description='Generate EPS merger trees.')
+_parser.add_argument('--ntree', type=int, default=_Ntree_default,
+    help='Number of trees to generate (default: %i)' % _Ntree_default)
+_parser.add_argument('--lgM0_lo', type=float, default=_lgM0_lo_default,
+    help='Lower bound of log10(M0) range (default: %.2f)' % _lgM0_lo_default)
+_parser.add_argument('--lgM0_hi', type=float, default=_lgM0_hi_default,
+    help='Upper bound of log10(M0) range (default: %.2f)' % _lgM0_hi_default)
+_parser.add_argument('--outdir', default=_outdir_default,
+    help='Output directory (default: %s)' % _outdir_default)
+_args, _ = _parser.parse_known_args()
+
+lgM0_lo = _args.lgM0_lo
+lgM0_hi = _args.lgM0_hi
+Ntree   = _args.ntree
+outfile1 = os.path.join(_args.outdir, 'tree%i_lgM%.2f.npz')
 
 ############################### compute #################################
 
@@ -270,7 +289,8 @@ def loop(itree):
 
 #---for parallelization, comment for testing in serial mode
 if __name__ == "__main__":
-    pool = Pool(cpu_count()) # use all cores
+    os.makedirs(_args.outdir, exist_ok=True)
+    pool = Pool(min(Ntree, cpu_count()))
     pool.map(loop, range(Ntree))
 
 time_end = time.time() 
