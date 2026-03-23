@@ -8,10 +8,12 @@ Run with:
 
 import numpy as np
 import pytest
+from scipy.integrate import quad
+from scipy.interpolate import InterpolatedUnivariateSpline
 
 import config as cfg
 import evolve as ev
-from profiles import NFW, Dekel
+from profiles import NFW, Dekel, MN
 
 
 # ---------------------------------------------------------------------------
@@ -314,3 +316,84 @@ class TestDekel2:
         c2, D2 = ev.Dekel2(0.5 * mv0, mv0, lmax0, vmax0, alpha0, slope0, z=2.)
         # rho_crit is higher at z=2, so Delta should differ
         assert abs(D0 - D2) > 1.  # they shouldn't be identical
+
+
+# ---------------------------------------------------------------------------
+# MN.M tests — shared normalized interpolator
+# ---------------------------------------------------------------------------
+
+class TestMNMass:
+    """Tests for the MN disk enclosed-mass method and its per-shape-ratio cache."""
+
+    def _reference_M(self, disk, r):
+        """Recompute MN.M(r) via direct quadrature (the old per-instance approach)
+        for comparison against the new shared-interpolator implementation."""
+        a, b, Md = disk.a, disk.b, disk.Md
+
+        def integrand_1d(z, r_):
+            q = np.sqrt(r_**2 - z**2)
+            x = np.sqrt(z**2 + b**2)
+            s = a + x
+            t = q**2 / s**2
+            top = s**3 * (-np.expm1(1.5 * np.log1p(t))) + a * q**2
+            bottom = x**3 * (q**2 + s**2)**1.5
+            return top / bottom
+
+        interp_rads = a * np.logspace(-3, 3.5, 100)
+        interp_mass = np.zeros(len(interp_rads))
+        for i, ri in enumerate(interp_rads):
+            interp_mass[i] = quad(lambda z: integrand_1d(z, ri), 0, ri)[0]
+        interp_mass *= -b**2 * Md
+        ref_interp = InterpolatedUnivariateSpline(
+            np.log10(interp_rads), np.log10(interp_mass))
+        return 10.**ref_interp(np.log10(r))
+
+    def test_M_agrees_with_reference_at_multiple_radii(self):
+        """New shared-interp M(r) must match reference quadrature within 0.5%."""
+        disk = MN(1e10, 5., 0.2)
+        for r in [0.1, 1., 5., 20., 100., 500.]:
+            m_new = disk.M(r)
+            m_ref = self._reference_M(disk, r)
+            relerr = abs(m_new - m_ref) / m_ref
+            assert relerr < 0.005, \
+                f"MN.M({r}) relative error {relerr:.4f} exceeds 0.5%"
+
+    def test_M_monotone_increasing(self):
+        """Enclosed mass must increase with radius."""
+        disk = MN(5e10, 6.5, 0.26)
+        radii = np.logspace(-1, 3, 40)
+        masses = [disk.M(r) for r in radii]
+        diffs = np.diff(masses)
+        assert np.all(diffs > 0), "MN.M is not monotone increasing"
+
+    def test_M_scales_with_Md(self):
+        """M(r) must scale linearly with disk mass."""
+        r = 10.
+        d1 = MN(1e10, 5., 0.2)
+        d2 = MN(2e10, 5., 0.2)
+        ratio = d2.M(r) / d1.M(r)
+        assert abs(ratio - 2.0) < 0.001, f"M does not scale with Md: ratio={ratio}"
+
+    def test_cache_shared_for_same_ba(self):
+        """Two MN instances with same b/a but different Md and a should share the
+        same interpolator object (identical id)."""
+        d1 = MN(1e10, 5., 0.2)   # b/a = 0.04
+        d2 = MN(5e9, 10., 0.4)   # b/a = 0.04 — same shape ratio
+        assert d1._shared_Minterp is d2._shared_Minterp, \
+            "Interpolators not shared despite identical b/a ratio"
+
+    def test_cache_distinct_for_different_ba(self):
+        """Different b/a ratios must produce distinct interpolators."""
+        d1 = MN(1e10, 5., 0.2)   # b/a = 0.04
+        d2 = MN(1e10, 5., 0.5)   # b/a = 0.10
+        assert d1._shared_Minterp is not d2._shared_Minterp, \
+            "Interpolators incorrectly shared across different b/a ratios"
+
+    def test_M_scales_with_a(self):
+        """M(r) at r=a should be a fixed fraction of Md for a given b/a."""
+        for a in [1., 5., 20.]:
+            disk = MN(1e10, a, a * 0.04)
+            m_at_a  = disk.M(a)
+            m_at_5a = disk.M(5 * a)
+            # At r=a, enclosed mass should be ~O(0.1) Md for typical b/a
+            assert 0. < m_at_a < m_at_5a < 1e10
