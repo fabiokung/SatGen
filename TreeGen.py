@@ -81,7 +81,7 @@ def loop(itree):
     
     mass = np.zeros((cfg.Nmax,cfg.Nz)) - 99.
     order = np.zeros((cfg.Nmax,cfg.Nz),np.int8) - 99
-    ParentID = np.zeros((cfg.Nmax,cfg.Nz),np.int16) - 99
+    ParentID = np.zeros((cfg.Nmax,cfg.Nz),np.int32) - 99
     
     VirialRadius = np.zeros((cfg.Nmax,cfg.Nz),np.float32) - 99.
     concentration = np.zeros((cfg.Nmax,cfg.Nz),np.float32) - 99.
