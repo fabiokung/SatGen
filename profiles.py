@@ -2048,9 +2048,13 @@ class MN(object):
             def integrand_1d(z, r):
                 q = np.sqrt(r**2 - z**2)
                 x = np.sqrt(z**2 + self.b**2)
-                top = self.a**3 + self.a*q**2 + 3.*x*self.a**2 + 3.*self.a*x**2 +\
-                        x**3 - (q**2 + (self.a + x)**2)**(1.5)
-                bottom = x**3 * (q**2 + (self.a + x)**2)**1.5
+                s = self.a + x
+                t = q**2 / s**2
+                # Reformulation avoids catastrophic cancellation at r << b.
+                # top = s³ + a·q² − (q²+s²)^1.5 = s³·[1−(1+t)^1.5] + a·q²
+                # expm1/log1p give 1−(1+t)^1.5 accurately for all t ≥ 0.
+                top = s**3 * (-np.expm1(1.5 * np.log1p(t))) + self.a * q**2
+                bottom = x**3 * (q**2 + s**2)**1.5
                 return top / bottom
             interp_rads = self.a * np.logspace(-3, 3.5, 100)
             interp_mass = np.zeros(len(interp_rads))
