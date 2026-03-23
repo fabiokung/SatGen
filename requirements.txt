@@ -1,7 +1,10 @@
-numpy
-scipy
-lmfit
-fast_histogram
+numpy==2.4.3
+scipy==1.17.1
+lmfit==1.3.4
+fast_histogram==0.14
 # cosmolopy requires swig (brew install swig) and CFLAGS="-Wno-implicit-function-declaration" due to outdated C code
 # Install with: CFLAGS="-Wno-implicit-function-declaration" pip install cosmolopy
-cosmolopy
+cosmolopy==0.4.1
+
+# Visualization (used by scripts/ and test_evolve.py)
+matplotlib==3.10.8
