@@ -18,8 +18,9 @@ import aux
 
 import numpy as np
 import sys
-import os 
-import time 
+import os
+import argparse
+import time
 from multiprocessing import Pool, cpu_count
 
 # <<< for clean on-screen prints, use with caution, make sure that 
@@ -30,21 +31,25 @@ warnings.filterwarnings("ignore", category=RuntimeWarning)
 ########################### user control ################################
 
 fd = 0.1 # <<< play with, disk mass fraction: no disk potential if 0
-flattening = 25. # disk scale radius / disk scale height  
+flattening = 25. # disk scale radius / disk scale height
 fb = 0.0 # <<< play with, bulge mass fraction: no bulge potential if 0
 
-datadir = "./OUTPUT_TREE_MW_NIHAO/" 
-#outdir = "./OUTPUT_SAT_MW_fd%.2f_fb%.2f_NIHAO/"%(fd,fb)
-#outdir = "./OUTPUT_SAT_MW_fd%.2f_fb%.2f_NIHAO_EnhancedDF/"%(fd,fb)
-#outdir = "./OUTPUT_SAT_MW_fd%.2f_fb%.2f_NIHAO_WeakenedDF/"%(fd,fb)
-outdir = "./OUTPUT_SAT_MW_fd%.2f_fb%.2f_NIHAO_ZeroDiskDF/"%(fd,fb)
-#datadir = "./OUTPUT_TREE_MW_APOSTLE/" 
-#outdir = "./OUTPUT_SAT_MW_fd%.2f_fb%.2f_APOSTLE/"%(fd,fb)
+_default_datadir = "./OUTPUT_TREE_CLUSTER_NIHAO/"
+_default_outdir  = "./OUTPUT_SAT_CLUSTER_fd%.2f_fb%.2f_NIHAO_ZeroDiskDF/" % (fd, fb)
+#_default_datadir = "./OUTPUT_TREE_MW_APOSTLE/"
+#_default_outdir  = "./OUTPUT_SAT_MW_fd%.2f_fb%.2f_APOSTLE/" % (fd, fb)
+#_default_datadir = "./OUTPUT_TREE_GROUP_NIHAO/"
+#_default_outdir  = "./OUTPUT_SAT_GROUP_NIHAO/"
 
-#datadir = "./OUTPUT_TREE_GROUP_NIHAO/" 
-#outdir = "./OUTPUT_SAT_GROUP_NIHAO/"
-#datadir = "./OUTPUT_TREE_GROUP_APOSTLE/" 
-#outdir = "./OUTPUT_SAT_GROUP_APOSTLE/"
+_parser = argparse.ArgumentParser(description='Evolve SatGen satellites.')
+_parser.add_argument('--datadir', default=_default_datadir,
+    help='Directory containing TreeGen .npz files (default: %s)' % _default_datadir)
+_parser.add_argument('--outdir', default=_default_outdir,
+    help='Output directory for evolved .npz files (default: %s)' % _default_outdir)
+_args, _ = _parser.parse_known_args()
+
+datadir = _args.datadir
+outdir  = _args.outdir
 
 cfg.Mres = 1e6 # <<< using that in TreeGen.py is enough
 cfg.Rres = 0.01 # [kpc] <<< use 0.001 if want to resolve UCDs
