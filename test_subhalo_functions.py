@@ -400,3 +400,53 @@ class TestHeatProfile:
         huge_eps = 1e10 * cfg.G * p.Mh / p.rh
         with pytest.raises(RuntimeError, match="unbinds"):
             heat_profile(p, eps=lambda r: huge_eps * r**2)
+
+    def _stripping_eps(self, p):
+        """Energy injection that grows steeply with r, unbinding outer shells while
+        keeping inner shells bound.  eps(r) = 0.6 * (G Mh / rh) * (r/rh)^2."""
+        G, Mh, rh = cfg.G, p.Mh, p.rh
+        return lambda r: 0.6 * G * Mh / rh * (r / rh) ** 2
+
+    def test_no_zero_mass_shells_in_bound_region(self, small_nfw_profile):
+        """Every consecutive pair of shells in the output must carry positive mass
+        (no flat spot in the cumulative mass profile inside the bound region)."""
+        p = small_nfw_profile
+        result = heat_profile(p, self._stripping_eps(p))
+        shell_masses = np.diff(result.Mr)
+        assert np.all(shell_masses > 0), (
+            "Zero-mass shell(s) inside bound region at indices: "
+            f"{np.where(shell_masses <= 0)[0]}"
+        )
+
+    def test_only_outer_shells_unbound(self, small_nfw_profile):
+        """Bound shells must form a contiguous inner block — no unbound shell
+        sandwiched between two bound shells.
+
+        We reconstruct the bound/unbound decision on the *output* grid using
+        the same eps and the same energy formula as heat_profile itself:
+            Ef = G * Menc / r * (-1 + 2*eps(r)*r/(G*Menc))
+        and verify that once a shell is unbound, all shells at larger r are
+        also unbound (i.e. the bound set is a prefix of the sorted shell list)."""
+        p = small_nfw_profile
+        eps = self._stripping_eps(p)
+        result = heat_profile(p, eps)
+
+        G = cfg.G
+        ri = result.ri
+        Menc = result.Mr
+
+        Mshell = np.empty_like(Menc)
+        Mshell[0] = Menc[0]
+        Mshell[1:] = np.diff(Menc)
+
+        perturb = np.where(Menc > 0, 2.0 * eps(ri) * ri / (G * Menc), 0.0)
+        Ef = G * Menc / ri * (-1.0 + perturb)
+        bound = (Ef < 0) & (Mshell > 0)
+
+        if bound.any():
+            last_bound_idx = int(np.max(np.where(bound)[0]))
+            interior = bound[:last_bound_idx]
+            assert np.all(interior), (
+                "Unbound shell(s) sandwiched inside bound region at indices: "
+                f"{np.where(~interior)[0]}"
+            )

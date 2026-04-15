@@ -1,12 +1,12 @@
 # SatGen imports
-import config as cfg
-
 # other imports
 import numpy as np
-from scipy.optimize import brentq, minimize
-from scipy.interpolate import InterpolatedUnivariateSpline
-from scipy.integrate import quad
 from scipy.differentiate import derivative
+from scipy.integrate import quad
+from scipy.interpolate import InterpolatedUnivariateSpline
+from scipy.optimize import brentq, minimize
+
+import config as cfg
 
 
 def tidalTensor(hostProfile, coords):
@@ -29,14 +29,14 @@ class NumericProfile(object):
         self.rhovals = derivative(self.MInt, self.ri).df/(4.0*np.pi*self.ri**2)
         self.rhoInt = InterpolatedUnivariateSpline(self.ri, self.rhovals, ext='zeros')
 
-        self.rmax = minimize(lambda x: -self.Vcirc(x), self.rh/2., method='L-BFGS-B', bounds=((0.1,self.rh),)).x[0]
+        self.rmax = minimize(lambda x: -self.Vcirc(x), self.rh/2., method='L-BFGS-B', bounds=((self.ri[0],self.rh),)).x[0]
         self.Vmax = self.Vcirc(self.rmax)
-    
+
     def rho(self, R, z=0.):
         r = np.sqrt(R**2 + z**2)
 
         return self.rhoInt(r)
-    
+
     def M(self, R, z=0.):
         r = np.sqrt(R**2 + z**2)
 
@@ -45,10 +45,10 @@ class NumericProfile(object):
     def rhobar(self, R, z=0.):
         r = np.sqrt(R**2.+z**2.)
         return self.M(r)/(cfg.FourPiOverThree*r**3)
-    
+
     def tdyn(self,R,z=0.):
         return np.sqrt(cfg.ThreePiOverSixteenG / self.rhobar(R,z))
-    
+
     def Phi(self,R,z=0.):
         r = np.sqrt(R**2.+z**2.)
         #phi1 = -cfg.G*self.M(r)/r
@@ -64,16 +64,16 @@ class NumericProfile(object):
             phi2 = -cfg.G*quad(lambda x: self.M(x)/x**2, r, self.rh)[0]
 
         return phi1 + phi2
-    
+
     def fgrav(self,R):
         r = np.sqrt(R**2.+z**2.)
         fac = -cfg.G*self.M(r)/r**2
         return fac*R/r, 0, fac*z/r
-    
+
     def Vcirc(self,R,z=0.):
         r = np.sqrt(R**2 + z**2)
         return np.sqrt(cfg.G*self.M(r)/r)
-    
+
     def sigma(self,R,z=0.):
         r = np.sqrt(R**2.+z**2.)
         if isinstance(r,list) or isinstance(r,np.ndarray):
@@ -85,7 +85,7 @@ class NumericProfile(object):
             integ = cfg.G*quad(lambda x: self.rho(x)*self.M(x)/x**2,r,self.rh)[0]
         return np.sqrt(integ/self.rho(r))
 
-def heat_profile(profile, eps, count_per_decade=100):
+def heat_profile(profile: NumericProfile, eps, count_per_decade=100):
     """
     Apply monotonic heating algorithm to a NumericProfile.
 
@@ -181,6 +181,7 @@ def heat_profile(profile, eps, count_per_decade=100):
 
     # --------------------------------------------------
     # Sort by radius (important after shell expansion)
+    # TODO(Fabio): Investigate further. This is suspicious, it indicates there can be shell crossing.
     # --------------------------------------------------
     order = np.argsort(r_bound)
 
