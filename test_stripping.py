@@ -13,7 +13,7 @@ import config as cfg
 from profiles import NFW, Vcirc as standalone_Vcirc, tdyn as standalone_tdyn
 import stripping_common as sc
 from stripping_common import EvolutionResult
-from subhalo_functions import NumericProfile, SIS, heat_profile
+from subhalo_functions import NumericProfile, SIS, heat_profile, _log_pchip
 
 
 # ---------------------------------------------------------------------------
@@ -595,3 +595,132 @@ class TestInterpolatorEdgeCases:
         assert np.isfinite(p.rmax)
         assert p.rmax < 0.5 * ri_ext[-1]
         assert p.rmax > ri[0]
+
+
+# ---------------------------------------------------------------------------
+# log-log PCHIP behaviour (cusp accuracy + boundary contracts)
+# ---------------------------------------------------------------------------
+
+class TestLogPCHIP:
+    """Power laws are straight lines in log-log, so log-PCHIP is exact for
+    them between knots. Linear-axis PCHIP carries O(h^2) inter-knot error
+    on the same data. These tests pin that distinction down on the
+    quantities we actually care about (M cusps, rho cusps), the boundary
+    contract for queries outside the knot range, and the zero-tail
+    handling rho needs after stripping."""
+
+    def test_M_power_law_exactness(self):
+        """M = r^2 on 20 log-knots: log-PCHIP rel error < 1e-12 at log
+        midpoints; linear PCHIP > 1e-3 (regression detector that flips if
+        someone reverts the wrap)."""
+        from scipy.interpolate import PchipInterpolator
+        ri = np.logspace(-3, 1, 20)
+        Mr = ri**2
+        f_log = _log_pchip(ri, Mr)
+        f_lin = PchipInterpolator(ri, Mr, extrapolate=False)
+        r_mid = np.sqrt(ri[:-1] * ri[1:])
+        truth = r_mid**2
+        err_log = np.max(np.abs(f_log(r_mid) - truth) / truth)
+        err_lin = np.max(np.abs(f_lin(r_mid) - truth) / truth)
+        assert err_log < 1e-12, f"log-PCHIP rel error {err_log:.3e} too large"
+        assert err_lin > 1e-3, f"linear PCHIP rel error {err_lin:.3e} unexpectedly small"
+
+    def test_rho_cusp_reproduction(self):
+        """rho ~ r^-1.5 on 30 log-knots: log-PCHIP rel error < 1e-10 at
+        log midpoints. Linear PCHIP visibly worse (>= 1e-2 on the steepest
+        decade), so the cusp slope at the innermost knots is the practical
+        win."""
+        from scipy.interpolate import PchipInterpolator
+        ri = np.logspace(-3, 1, 30)
+        rho = ri**(-1.5)
+        f_log = _log_pchip(ri, rho)
+        f_lin = PchipInterpolator(ri, rho, extrapolate=False)
+        r_mid = np.sqrt(ri[:-1] * ri[1:])
+        truth = r_mid**(-1.5)
+        err_log = np.max(np.abs(f_log(r_mid) - truth) / truth)
+        err_lin_inner = np.max(np.abs(f_lin(r_mid[:5]) - truth[:5]) / truth[:5])
+        assert err_log < 1e-10, f"log-PCHIP rel error {err_log:.3e}"
+        assert err_lin_inner > 1e-2, (
+            f"linear PCHIP cusp error {err_lin_inner:.3e} unexpectedly small"
+        )
+
+    def test_M_boundary_clamps_preserved(self):
+        """M(0.5*ri[0]) returns M(ri[0]); M(2*ri[-1]) returns Mh. With the
+        wrap helper handling the clamp, NumericProfile.M no longer needs
+        np.clip — confirm the contract still holds end-to-end."""
+        ri = np.logspace(-3, np.log10(0.1), 50)
+        Mr = ri**0.5
+        p = NumericProfile(ri, Mr)
+        m_below = float(p.M(0.5 * p.ri[0]))
+        m_above = float(p.M(2.0 * p.ri[-1]))
+        assert np.isfinite(m_below) and np.isfinite(m_above)
+        # below: returns the first masked y (typically Mr[0] when all knots positive)
+        assert abs(m_below - float(p.MInt(p.ri[0]))) < 1e-12
+        # above: returns Mh
+        assert abs(m_above - p.Mh) < 1e-9 * p.Mh
+
+    def test_rho_boundary_returns_zero(self):
+        """rho query outside [ri[0], ri[-1]] returns 0 — clamp_below='zero'
+        and clamp_above='zero' carry through. NaN here would propagate
+        into ev.ltidal and the rmax root-finder."""
+        ri = np.logspace(-3, np.log10(0.1), 50)
+        sat = NFW(1e6, 10.)
+        Mr = sat.M(ri)
+        p = NumericProfile(ri, Mr)
+        assert float(p.rho(p.ri[-1] * 2.)) == 0.
+        assert float(p.rho(p.ri[0] * 0.5)) == 0.
+
+    def test_rho_zero_tail_preserved(self):
+        """A profile with rho == 0 on the outer 30% of knots must read
+        zero in the tail. leading_only=True restricts the log-PCHIP to the
+        leading positive run; everything past the first zero clamps to 0."""
+        ri = np.logspace(-3, -1, 100)
+        # cusp + sharp truncation at 70% of the knot range
+        cut = int(0.7 * len(ri))
+        Mr = np.zeros_like(ri)
+        Mr[:cut] = ri[:cut]**2
+        Mr[cut:] = Mr[cut - 1]
+        p = NumericProfile(ri, Mr)
+        rho_tail = p.rho(ri[cut + 5:])
+        assert np.all(rho_tail == 0.), f"rho tail not zero, max={rho_tail.max():.3e}"
+        # cusp interior still gets log-PCHIP accuracy
+        rho_inner = p.rho(ri[10:20])
+        assert np.all(rho_inner > 0.)
+
+    def test_M_convergence_rate_flat(self):
+        """M = r^2.5 on N ∈ {10, 20, 40, 80} log-knots. log-PCHIP error is
+        roundoff-flat (~1e-13); linear PCHIP error scales ~h^2. The flatness
+        is the strongest single argument for the change."""
+        from scipy.interpolate import PchipInterpolator
+        Ns = [10, 20, 40, 80]
+        errs_log, errs_lin = [], []
+        for N in Ns:
+            ri = np.logspace(-3, 1, N)
+            Mr = ri**2.5
+            r_mid = np.sqrt(ri[:-1] * ri[1:])
+            truth = r_mid**2.5
+            f_log = _log_pchip(ri, Mr)
+            f_lin = PchipInterpolator(ri, Mr, extrapolate=False)
+            errs_log.append(np.max(np.abs(f_log(r_mid) - truth) / truth))
+            errs_lin.append(np.max(np.abs(f_lin(r_mid) - truth) / truth))
+        # log: flat at machine precision across all N
+        assert max(errs_log) < 1e-10, f"log-PCHIP errs not flat: {errs_log}"
+        # linear: error halves (or better) when N doubles — confirms ~h^2 scaling
+        assert errs_lin[0] / errs_lin[-1] > 16., (
+            f"linear PCHIP did not converge as expected: {errs_lin}"
+        )
+
+    def test_heat_profile_first_shell_no_log_blowup(self):
+        """heat_profile's final rebin uses log-PCHIP on (r_bound, M_bound)
+        from cumsum. If the first shell carries a tiny mass relative to the
+        rest, log(M_bound[0]) is very negative — the rebin grid starts at
+        r_bound[0] so the helper never extrapolates. Pin this behaviour
+        with a profile that exposes it (NFW with extreme inner resolution)."""
+        ri = np.logspace(-5, np.log10(0.5), 200)  # innermost shell << rest
+        sat = NFW(1e6, 10.)
+        p = NumericProfile(ri, sat.M(ri))
+        def eps(r): return 0.1 * r**2
+        h = heat_profile(p, eps)
+        assert np.all(np.isfinite(h.Mr))
+        assert np.all(h.Mr >= 0.)
+        assert np.all(np.diff(h.Mr) >= -1e-9 * h.Mh)

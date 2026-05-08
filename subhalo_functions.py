@@ -74,6 +74,54 @@ class SIS(object):
         return np.sqrt(self.sigma_v2 * np.maximum(1. - (r/self.rh)**2., 0.))
 
 
+def _log_pchip(x, y, eps_rel=1e-30, clamp_below='value', clamp_above='value',
+               leading_only=False):
+    """log-log PCHIP on positive (x, y). Power-law inputs become straight
+    lines in log-log so PCHIP is exact between knots — useful for cusps
+    (M ~ r^2-3, rho ~ r^-1.5) where linear PCHIP carries O(h^2) error.
+
+    Returns None when the data has fewer than 2 strictly-positive knots
+    (above eps_rel * y.max()); the caller can then fall back to linear
+    PCHIP. Queries outside [x_inside[0], x_inside[-1]] are clamped — never
+    extrapolated. clamp_below/clamp_above: 'value' returns the boundary y;
+    'zero' returns 0.
+
+    leading_only=True restricts the support to the leading positive run
+    (truncates at the first zero/below-eps knot). For rho this preserves
+    interior plateaus exactly: any region after the first dM/dr=0 reads
+    as clamp_above. Real heated profiles are monotone so this is a no-op;
+    synthetic profiles with interior plateaus get the right zero floor.
+    """
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    if y.size == 0 or y.max() <= 0.:
+        return None
+    pos = y > eps_rel * y.max()
+    mask = (np.cumprod(pos.astype(int)) > 0) if leading_only else pos
+    if mask.sum() < 2:
+        return None
+    xm, ym = x[mask], y[mask]
+    pchip = PchipInterpolator(np.log(xm), np.log(ym), extrapolate=False)
+    x_lo, x_hi = float(xm[0]), float(xm[-1])
+    y_lo, y_hi = float(ym[0]), float(ym[-1])
+    lo_val = y_lo if clamp_below == 'value' else 0.
+    hi_val = y_hi if clamp_above == 'value' else 0.
+
+    def f(r):
+        scalar_in = np.ndim(r) == 0
+        r_arr = np.atleast_1d(np.asarray(r, dtype=float))
+        out = np.empty_like(r_arr)
+        below = r_arr < x_lo
+        above = r_arr > x_hi
+        inside = ~(below | above)
+        if inside.any():
+            out[inside] = np.exp(pchip(np.log(r_arr[inside])))
+        out[below] = lo_val
+        out[above] = hi_val
+        return out.item() if scalar_in else out
+    return f
+
+
 def tidalTensor(hostProfile, coords):
     x,y,z = coords
     r = np.sqrt(x**2+y**2+z**2)
@@ -89,25 +137,23 @@ class NumericProfile(object):
         self.rh = np.max(ri)
         self.Mh = np.max(Mr)
 
-        # PCHIP throughout for the data-driven M and rho splines. Cubic
-        # InterpolatedUnivariateSpline on the heated+stripped profiles we
-        # feed in here was producing artefacts at every boundary we hit:
-        # overshoot above max(Mr) just inside rh (per-step ~1e-4 leak that
-        # compounded into many-fold mass growth over thousands of steps),
-        # ringing on the steep ramp+plateau shape that produced negative
-        # M(r) interior shells, and natural-BC flattening of dM/dr at rh
-        # that gave a 5x-too-low rho at the outer knot. PCHIP is
-        # monotone-preserving and stays within [Mr.min(), Mr.max()] on
-        # monotone input — exactly the invariant we need.
-        self.MInt = PchipInterpolator(self.ri, self.Mr, extrapolate=False)
+        # log-log PCHIP for M and rho. Power-law cusps (M ~ r^2-3,
+        # rho ~ r^-1.5) become straight lines in log-log so PCHIP is exact
+        # between knots; linear-axis PCHIP carries O(h^2) error there.
+        # Fall back to linear PCHIP on degenerate inputs (all-zero,
+        # fewer-than-2 positive knots).
+        self.MInt = (_log_pchip(self.ri, self.Mr)
+                     or PchipInterpolator(self.ri, self.Mr, extrapolate=False))
         # density from a finite-difference dM/dr (np.gradient: 2nd-order
         # central interior, one-sided at the ends). Spline-derivative rho
-        # was the original source of the ringing on near-flat M(r) regions
-        # (most mass concentrated in a narrow shell post-heating); FD is
-        # exact on plateaus and consistent with the boundary values.
+        # rings on near-flat M(r) regions (most mass concentrated in a
+        # narrow shell post-heating); FD is exact on plateaus.
         dMdr = np.gradient(self.Mr, self.ri)
         self.rhovals = np.maximum(dMdr, 0.) / (4.0*np.pi*self.ri**2)
-        self.rhoInt = PchipInterpolator(self.ri, self.rhovals, extrapolate=False)
+        self.rhoInt = (_log_pchip(self.ri, self.rhovals,
+                                  clamp_below='zero', clamp_above='zero',
+                                  leading_only=True)
+                       or PchipInterpolator(self.ri, self.rhovals, extrapolate=False))
 
         # rmax / Vmax via root-finding of f(r) = 4*pi*r^3*rho - M = 0,
         # the dVc/dr = 0 condition. Argmax of Vc on a discrete grid is not
@@ -148,7 +194,9 @@ class NumericProfile(object):
         cumint = F(self.ri[-1]) - F(self.ri)
         sig2_vals = np.zeros_like(self.rhovals)
         np.divide(cfg.G * cumint, self.rhovals, out=sig2_vals, where=self.rhovals > 0)
-        self._sig2 = InterpolatedUnivariateSpline(self.ri, np.maximum(sig2_vals, 0.), k=3, ext='const')
+        sig2_pos = np.maximum(sig2_vals, 0.)
+        self._sig2 = (_log_pchip(self.ri, sig2_pos)
+                      or InterpolatedUnivariateSpline(self.ri, sig2_pos, k=3, ext='const'))
 
         # half-mass radius and angular frequency at r_half, for the
         # adiabatic correction in tidal heating (Pullen+14 / Gnedin+99,
@@ -180,18 +228,11 @@ class NumericProfile(object):
 
     def rho(self, R, z=0.):
         r = np.sqrt(R**2 + z**2)
-        # PchipInterpolator with extrapolate=False returns NaN outside
-        # [ri[0], ri[-1]]; treat outside-data as zero density
-        val = self.rhoInt(r)
-        return np.where(np.isnan(val), 0., np.maximum(val, 0.))
+        return self.rhoInt(r)
 
     def M(self, R, z=0.):
         r = np.sqrt(R**2 + z**2)
-        # PCHIP with extrapolate=False returns NaN outside [ri[0], ri[-1]];
-        # match the previous ext='const' behaviour by clamping the query
-        # radius (M(<r<ri[0]) = M(ri[0]); M(<r>rh) = Mh).
-        r_clamped = np.clip(r, self.ri[0], self.ri[-1])
-        return self.MInt(r_clamped)
+        return self.MInt(r)
 
     def rhobar(self, R, z=0.):
         r = np.sqrt(R**2.+z**2.)
@@ -348,19 +389,19 @@ def heat_profile(profile: NumericProfile, eps, count_per_decade=100):
     r_bound = r_bound[keep]
     M_bound = M_bound[keep]
 
-    # Rebin to a uniform log-spaced grid via PCHIP. Shell expansion produces
-    # irregular knot spacing in r_bound (large gaps near the outer edge where
-    # shells move farthest); cubic splines on those knots ring and can drive
-    # M(r) below zero. PCHIP preserves monotonicity, so the downstream cubic
-    # spline in NumericProfile gets well-conditioned monotone knots.
+    # Rebin to a uniform log-spaced grid via log-log PCHIP. Shell expansion
+    # produces irregular knot spacing in r_bound (large gaps near the outer
+    # edge where shells move farthest); log-log PCHIP is exact for power-law
+    # M(r) between knots and stays monotone on the cumsum input.
     n_clean = max(len(r_bound), 200)
     ri_clean = np.logspace(np.log10(r_bound[0]), np.log10(r_bound[-1]), n_clean)
     # snap endpoints to exact knot positions; logspace float roundoff can
-    # nudge the last sample fractionally past r_bound[-1] and PCHIP with
-    # extrapolate=False would return NaN there.
+    # nudge samples fractionally outside [r_bound[0], r_bound[-1]] and the
+    # interpolators with extrapolate=False would clamp/NaN there.
     ri_clean[0] = r_bound[0]
     ri_clean[-1] = r_bound[-1]
-    M_pchip = PchipInterpolator(r_bound, M_bound, extrapolate=False)
+    M_pchip = (_log_pchip(r_bound, M_bound)
+               or PchipInterpolator(r_bound, M_bound, extrapolate=False))
     Mr_clean = M_pchip(ri_clean)
 
     return NumericProfile(ri_clean, Mr_clean)
