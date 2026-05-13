@@ -101,7 +101,19 @@ def _log_pchip(x, y, eps_rel=1e-30, clamp_below='value', clamp_above='value',
     if mask.sum() < 2:
         return None
     xm, ym = x[mask], y[mask]
-    pchip = PchipInterpolator(np.log(xm), np.log(ym), extrapolate=False)
+    # drop log-space near-duplicates: when consecutive xm values agree to
+    # within machine epsilon (~1e-16 relative), log(xm) collapses and
+    # PchipInterpolator rejects the non-strictly-increasing input. Happens
+    # naturally on the outer Kazantzidis tail where M(r) plateaus and the
+    # heat_profile shell expansion produces clustered r_f at floating-point
+    # precision. 1e-12 leaves a comfortable margin above double precision.
+    log_xm = np.log(xm)
+    if len(log_xm) > 1:
+        good = np.concatenate(([True], np.diff(log_xm) > 1e-12))
+        if good.sum() < 2:
+            return None
+        xm, ym, log_xm = xm[good], ym[good], log_xm[good]
+    pchip = PchipInterpolator(log_xm, np.log(ym), extrapolate=False)
     x_lo, x_hi = float(xm[0]), float(xm[-1])
     y_lo, y_hi = float(ym[0]), float(ym[-1])
     lo_val = y_lo if clamp_below == 'value' else 0.

@@ -4,13 +4,24 @@ import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 from dataclasses import dataclass
-from scipy.optimize import bisect, brentq
+from scipy.optimize import brentq
 
 import config as cfg
 from profiles import NFW, Dekel, Green, Vcirc, tdyn
 from orbit import orbit
 import evolve as ev
 from subhalo_functions import NumericProfile, heat_profile, tidalTensor
+
+
+# Stripping bookkeeping: Zentner+05 / Du+24 eq. 35 with T_dyn = t_orb
+# (orbital dynamical time at the satellite, matching Galacticus's default
+# useDynamicalTimeScale=false). Each step removes
+#     dm = alpha * (M_heated.Mh - M_heated(<lt)) * dt / t_orb
+# from the heated profile, then we hard-truncate at rmaxNew = M^-1(m_new):
+# rebuild the grid on newProfile's own knots <= rmaxNew, appending the
+# exact (rmaxNew, m_new) as the new outermost point. The truncation
+# couples the bound mass to the spatial profile (m = numProfile.Mh by
+# construction).
 
 
 @dataclass
@@ -242,21 +253,23 @@ class _HeatingStepper:
     each peri to start a fresh segment.
     """
 
-    def __init__(self, numProfile, second_order):
+    def __init__(self, numProfile, second_order, f2=0.406, chi_v=-0.333):
         self.second_order = second_order
         if not second_order:
             return
-        f2, chi_v = 0.406, -0.333  # Benson & Du 2022 eq. (4)
+        # Benson+Du22 eq. (4) calibrates f_2=0.406 against an SIS host;
+        # Du+24 Table IV refits f_2=0.547 for an NFW host. chi_v fixed at
+        # -0.333 in both (Du+24 absorbs its uncertainty into f_2).
         self.c2 = np.sqrt(2.) * f2 * (1. + chi_v)
         self.H = 0.
         self.sqrt_H = 0.
         self.t_last_reset = 0.
         self.r_p1 = None  # previous step's r
         self.r_p2 = None  # two-step-back r
-        # sigma_r^2(r) is frozen at the start of each peri-to-peri segment
-        # so the per-step contributions add up exactly to the per-orbit
-        # eq. (4) total. Drifting it within a segment under-counts because
-        # heating raises specific energy and lowers sigma_r^2.
+        # sigma_r^2(r) is refrozen at each peri-to-peri segment so per-step
+        # contributions sum to the per-orbit eq. (4) total. Drifting it
+        # within a segment under-counts because heating raises specific
+        # energy and lowers sigma_r^2.
         self.sig2 = numProfile._sig2
         self.rh = numProfile.rh
 
@@ -301,14 +314,24 @@ class _HeatingStepper:
 
 
 def evolve_heating(host, numProfile0, xv0, tmax=10., Nstep=10000,
-                   epsh=3., gamma=2.5, alpha=1.,
-                   second_order=False,
+                   epsh=3., gamma=2.5, alpha=1., beta_h=1.,
+                   second_order=False, f2=0.406, chi_v=-0.333,
                    n_snapshots=10, label=None):
+    # Defaults are the Pullen+14 / Benson+Du22 SIS-host calibration
+    # (epsh=3, gamma=2.5, alpha=1, beta_h=1, f2=0.406, chi_v=-0.333). For
+    # Du+24's NFW-host calibration override to (epsh=0.0741, gamma=0,
+    # alpha=3.93, beta_h=0.278, f2=0.547, chi_v=-0.333).
     """Du+24 monotonic shell expansion + King62 stripping.
 
     second_order=True adds the Benson+Du22 second-order correction (eq. 4):
         dE = dE_1 + c2 * sqrt(dE_1 * sigma_r^2),  c2 = sqrt(2) f_2 (1+chi_v)
-    with f_2=0.406, chi_v=-0.333.
+    Defaults f_2=0.406, chi_v=-0.333 are the Benson+Du22 SIS-host fit. For
+    an NFW host use Du+24 Table IV (gamma=1 column): f_2=0.547.
+
+    beta_h sets the cumulant decay rate in eq. 39 of Du+24:
+        dG_ab/dt = g_ab - beta_h * G_ab / T_orbit
+    The default beta_h=1 matches Benson+Du22 eq. 16. Du+24 Table IV gives
+    beta_h=0.278 for an NFW subhalo on an NFW host.
 
     Benson+Du22 is a per-shock budget: dE_1 and sigma_r^2 are quantities accumulated
     over one full orbital encounter. The sqrt does not split linearly across
@@ -355,7 +378,7 @@ def evolve_heating(host, numProfile0, xv0, tmax=10., Nstep=10000,
     tprevious = 0.
     tt_int = np.zeros((3, 3))  # running tidal-tensor time integral [kpc/Gyr]^2
 
-    heater = _HeatingStepper(numProfile, second_order)
+    heater = _HeatingStepper(numProfile, second_order, f2=f2, chi_v=chi_v)
 
     for i, t in enumerate(timesteps):
         dt = t - tprevious
@@ -377,7 +400,10 @@ def evolve_heating(host, numProfile0, xv0, tmax=10., Nstep=10000,
             )
 
         tt_cur = tidalTensor(potential, [x, y, z_c])
-        tt_int += (tt_cur - tt_int / t_orb) * dt  # Benson+Du22 eq.16
+        # Du+24 eq. 39: dG_ab/dt = g_ab - beta_h * G_ab / T_orbit.
+        # beta_h=1 recovers Benson+Du22 eq. 16; Du+24 Table IV calibrates
+        # beta_h=0.278 for an NFW subhalo on an NFW host.
+        tt_int += (tt_cur - beta_h * tt_int / t_orb) * dt
         # adiabatic correction (Pullen+14 / Gnedin+99, Benson+Du22 eq. 3):
         # omega_p at the subhalo half-mass radius, T_shock = r/V (the
         # instantaneous orbital timescale at the current position — small
@@ -393,26 +419,33 @@ def evolve_heating(host, numProfile0, xv0, tmax=10., Nstep=10000,
             newProfile = heat_profile(numProfile, eps_r)
             lt = ev.ltidal(newProfile, potential, xv, 'King62')
             if lt < newProfile.rh:
+                # Zentner+05 / Du+24 eq. 35 with T_dyn = t_orb (orbital
+                # dynamical time). Drain the mass past lt at rate
+                # alpha (Mh - M(<lt)) / t_orb; then hard-truncate the
+                # heated profile at rmaxNew = M^-1(m_new) so the spatial
+                # profile mass equals m_new.
                 dm = alpha * (newProfile.Mh - newProfile.M(lt)) * dt / t_orb
-                dm = max(dm, 0.)
+                dm = max(float(dm), 0.)
                 m_new = max(newProfile.Mh - dm, cfg.Mres)
                 if m_new > cfg.Mres:
-                    # clamp m_new to the spline value at rh to keep bisect bracket valid
-                    m_new = min(m_new, newProfile.M(newProfile.rh))
+                    # clamp m_new to the spline value at rh to keep the
+                    # bisect bracket valid
+                    m_new = min(m_new, float(newProfile.M(newProfile.rh)))
                 if m_new > cfg.Mres:
-                    rmaxNew = bisect(lambda x_: newProfile.M(x_) - m_new,
-                                     newProfile.ri[0], newProfile.rh)
-                    # Rebuild on newProfile's own knots truncated to
-                    # <= rmaxNew, appending rmaxNew at m_new as the new
-                    # outermost knot. A logspace(r_lo, rmaxNew, 100) grid
+                    rmaxNew = brentq(
+                        lambda r_: float(newProfile.M(r_)) - m_new,
+                        newProfile.ri[0], newProfile.rh, xtol=1e-8,
+                    )
+                    # rebuild on newProfile's own knots truncated to
+                    # <= rmaxNew, appending the exact (rmaxNew, m_new) as
+                    # the new outermost knot. logspace(r_lo, rmaxNew, 100)
                     # would oversample the post-bulk-shell region (where M
                     # is essentially flat near Mh) and the FD-derived rho
-                    # on those wasted points collapses to ~zero in the
-                    # outer plot region.
+                    # would collapse to ~zero in the outer plot region.
                     mask = newProfile.ri < rmaxNew
-                    rvals = np.append(newProfile.ri[mask], rmaxNew)
-                    Mr = np.append(newProfile.Mr[mask], m_new)
-                    numProfile = NumericProfile(rvals, Mr)
+                    rvals_new = np.append(newProfile.ri[mask], rmaxNew)
+                    Mr_new = np.append(newProfile.Mr[mask], m_new)
+                    numProfile = NumericProfile(rvals_new, Mr_new)
                 m = m_new
             else:
                 numProfile = newProfile
