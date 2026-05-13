@@ -542,10 +542,12 @@ def evolve_heating(host, numProfile0, xv0, tmax=10., Nstep=10000,
 #---plotting
 
 def _style_for(i, styles):
-    """Per-result kwargs override; falls back to scatter-dot default when None."""
+    """Per-result kwargs override; default is dots connected by a thin
+    line in time order so post-pericentre plateau-to-plateau jumps in the
+    (rmax, vmax) tracks are visually traceable."""
     if styles is not None and i < len(styles) and styles[i] is not None:
         return dict(styles[i])
-    return dict(marker='.', linestyle='None', ms=2)
+    return dict(marker='.', linestyle='-', ms=2, lw=0.4, alpha=0.5)
 
 
 def markers_to_lines(handles):
