@@ -168,16 +168,16 @@ class NumericProfile(object):
                        or PchipInterpolator(self.ri, self.rhovals, extrapolate=False))
 
         # rmax / Vmax via root-finding of f(r) = 4*pi*r^3*rho - M = 0,
-        # the dVc/dr = 0 condition. Argmax of Vc on a discrete grid is not
-        # robust: heated/stripped profiles develop a flat outer shoulder
-        # (wide M(r) ~ r^2 region, constant rho, Vc rising slowly), where
-        # tiny inter-knot interpolation noise tips the discrete argmax
-        # between widely separated grid points and draws diagonal jumps in
-        # the (rmax, Vmax) track. The OUTERMOST + → - sign change of f is
-        # the true Vc peak. If no interior crossing exists the profile has
-        # no interior maximum (Vc monotonic over the bound region or peak
-        # below the resolution) — return NaN so the track mask drops the
-        # point rather than reporting a boundary value.
+        # the dVc/dr = 0 condition. Heated/stripped profiles can be
+        # multimodal: a small outer Vc bump (from the heating-induced
+        # shoulder) sits beside the inner cusp peak, and tiny inter-knot
+        # interpolation noise tips the argmax between them step-to-step,
+        # producing diagonal jumps in the (rmax, Vmax) track. brentq each
+        # + → - sign change of f and pick the GLOBAL Vc maximum across
+        # roots. For unimodal profiles there is one root and this matches
+        # the old behaviour exactly. No interior crossing means Vc is
+        # monotonic over the bound region; return NaN so the track mask
+        # drops the point rather than reporting a boundary value.
         rr = np.logspace(np.log10(self.ri[0]), np.log10(self.rh), 200)
         f_grid = 4.0 * np.pi * rr**3 * self.rho(rr) - self.M(rr)
         # exclude the last few grid points: rho rolls off as the
@@ -189,15 +189,17 @@ class NumericProfile(object):
             self.rmax = np.nan
             self.Vmax = float(np.max(self.Vcirc(rr)))
         else:
-            k = int(idx_pm[-1])
-            # bracket has a confirmed sign change so brentq cannot fail;
-            # if it ever does, that is a real bug and should propagate
-            rmax = brentq(
-                lambda r: 4.0*np.pi*r**3 * float(self.rho(r)) - float(self.MInt(r)),
-                rr[k], rr[k+1], xtol=1e-8,
-            )
-            self.rmax = float(rmax)
-            self.Vmax = float(self.Vcirc(rmax))
+            best_r, best_V = -1., -1.
+            for k in idx_pm:
+                rk = brentq(
+                    lambda r: 4.0*np.pi*r**3 * float(self.rho(r)) - float(self.MInt(r)),
+                    rr[int(k)], rr[int(k)+1], xtol=1e-8,
+                )
+                Vk = float(self.Vcirc(rk))
+                if Vk > best_V:
+                    best_r, best_V = rk, Vk
+            self.rmax = float(best_r)
+            self.Vmax = float(best_V)
 
         # sigma_r^2 at ri grid points via exact spline antiderivative (Jeans, isotropic)
         fvals = np.maximum(self.rhovals, 0.) * np.maximum(self.Mr, 0.) / self.ri**2

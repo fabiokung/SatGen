@@ -316,7 +316,21 @@ class _HeatingStepper:
 def evolve_heating(host, numProfile0, xv0, tmax=10., Nstep=10000,
                    epsh=3., gamma=2.5, alpha=1., beta_h=1.,
                    second_order=False, f2=0.406, chi_v=-0.333,
+                   t_dyn_mode='host',
                    n_snapshots=10, label=None):
+    # t_dyn_mode controls the timescale T in Du+24 eq. 35 (King62 stripping)
+    # and eq. 39 (cumulant decay):
+    #   'host':   T = T_dyn,host(r_sub) = tdyn(host, r_sub). Galacticus
+    #             useDynamicalTimeScale=false. Matches Benson+Du22 SIS fit.
+    #   'sub_lt': T = T_dyn,sub(lt) = (pi/2) sqrt(lt^3 / G M_sub(<lt)).
+    #             Galacticus useDynamicalTimeScale=true. Matches Du+24
+    #             NFW Table IV refit. Cumulant decay uses lt from the
+    #             previous step (lagged), stripping rate uses lt from the
+    #             current step. When M(<lt) drops to zero (lt below grid
+    #             resolution), the fallback is T_dyn,sub(rmax) = (pi/2)
+    #             rmax/Vmax -- still subhalo-internal, never host-side.
+    # Adiabatic T_shock (= r/V), the per-orbit cumulant reset fallback,
+    # and the CFL timestep guard always use host-side t_orb regardless.
     # Defaults are the Pullen+14 / Benson+Du22 SIS-host calibration
     # (epsh=3, gamma=2.5, alpha=1, beta_h=1, f2=0.406, chi_v=-0.333). For
     # Du+24's NFW-host calibration override to (epsh=0.0741, gamma=0,
@@ -375,6 +389,11 @@ def evolve_heating(host, numProfile0, xv0, tmax=10., Nstep=10000,
     r = np.sqrt(xv0[0]**2 + xv0[2]**2)
     m = mv0
     lt = cfg.Rres
+    # lagged-lt state for t_dyn_mode='sub_lt' cumulant decay. Step 0 has
+    # no prior lt, so use rh (treat as "no stripping yet"). M_at_lt_prev
+    # is kept in sync to avoid a redundant spline call each step.
+    lt_prev = float(numProfile.rh)
+    M_at_lt_prev = float(numProfile.M(lt_prev))
     tprevious = 0.
     tt_int = np.zeros((3, 3))  # running tidal-tensor time integral [kpc/Gyr]^2
 
@@ -400,10 +419,19 @@ def evolve_heating(host, numProfile0, xv0, tmax=10., Nstep=10000,
             )
 
         tt_cur = tidalTensor(potential, [x, y, z_c])
-        # Du+24 eq. 39: dG_ab/dt = g_ab - beta_h * G_ab / T_orbit.
+        # Du+24 eq. 39: dG_ab/dt = g_ab - beta_h * G_ab / T.
         # beta_h=1 recovers Benson+Du22 eq. 16; Du+24 Table IV calibrates
         # beta_h=0.278 for an NFW subhalo on an NFW host.
-        tt_int += (tt_cur - beta_h * tt_int / t_orb) * dt
+        if t_dyn_mode == 'sub_lt':
+            if M_at_lt_prev > 0.:
+                T_decay = (np.pi / 2.) * np.sqrt(lt_prev**3 / (cfg.G * M_at_lt_prev))
+            else:
+                # M(<lt) numerical floor: fall back to the internal time
+                # at rmax (always well-defined; stays in subhalo frame).
+                T_decay = (np.pi / 2.) * numProfile.rmax / numProfile.Vmax
+        else:
+            T_decay = t_orb
+        tt_int += (tt_cur - beta_h * tt_int / T_decay) * dt
         # adiabatic correction (Pullen+14 / Gnedin+99, Benson+Du22 eq. 3):
         # omega_p at the subhalo half-mass radius, T_shock = r/V (the
         # instantaneous orbital timescale at the current position — small
@@ -419,14 +447,24 @@ def evolve_heating(host, numProfile0, xv0, tmax=10., Nstep=10000,
             newProfile = heat_profile(numProfile, eps_r)
             lt = ev.ltidal(newProfile, potential, xv, 'King62')
             if lt < newProfile.rh:
-                # Zentner+05 / Du+24 eq. 35 with T_dyn = t_orb (orbital
-                # dynamical time). Drain the mass past lt at rate
-                # alpha (Mh - M(<lt)) / t_orb; then hard-truncate the
-                # heated profile at rmaxNew = M^-1(m_new) so the spatial
-                # profile mass equals m_new.
-                dm = alpha * (newProfile.Mh - newProfile.M(lt)) * dt / t_orb
+                # Zentner+05 / Du+24 eq. 35. Drain the mass past lt at rate
+                # alpha (Mh - M(<lt)) / T; truncate at rmaxNew=M^-1(m_new).
+                M_at_lt = float(newProfile.M(lt))
+                if t_dyn_mode == 'sub_lt':
+                    if M_at_lt > 0.:
+                        T_strip = (np.pi / 2.) * np.sqrt(lt**3 / (cfg.G * M_at_lt))
+                    else:
+                        T_strip = (np.pi / 2.) * newProfile.rmax / newProfile.Vmax
+                else:
+                    T_strip = t_orb
+                dm = alpha * (newProfile.Mh - M_at_lt) * dt / T_strip
                 dm = max(float(dm), 0.)
                 m_new = max(newProfile.Mh - dm, cfg.Mres)
+                # cap against single-step overshoot past M(<lt): the rate
+                # equation asymptotes to M_at_lt, never below. Without the
+                # cap, dt/T_strip > 1/alpha can take m_new < M_at_lt in
+                # one step (rmaxNew < lt, unphysical).
+                m_new = max(m_new, M_at_lt)
                 if m_new > cfg.Mres:
                     # clamp m_new to the spline value at rh to keep the
                     # bisect bracket valid
@@ -436,15 +474,22 @@ def evolve_heating(host, numProfile0, xv0, tmax=10., Nstep=10000,
                         lambda r_: float(newProfile.M(r_)) - m_new,
                         newProfile.ri[0], newProfile.rh, xtol=1e-8,
                     )
-                    # rebuild on newProfile's own knots truncated to
-                    # <= rmaxNew, appending the exact (rmaxNew, m_new) as
-                    # the new outermost knot. logspace(r_lo, rmaxNew, 100)
-                    # would oversample the post-bulk-shell region (where M
-                    # is essentially flat near Mh) and the FD-derived rho
-                    # would collapse to ~zero in the outer plot region.
-                    mask = newProfile.ri < rmaxNew
-                    rvals_new = np.append(newProfile.ri[mask], rmaxNew)
-                    Mr_new = np.append(newProfile.Mr[mask], m_new)
+                    # rebuild on a fresh log-spaced grid spanning
+                    # [cfg.Rres, rmaxNew] with the same number of knots
+                    # as the input profile. Keeps grid density uniform
+                    # regardless of stripping depth -- inheriting the
+                    # outer-truncated parent grid would shed knots one
+                    # at a time as rmaxNew shrinks, leaving a thin
+                    # spline shape at deep stripping that locks the
+                    # rmax brentq root to discrete knot locations
+                    # (visible as clumps in the (rmax, Vmax) track).
+                    n_grid = len(newProfile.ri)
+                    rvals_new = np.logspace(np.log10(cfg.Rres),
+                                            np.log10(rmaxNew), n_grid)
+                    Mr_new = newProfile.M(rvals_new)
+                    # exact outermost knot: heat_profile spline noise can
+                    # put M(rmaxNew) slightly off m_new
+                    Mr_new[-1] = m_new
                     numProfile = NumericProfile(rvals_new, Mr_new)
                 m = m_new
             else:
@@ -453,6 +498,15 @@ def evolve_heating(host, numProfile0, xv0, tmax=10., Nstep=10000,
         else:
             m = cfg.Mres
             lt = cfg.Rres
+
+        # carry forward for the NEXT step's cumulant decay denominator.
+        # When lt is non-finite or non-physical, fall back to rh (no-strip).
+        if np.isfinite(lt) and lt > 0. and lt < numProfile.rh:
+            lt_prev = float(lt)
+            M_at_lt_prev = float(numProfile.M(lt_prev))
+        else:
+            lt_prev = float(numProfile.rh)
+            M_at_lt_prev = float(numProfile.Mh)
 
         if should_reset:
             heater.reset(numProfile, t)
