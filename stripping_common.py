@@ -67,20 +67,21 @@ def _vmax_rmax(profile):
 
     if len(sign_changes) == 0:
         vc = np.sqrt(np.maximum(cfg.G * profile.M(rr) / rr, 0.))
-        idx = np.argmax(vc)
-        return vc[idx], rr[idx]
+        idx = int(np.argmax(vc))
+        return float(vc[idx]), float(rr[idx])
 
     idx = sign_changes[-1]
-    rmax = brentq(f, rr[idx], rr[idx + 1], xtol=1e-8)
-    vmax = np.sqrt(cfg.G * profile.M(rmax) / rmax)
+    rmax = float(brentq(f, rr[idx], rr[idx + 1], xtol=1e-8))  # type: ignore[arg-type]
+    vmax = float(np.sqrt(cfg.G * profile.M(rmax) / rmax))
     return vmax, rmax
 
 
-#---evolution routines
+# ---evolution routines
 
 def evolve_satgen_dekel(host, sat, xv0, tmax=10., Nstep=10000, alpha=1.,
                         n_snapshots=10, label='SatGen (Dekel / P10 track)'):
     """Dekel/P10 tidal-track evolution (Baseline A)."""
+    assert cfg.Mres is not None, "cfg.Mres must be set before calling evolve_satgen_dekel"
     potential = host
     timesteps = np.linspace(0., tmax, Nstep + 1)[1:]
     mv0 = sat.Mh
@@ -121,16 +122,13 @@ def evolve_satgen_dekel(host, sat, xv0, tmax=10., Nstep=10000, alpha=1.,
             continue
         r = np.sqrt(xv[0]**2 + xv[2]**2)
 
+        a = s.alphah
         if m > cfg.Mres:
             m, lt = ev.msub(s, potential, xv, dt, choice='King62', alpha=alpha)
-            a = s.alphah
             c, Delta = ev.Dekel(m, mv0, rmax0, vmax0, aDekel0, z=0.)
         else:
-            m = cfg.Mres
-            lt = cfg.Rres
-            c = s.ch
-            a = s.alphah
-            Delta = 200.
+            m, lt = cfg.Mres, cfg.Rres
+            c, Delta = s.ch, 200.
         s = Dekel(m, c, a, Delta=Delta, z=0.)
 
         t_arr[i] = t
@@ -163,6 +161,7 @@ def evolve_satgen_green(host, ma, c2a, xv0, tmax=10., Nstep=10000,
 
     alpha='conc' uses concentration-dependent stripping efficiency (ev.alpha_from_c2).
     """
+    assert cfg.Mres is not None, "cfg.Mres must be set before calling evolve_satgen_green"
     potential = host
     timesteps = np.linspace(0., tmax, Nstep + 1)[1:]
 
@@ -201,17 +200,13 @@ def evolve_satgen_green(host, ma, c2a, xv0, tmax=10., Nstep=10000,
             continue
         r = np.sqrt(xv[0]**2 + xv[2]**2)
 
-        if m > cfg.Mres:
-            if alpha == 'conc':
-                al = ev.alpha_from_c2(host.ch, s.ch)
-            else:
-                al = float(alpha)
+        if m <= cfg.Mres:
+            m, lt = cfg.Mres, cfg.Rres
+        else:
+            al = ev.alpha_from_c2(host.ch, s.ch) if alpha == 'conc' else float(alpha)
             m, lt = ev.msub(s, potential, xv, dt, choice='King62', alpha=al)
             m = max(m, cfg.Mres)
             s.update_mass(m)
-        else:
-            m = cfg.Mres
-            lt = cfg.Rres
 
         vm, rm = _vmax_rmax(s)
 
@@ -361,6 +356,7 @@ def evolve_heating(host, numProfile0, xv0, tmax=10., Nstep=10000,
     """
     if label is None:
         label = 'Du+24 heating + Benson+Du22 2nd-order' if second_order else 'Du+24 heating'
+    assert cfg.Mres is not None, "cfg.Mres must be set before calling evolve_heating"
     potential = host
     timesteps = np.linspace(0., tmax, Nstep + 1)[1:]
 
@@ -401,12 +397,11 @@ def evolve_heating(host, numProfile0, xv0, tmax=10., Nstep=10000,
 
     for i, t in enumerate(timesteps):
         dt = t - tprevious
-        if r > cfg.Rres:
-            o.integrate(t, potential, m)
-            xv = o.xv
-        else:
+        if r <= cfg.Rres:
             tprevious = t
             continue
+        o.integrate(t, potential, m)
+        xv = o.xv
         r = np.sqrt(xv[0]**2 + xv[2]**2)
         V = np.sqrt(xv[3]**2 + xv[4]**2 + xv[5]**2)
         x = xv[0] * np.cos(xv[1])
@@ -422,15 +417,12 @@ def evolve_heating(host, numProfile0, xv0, tmax=10., Nstep=10000,
         # Du+24 eq. 39: dG_ab/dt = g_ab - beta_h * G_ab / T.
         # beta_h=1 recovers Benson+Du22 eq. 16; Du+24 Table IV calibrates
         # beta_h=0.278 for an NFW subhalo on an NFW host.
+        T_decay = t_orb
         if t_dyn_mode == 'sub_lt':
-            if M_at_lt_prev > 0.:
-                T_decay = (np.pi / 2.) * np.sqrt(lt_prev**3 / (cfg.G * M_at_lt_prev))
-            else:
-                # M(<lt) numerical floor: fall back to the internal time
-                # at rmax (always well-defined; stays in subhalo frame).
-                T_decay = (np.pi / 2.) * numProfile.rmax / numProfile.Vmax
-        else:
-            T_decay = t_orb
+            T_decay = (np.pi / 2.) * (
+                np.sqrt(lt_prev**3 / (cfg.G * M_at_lt_prev)) if M_at_lt_prev > 0.
+                else numProfile.rmax / numProfile.Vmax  # M(<lt) floor; stays in subhalo frame
+            )
         tt_int += (tt_cur - beta_h * tt_int / T_decay) * dt
         # adiabatic correction (Pullen+14 / Gnedin+99, Benson+Du22 eq. 3):
         # omega_p at the subhalo half-mass radius, T_shock = r/V (the
@@ -443,70 +435,76 @@ def evolve_heating(host, numProfile0, xv0, tmax=10., Nstep=10000,
 
         eps_r, should_reset = heater.step(dt, tidalHR, r, t, t_orb)
 
-        if m > cfg.Mres:
+        if m <= cfg.Mres:
+            m, lt = cfg.Mres, cfg.Rres
+        else:
             newProfile = heat_profile(numProfile, eps_r)
-            lt = ev.ltidal(newProfile, potential, xv, 'King62')
-            if lt < newProfile.rh:
+            lt = float(ev.ltidal(newProfile, potential, xv, 'King62'))  # type: ignore[arg-type]
+            if lt >= newProfile.rh:
+                numProfile, m = newProfile, newProfile.Mh
+            else:
                 # Zentner+05 / Du+24 eq. 35. Drain the mass past lt at rate
                 # alpha (Mh - M(<lt)) / T; truncate at rmaxNew=M^-1(m_new).
-                M_at_lt = float(newProfile.M(lt))
+                # PCHIP eval at lt < rh can return M(lt) > Mh at
+                # floating-point precision (~1e-16 relative) due to
+                # roundoff, even though the spline is monotone on
+                # monotone input. In the deep-stripping asymptote where
+                # Mh - M(<lt) is itself near zero, that tiny overshoot
+                # flips the sign of (Mh - M_at_lt) and trips the
+                # overstrip check below on floating-point noise rather
+                # than a real overshoot. Clamp to enforce the analytic
+                # constraint M(<r) <= Mh; real overshoots
+                # (alpha * dt / T_strip > 1) still raise below.
+                M_at_lt = min(float(newProfile.M(lt)), float(newProfile.Mh))
+                T_strip = t_orb
                 if t_dyn_mode == 'sub_lt':
-                    if M_at_lt > 0.:
-                        T_strip = (np.pi / 2.) * np.sqrt(lt**3 / (cfg.G * M_at_lt))
-                    else:
-                        T_strip = (np.pi / 2.) * newProfile.rmax / newProfile.Vmax
-                else:
-                    T_strip = t_orb
-                dm = alpha * (newProfile.Mh - M_at_lt) * dt / T_strip
-                dm = max(float(dm), 0.)
+                    T_strip = (np.pi / 2.) * (
+                        np.sqrt(lt**3 / (cfg.G * M_at_lt)) if M_at_lt > 0.
+                        else newProfile.rmax / newProfile.Vmax
+                    )
+                dm = max(float(alpha * (newProfile.Mh - M_at_lt) * dt / T_strip), 0.)
                 m_new = max(newProfile.Mh - dm, cfg.Mres)
-                # cap against single-step overshoot past M(<lt): the rate
-                # equation asymptotes to M_at_lt, never below. Without the
-                # cap, dt/T_strip > 1/alpha can take m_new < M_at_lt in
+                # rate equation asymptotes to M(<lt), never below: without
+                # the cap, dt/T_strip > 1/alpha takes m_new < M_at_lt in
                 # one step (rmaxNew < lt, unphysical).
-                m_new = max(m_new, M_at_lt)
+                if m_new < M_at_lt:
+                    raise ValueError(
+                        f"Detected overstripping: m_new={m_new:.2e} < "
+                        f"M(<lt)={M_at_lt:.2e} at lt={lt:.2f} kpc; "
+                        f"increase Nstep to reduce dt or decrease alpha"
+                    )
                 if m_new > cfg.Mres:
-                    # clamp m_new to the spline value at rh to keep the
-                    # bisect bracket valid
+                    # clamp to spline at rh to keep the bisect bracket valid
                     m_new = min(m_new, float(newProfile.M(newProfile.rh)))
-                if m_new > cfg.Mres:
                     rmaxNew = brentq(
                         lambda r_: float(newProfile.M(r_)) - m_new,
                         newProfile.ri[0], newProfile.rh, xtol=1e-8,
                     )
-                    # rebuild on a fresh log-spaced grid spanning
-                    # [cfg.Rres, rmaxNew] with the same number of knots
-                    # as the input profile. Keeps grid density uniform
-                    # regardless of stripping depth -- inheriting the
-                    # outer-truncated parent grid would shed knots one
-                    # at a time as rmaxNew shrinks, leaving a thin
-                    # spline shape at deep stripping that locks the
-                    # rmax brentq root to discrete knot locations
-                    # (visible as clumps in the (rmax, Vmax) track).
+                    # fresh log-spaced grid: inheriting the outer-truncated
+                    # parent grid sheds knots as rmaxNew shrinks, causing
+                    # clumps in the (rmax, Vmax) track at deep stripping.
+                    # Inner bound is max(Rres, newProfile.ri[0]): sampling
+                    # below newProfile.ri[0] hits the PCHIP boundary
+                    # clamp (returns the boundary M-value), producing a
+                    # constant-M plateau that np.gradient turns into
+                    # alternating zero / spurious-large rho values inside
+                    # NumericProfile.
                     n_grid = len(newProfile.ri)
-                    rvals_new = np.logspace(np.log10(cfg.Rres),
-                                            np.log10(rmaxNew), n_grid)
+                    rvals_new = np.logspace(
+                        np.log10(max(cfg.Rres, float(newProfile.ri[0]))),
+                        np.log10(rmaxNew), n_grid,
+                    )
                     Mr_new = newProfile.M(rvals_new)
-                    # exact outermost knot: heat_profile spline noise can
-                    # put M(rmaxNew) slightly off m_new
-                    Mr_new[-1] = m_new
+                    Mr_new[-1] = m_new  # heat_profile spline can put M(rmaxNew) slightly off m_new
                     numProfile = NumericProfile(rvals_new, Mr_new)
                 m = m_new
-            else:
-                numProfile = newProfile
-                m = numProfile.Mh
-        else:
-            m = cfg.Mres
-            lt = cfg.Rres
 
         # carry forward for the NEXT step's cumulant decay denominator.
-        # When lt is non-finite or non-physical, fall back to rh (no-strip).
+        lt_prev = float(numProfile.rh)
+        M_at_lt_prev = float(numProfile.Mh)
         if np.isfinite(lt) and lt > 0. and lt < numProfile.rh:
             lt_prev = float(lt)
             M_at_lt_prev = float(numProfile.M(lt_prev))
-        else:
-            lt_prev = float(numProfile.rh)
-            M_at_lt_prev = float(numProfile.Mh)
 
         if should_reset:
             heater.reset(numProfile, t)
@@ -539,9 +537,9 @@ def evolve_heating(host, numProfile0, xv0, tmax=10., Nstep=10000,
     )
 
 
-#---plotting
+# ---plotting
 
-def _style_for(i, styles):
+def _style_for(i, styles) -> dict:
     """Per-result kwargs override; default is dots connected by a thin
     line in time order so post-pericentre plateau-to-plateau jumps in the
     (rmax, vmax) tracks are visually traceable."""
@@ -593,7 +591,8 @@ def plot_mass_loss(results, ax=None, title='Mass Loss History', styles=None, leg
     if ax is None:
         _, ax = plt.subplots(figsize=(7, 5))
     for i, res in enumerate(results):
-        mask = np.isfinite(res.m)  # drop NaN-initialised skipped-iteration slots
+        # drop NaN-initialised skipped-iteration slots
+        mask = np.isfinite(res.m)
         ax.plot(res.t[mask], res.m[mask],
                 label=res.label, **_style_for(i, styles))
     ax.set_xscale('log')
@@ -617,13 +616,16 @@ def profile_ylims(*results):
             Vc = np.sqrt(np.maximum(cfg.G * snap_M / r_grid, 0.))
             pos = snap_rho[snap_rho > 0]
             if len(pos):
-                rho_all.append(pos.min()); rho_all.append(pos.max())
+                rho_all.append(pos.min())
+                rho_all.append(pos.max())
             pos = snap_M[snap_M > 0]
             if len(pos):
-                M_all.append(pos.min()); M_all.append(pos.max())
+                M_all.append(pos.min())
+                M_all.append(pos.max())
             pos = Vc[Vc > 0]
             if len(pos):
-                Vc_all.append(pos.min()); Vc_all.append(pos.max())
+                Vc_all.append(pos.min())
+                Vc_all.append(pos.max())
 
     def _lims(vals):
         return (min(vals), max(vals)) if vals else (1e-10, 1e10)
@@ -653,7 +655,7 @@ def plot_profile_snapshots(result, axes=None, title_prefix='', ylims=None):
               r'$M(r)$ [$M_\odot$]',
               r'$V_{\rm c}(r)$ [kpc/Gyr]']
     titles = ['Density', 'Enclosed Mass', 'Circular Velocity']
-    panel_ylims = ylims if ylims is not None else [None, None, None]
+    panel_ylims: list = ylims if ylims is not None else [None, None, None]
     for ax, ylab, ttl, ylim in zip(axes, labels, titles, panel_ylims):
         ax.set_xscale('log')
         ax.set_yscale('log')
@@ -671,7 +673,8 @@ def plot_orbit(results, ax=None, title='Orbital Radius', styles=None, legend=Tru
     if ax is None:
         _, ax = plt.subplots(figsize=(6, 4))
     for i, res in enumerate(results):
-        mask = np.isfinite(res.r)  # drop NaN-initialised skipped-iteration slots
+        # drop NaN-initialised skipped-iteration slots
+        mask = np.isfinite(res.r)
         kw = dict(styles[i]) if (styles is not None and i < len(styles)
                                  and styles[i] is not None) else {}
         ax.plot(res.t[mask], res.r[mask], label=res.label, **kw)

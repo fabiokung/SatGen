@@ -9,21 +9,6 @@ from subhalo_functions import NumericProfile
 import stripping_common as sc
 
 
-# Benson+Du22 calibration (Pullen+14 SIS-host coefficients). Matches the
-# stripping_sis and stripping_nfw notebooks; second-order brings the NFW
-# track onto Du+24 eq. 19 within a few percent over r/r_0 in [0.15, 1].
-# t_dyn_mode='sub_lt' uses T_dyn,sub(lt) (Galacticus useDynamicalTimeScale
-# = true) for King62 stripping and the eq. 39 cumulant decay; this exposes
-# the post-pericentre quiescent stairsteps in (rmax, vmax) that flag the
-# transition into deep stripping.
-HEAT_KW = dict(
-    tmax=30., Nstep=30000,
-    epsh=3., gamma=1.5, beta_h=1., alpha=1.,
-    second_order=True,
-    t_dyn_mode='sub_lt',
-)
-
-
 def evolve_one(params):
     """Evolve one (subhalo, host, orbit) configuration with the Benson+Du22
     calibration. params is a dict with M_sub, c_sub, M_host, c_host, and
@@ -41,7 +26,20 @@ def evolve_one(params):
     rvals = np.logspace(np.log10(cfg.Rres), np.log10(10.*sat.rs), 200)
     M_sub_arr = sat.M(rvals)
     xv0, _ = sc.make_orbit(hNFW, R0=R0_frac*hNFW.rh, eta=eta)
-    res = sc.evolve_heating(hNFW, NumericProfile(rvals, M_sub_arr), xv0, **HEAT_KW)
+    # Benson+Du22 calibration (Pullen+14 SIS-host coefficients). Matches the
+    # stripping_sis and stripping_nfw notebooks; second-order brings the NFW
+    # track onto Du+24 eq. 19 within a few percent over r/r_0 in [0.15, 1].
+    # t_dyn_mode='sub_lt' uses T_dyn,sub(lt) (Galacticus useDynamicalTimeScale
+    # = true) for King62 stripping and the eq. 39 cumulant decay; this exposes
+    # the post-pericentre quiescent stairsteps in (rmax, vmax) that flag the
+    # transition into deep stripping.
+    res = sc.evolve_heating(
+        hNFW, NumericProfile(rvals, M_sub_arr), xv0,
+        tmax=30., Nstep=30000,
+        epsh=3., gamma=1.5, beta_h=1., alpha=1.,
+        second_order=True,
+        t_dyn_mode='sub_lt',
+    )
     mask = np.isfinite(res.rmax) & np.isfinite(res.vmax)
     return {
         **params,

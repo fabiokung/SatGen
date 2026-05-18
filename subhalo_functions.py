@@ -1,5 +1,8 @@
 # SatGen imports
 # other imports
+import warnings
+from typing import cast
+
 import numpy as np
 from scipy.integrate import quad
 from scipy.interpolate import InterpolatedUnivariateSpline, PchipInterpolator
@@ -7,6 +10,12 @@ from scipy.optimize import brentq
 
 import config as cfg
 import cosmo as co
+
+
+# heat_profile is called every ODE step (~30k/run); the local monotonic
+# clamp fires routinely near the inner grid edge. One warning per process
+# is enough to flag the issue without spamming the log.
+_heat_profile_clamp_warned = False
 
 
 class SIS(object):
@@ -191,10 +200,10 @@ class NumericProfile(object):
         else:
             best_r, best_V = -1., -1.
             for k in idx_pm:
-                rk = brentq(
+                rk = cast(float, brentq(
                     lambda r: 4.0*np.pi*r**3 * float(self.rho(r)) - float(self.MInt(r)),
                     rr[int(k)], rr[int(k)+1], xtol=1e-8,
-                )
+                ))
                 Vk = float(self.Vcirc(rk))
                 if Vk > best_V:
                     best_r, best_V = rk, Vk
@@ -203,14 +212,14 @@ class NumericProfile(object):
 
         # sigma_r^2 at ri grid points via exact spline antiderivative (Jeans, isotropic)
         fvals = np.maximum(self.rhovals, 0.) * np.maximum(self.Mr, 0.) / self.ri**2
-        f_spl = InterpolatedUnivariateSpline(self.ri, fvals, k=3, ext='zeros')
+        f_spl = InterpolatedUnivariateSpline(self.ri, fvals, k=3, ext=1)
         F = f_spl.antiderivative()
         cumint = F(self.ri[-1]) - F(self.ri)
         sig2_vals = np.zeros_like(self.rhovals)
         np.divide(cfg.G * cumint, self.rhovals, out=sig2_vals, where=self.rhovals > 0)
         sig2_pos = np.maximum(sig2_vals, 0.)
         self._sig2 = (_log_pchip(self.ri, sig2_pos)
-                      or InterpolatedUnivariateSpline(self.ri, sig2_pos, k=3, ext='const'))
+                      or InterpolatedUnivariateSpline(self.ri, sig2_pos, k=3, ext=3))
 
         # half-mass radius and angular frequency at r_half, for the
         # adiabatic correction in tidal heating (Pullen+14 / Gnedin+99,
@@ -310,6 +319,7 @@ def heat_profile(profile: NumericProfile, eps, count_per_decade=100):
         Heated profile
     """
 
+    global _heat_profile_clamp_warned
     G = cfg.G
 
     rvir = profile.rh
@@ -328,6 +338,11 @@ def heat_profile(profile: NumericProfile, eps, count_per_decade=100):
     Menc = profile.M(ri)
     perturb = np.zeros_like(ri)
 
+    # clamp telemetry (first-occurrence warning below)
+    clamp_count = 0
+    clamp_worst_excess = 0.0
+    clamp_worst_r = np.nan
+
     # --------------------------------------------------
     # Compute perturbation outer → inner
     # --------------------------------------------------
@@ -341,9 +356,22 @@ def heat_profile(profile: NumericProfile, eps, count_per_decade=100):
         else:
             perturb[i] = 0.0
 
-        # enforce monotonic shell ordering; skip when either Menc is non-positive
-        # (spline undershoot at small r), where the (m_i/m_{i+1})**(-1/3) factor
-        # is ill-defined
+        # Local shell-crossing clamp. r_f(r_i) <= r_f(r_{i+1}) gives a
+        # per-shell upper bound on xi (with an extra (M_i/M_{i+1})^(-1/3)
+        # factor that tightens the constraint to keep adjacent shells from
+        # crowding). Skip when either Menc is non-positive (spline
+        # undershoot at small r); the (M_i/M_{i+1})^(-1/3) factor is
+        # undefined there.
+        # TODO(fabio): add the full Du+24 §IV.C shell-crossing handling.
+        # The clamp below is what Galacticus's heatedMonotonic class does
+        # -- a local, shell-by-shell limit. Du+24 eqs. 41-44 do more: find
+        # the single radius r_crossing where dxi/dr = 0 (eq. 44) and xi is
+        # continuous (eq. 43), then for r < r_crossing replace eps(r) with
+        # xi(r_crossing) * G*M(r) / (2r) (eq. 42), making eps proportional
+        # to the gravitational potential inward of r_crossing. The clamp
+        # approximates this globally-flattened xi(r) with a chain of local
+        # inequalities; the two coincide for smooth-enough profiles but
+        # not in general (see Du+24 Fig. 7 for the cored gamma=0 case).
         if i < count_r - 1 and Menc[i] > 0 and Menc[i + 1] > 0:
             limit = (
                 1.0
@@ -351,7 +379,26 @@ def heat_profile(profile: NumericProfile, eps, count_per_decade=100):
                 * (Menc[i] / Menc[i + 1]) ** (-1.0 / 3.0)
                 * (1.0 - perturb[i + 1])
             )
-            perturb[i] = min(perturb[i], limit)
+            if perturb[i] > limit:
+                clamp_count += 1
+                excess = (perturb[i] / limit) - 1.0 if limit > 0 else np.inf
+                if excess > clamp_worst_excess:
+                    clamp_worst_excess = excess
+                    clamp_worst_r = r
+                perturb[i] = limit
+
+    if clamp_count > 0 and not _heat_profile_clamp_warned:
+        _heat_profile_clamp_warned = True
+        warnings.warn(
+            f"heat_profile clamped {clamp_count} shell(s) to the local "
+            f"monotonic limit; worst overshoot "
+            f"{clamp_worst_excess * 100.0:.2f}% at r={clamp_worst_r:.3e} kpc. "
+            f"Galacticus heatedMonotonic local clamp applied; full Du+24 "
+            f"§IV.C r_crossing handling not yet implemented (TODO in "
+            f"heat_profile). Suppressed after first occurrence.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
 
     # --------------------------------------------------
     # Final energies
@@ -382,15 +429,14 @@ def heat_profile(profile: NumericProfile, eps, count_per_decade=100):
     r_bound = rf[bound]
     Mshell_bound = Mshell[bound]
 
-    # M(<r) at the post-expansion radii. Du+24's monotonic-shell clamp
-    # above guarantees rf is already sorted under their assumptions
-    # (Menc strictly positive on the sample grid), so this sort is a no-op
-    # in the common case. The clamp is bypassed when Menc[i+1] <= 0 (spline
-    # undershoot at very small r), where the (Menc[i]/Menc[i+1])^(-1/3)
-    # factor is undefined; sort+cumsum recovers a self-consistent M(<r) in
-    # that fallback. Menc[bound][order] would be wrong here — those values
-    # are cumulative masses at the *original* shell positions, not at the
-    # post-sort radii.
+    # M(<r) at the post-expansion radii. The shell-crossing guard above
+    # rules out crossings on the bulk grid (Menc strictly positive), so
+    # this sort is a no-op in the common case. The guard is bypassed when
+    # Menc[i+1] <= 0 (spline undershoot at very small r), where the
+    # (Menc[i]/Menc[i+1])^(-1/3) factor is undefined; sort+cumsum recovers
+    # a self-consistent M(<r) in that fallback. Menc[bound][order] would
+    # be wrong here -- those values are cumulative masses at the *original*
+    # shell positions, not at the post-sort radii.
     order = np.argsort(r_bound)
     r_bound = r_bound[order]
     M_bound = np.cumsum(Mshell_bound[order])
