@@ -397,3 +397,120 @@ class TestMNMass:
             m_at_5a = disk.M(5 * a)
             # At r=a, enclosed mass should be ~O(0.1) Md for typical b/a
             assert 0. < m_at_a < m_at_5a < 1e10
+
+
+# ---------------------------------------------------------------------------
+# truncate_kazantzidis tests — Kazantzidis+06 exponential tail
+# ---------------------------------------------------------------------------
+
+class TestTruncateKazantzidis:
+    """Kazantzidis+06 exponentially-truncated tail stitched onto a profile."""
+
+    def _numprofile(self):
+        from subhalo_functions import NumericProfile
+        sat = NFW(1e9, 20.)
+        ri = np.logspace(np.log10(1e-3 * sat.rh), np.log10(sat.rh), 300)
+        return NumericProfile(ri, sat.M(ri)), sat
+
+    def test_mode_a_hits_target_mass(self):
+        """Mode A: the solved r_decay makes the total enclosed mass = m_total."""
+        from subhalo_functions import truncate_kazantzidis
+        prof, _ = self._numprofile()
+        r_t = 0.4 * prof.rh
+        for frac in (0.95, 0.8):
+            m_target = frac * prof.Mh
+            tp = truncate_kazantzidis(prof, r_t, m_total=m_target)
+            assert abs(tp.Mh - m_target) / m_target < 1e-4
+
+    def test_density_continuous_and_inner_preserved(self):
+        """Density is continuous at the join, the inner profile is unchanged,
+        and the tail declines monotonically outward."""
+        from subhalo_functions import truncate_kazantzidis
+        prof, _ = self._numprofile()
+        r_t = 0.4 * prof.rh
+        tp = truncate_kazantzidis(prof, r_t, m_total=0.85 * prof.Mh)
+        assert abs(float(tp.rho(r_t)) / float(prof.rho(r_t)) - 1.) < 0.05
+        r_mid = 0.2 * prof.rh
+        assert abs(float(tp.rho(r_mid)) / float(prof.rho(r_mid)) - 1.) < 0.05
+        rho_tail = np.array([float(tp.rho(r_t * f)) for f in (1.2, 1.6, 2.5, 5.)])
+        assert np.all(np.diff(rho_tail) < 0.), "tail density not monotone declining"
+
+    def test_degenerate_recovers_hard_cut(self):
+        """m_total = M(<r_t) leaves no tail -- the result is cut at r_t."""
+        from subhalo_functions import truncate_kazantzidis
+        prof, _ = self._numprofile()
+        r_t = 0.4 * prof.rh
+        M_t = float(prof.M(r_t))
+        tp = truncate_kazantzidis(prof, r_t, m_total=M_t * (1. + 1e-12))
+        assert abs(tp.rh - r_t) / r_t < 1e-6
+        assert abs(tp.Mh - M_t) / M_t < 1e-9
+
+    def test_fixed_rdecay_matches_direct_integration(self):
+        """Fixed-r_decay tail mass matches a direct quadrature of the
+        Kazantzidis density -- validates the incomplete-gamma mass formula."""
+        from subhalo_functions import truncate_kazantzidis
+        prof, _ = self._numprofile()
+        r_t = prof.rh  # the profile's own outer knot (sat.rh up to roundoff)
+        s = -1. - 2. * 20. / 21.  # NFW dln(rho)/dln(r) at r=rvir, c=20
+        r_decay = r_t
+        tp = truncate_kazantzidis(prof, r_t, r_decay=r_decay, slope=s)
+        rho_t = float(prof.rho(r_t))
+        kappa = r_t / r_decay + s
+        # finite upper limit r_t + 60 r_decay -- exp(-60) is negligible and
+        # quad is reliable on a finite interval (the inf-interval transform
+        # can miss the peak of this sharply-decaying integrand)
+        integ = quad(lambda r: 4. * np.pi * r**2 * rho_t * (r / r_t)**kappa
+                     * np.exp(-(r - r_t) / r_decay), r_t, r_t + 60. * r_decay)[0]
+        M_t = float(prof.M(r_t))
+        assert abs((tp.Mh - M_t) - integ) / integ < 1e-3
+
+    def test_tail_beyond_rmax_preserves_rmax(self):
+        """A tail stitched well outside r_max leaves r_max, V_max unchanged."""
+        from subhalo_functions import truncate_kazantzidis
+        prof, _ = self._numprofile()
+        r_t = 0.5 * prof.rh
+        tp = truncate_kazantzidis(prof, r_t, m_total=0.9 * prof.Mh)
+        assert abs(tp.rmax - prof.rmax) / prof.rmax < 1e-3
+        assert abs(tp.Vmax - prof.Vmax) / prof.Vmax < 1e-3
+
+    def test_requires_exactly_one_of_rdecay_mtotal(self):
+        from subhalo_functions import truncate_kazantzidis
+        prof, _ = self._numprofile()
+        with pytest.raises(ValueError):
+            truncate_kazantzidis(prof, 0.4 * prof.rh)
+        with pytest.raises(ValueError):
+            truncate_kazantzidis(prof, 0.4 * prof.rh, r_decay=1., m_total=1e8)
+
+    def test_profile_cut_no_outer_spike(self):
+        """_profile_cut truncates at M^-1(m_total), so the density has no
+        delta-shell spike at the outer edge (regression: a fixed-r_t cut with
+        M[-1]=m_total jumped the enclosed mass at the last grid interval)."""
+        from subhalo_functions import _profile_cut
+        prof, _ = self._numprofile()
+        m_total = 0.5 * prof.Mh
+        cut = _profile_cut(prof, m_total)
+        assert abs(cut.Mh - m_total) / m_total < 1e-4
+        r = np.linspace(0.4 * cut.rh, cut.rh, 12)
+        rho = np.array([float(cut.rho(ri)) for ri in r])
+        assert np.all(np.diff(rho) < 0.), "density not monotone -- outer spike"
+
+    def test_ln_gamma_upper_requires_positive_a(self):
+        """_ln_gamma_upper is defined only for a > 0; a <= 0 (steep joins) is
+        routed to a hard cut by truncate_kazantzidis, never computed here."""
+        from subhalo_functions import _ln_gamma_upper
+        for a in (-2.7, -0.5, 0.):
+            with pytest.raises(ValueError):
+                _ln_gamma_upper(a, 1.0)
+
+    def test_steep_join_conserves_mass(self):
+        """A join steeper than r^-3 still yields a mass-conserving, finite
+        profile -- a valid (compact) tail when the budget is reachable, a
+        hard cut when it is not."""
+        from subhalo_functions import truncate_kazantzidis
+        prof, _ = self._numprofile()
+        r_t = 0.4 * prof.rh
+        for frac in (0.7, 0.9, 0.999):
+            cut = truncate_kazantzidis(prof, r_t, m_total=frac * prof.Mh,
+                                       slope=-3.5)
+            assert abs(cut.Mh - frac * prof.Mh) / (frac * prof.Mh) < 1e-4
+            assert np.all(np.isfinite(cut.Mr))
