@@ -397,7 +397,8 @@ def _truncate_hard(newProfile, m_new):
 
 
 def _strip_and_truncate(profile, newProfile, potential, xv, t_orb, dt, alpha,
-                        t_dyn_mode, truncation, t, tail_n=5., tail_xi=0.):
+                        t_dyn_mode, truncation, t, tail_n=5., tail_xi=0.,
+                        lt_choice='King62'):
     """One King62 strip + retruncate step. Returns (profile, m, lt).
 
     Zentner+05 / Du+24 eq. 35 relaxes the bound mass toward M(<lt) on T_strip;
@@ -405,7 +406,7 @@ def _strip_and_truncate(profile, newProfile, potential, xv, t_orb, dt, alpha,
     this step. lt beyond the bound profile leaves it intact; a bound mass that
     falls to the floor keeps the last bound `profile`.
     """
-    lt = float(ev.ltidal(newProfile, potential, xv, 'King62'))  # type: ignore[arg-type]
+    lt = float(ev.ltidal(newProfile, potential, xv, lt_choice))  # type: ignore[arg-type]
     if lt >= newProfile.rh:
         return newProfile, newProfile.Mh, lt
     # PCHIP eval at lt < rh can return M(lt) > Mh at floating-point precision
@@ -452,7 +453,7 @@ def evolve_heating(host, numProfile0, xv0, tmax=10., Nstep=10000,
                    epsh=3., gamma=2.5, alpha=1., beta_h=1.,
                    second_order=False, f2=0.406, chi_v=-0.333,
                    t_dyn_mode='sub_lt', truncation='hard',
-                   tail_n=5., tail_xi=0.,
+                   tail_n=5., tail_xi=0., lt_choice='King62',
                    n_snapshots=10, label=None, early_terminate=False,
                    dynamical_friction=True):
     # t_dyn_mode controls only the timescale T in the King62 stripping rate
@@ -496,6 +497,11 @@ def evolve_heating(host, numProfile0, xv0, tmax=10., Nstep=10000,
                          tidal radius; tail_n and tail_xi are calibration
                          knobs (stripped N-body envelopes are r^-5..-6,
                          Springel+08 / Green & van den Bosch 2019).
+
+    lt_choice selects the tidal-radius equation passed to ev.ltidal:
+        'King62'   -- keeps the centrifugal term Omega^2 r^3 / G M (default).
+        'Tormen98' -- drops it -> larger lt, weaker stripping. This is the
+                      form Du+24 use (their yc=0); King62 is yc=1.
 
     Benson+Du22 is a per-shock budget: dE_1 and sigma_r^2 are quantities accumulated
     over one full orbital encounter. The sqrt does not split linearly across
@@ -608,7 +614,8 @@ def evolve_heating(host, numProfile0, xv0, tmax=10., Nstep=10000,
             clamp_worst_arr[i] = tally['worst_pct']
             numProfile, m, lt = _strip_and_truncate(
                 numProfile, newProfile, potential, xv, t_orb, dt, alpha,
-                t_dyn_mode, truncation, t, tail_n=tail_n, tail_xi=tail_xi)
+                t_dyn_mode, truncation, t, tail_n=tail_n, tail_xi=tail_xi,
+                lt_choice=lt_choice)
 
         if should_reset:
             heater.reset(numProfile, t)
