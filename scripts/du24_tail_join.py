@@ -7,10 +7,16 @@ H = f_t/(1+(r/r_te)^delta) (Du+24 eq. 23), with the effective tidal radius
 r_te(x) fit to their simulations (eq. 30, Table II; gamma=1, delta=3 here).
 
 We build that evolved profile at a grid of bound fractions x, then compute the
-King62 l_t of the same profile at the orbit's apocentre (Du+24 measure r_te at
+l_t of the same profile at the orbit's apocentre (Du+24 measure r_te at
 apocentres). xi = log10(r_te / l_t), plus log10(r_break / l_t) where r_break is
 the slope=-5 radius, to match the DASH definition. Self-contained: no cache, no
 multiprocessing.
+
+The l_t equation is selectable: 'King62' (yc=1, centrifugal term, default) or
+'Tormen98' (yc=0, no centrifugal term -- the form Du+24 use). Non-default choices
+write a suffixed pickle (du24_tail_join_<choice>.pkl).
+
+    python scripts/du24_tail_join.py [lt_choice]
 """
 import os
 import sys
@@ -69,12 +75,14 @@ def break_radius(rgrid, rho, slope=-5.):
 
 
 def main():
+    lt_choice = sys.argv[1] if len(sys.argv) > 1 else 'King62'
+    suffix = '' if lt_choice == 'King62' else '_' + lt_choice.lower()
     host = NFW(sc.DU24_MV_HOST, sc.DU24_C_HOST)
     sub = NFW(sc.DU24_MV_SUB, sc.DU24_C_SUB)
     rgrid = np.logspace(np.log10(cfg.Rres), np.log10(3. * sub.rh), 400)
     xs = np.logspace(np.log10(0.02), 0., 25)
 
-    print(f"r_vir,sub = {sub.rh:.2f} kpc, c_sub = {sc.DU24_C_SUB}")
+    print(f"r_vir,sub = {sub.rh:.2f} kpc, c_sub = {sc.DU24_C_SUB}, l_t={lt_choice}")
     print(f"{'orbit':6s} {'x':>7s} {'r_te/rv':>8s} {'r_te':>7s} {'l_t':>7s} "
           f"{'xi_rte':>7s} {'xi_brk':>7s}")
     summary = {}
@@ -84,7 +92,7 @@ def main():
         xi_rte, xi_brk = [], []
         for x in xs:
             prof, rte = evolved_profile(sub, x, rgrid)
-            lt = ev.ltidal(prof, [host], xv0, 'King62')
+            lt = ev.ltidal(prof, [host], xv0, lt_choice)
             if not np.isfinite(lt) or lt <= cfg.Rres:
                 continue
             rho = prof.rho(rgrid)
@@ -104,7 +112,7 @@ def main():
 
     import pickle
     out = os.path.join(os.path.dirname(__file__), '..', 'etc',
-                       'calibration_runs', 'du24_tail_join.pkl')
+                       'calibration_runs', f'du24_tail_join{suffix}.pkl')
     pickle.dump(summary, open(out, 'wb'))
     print(f"-> {out}")
 

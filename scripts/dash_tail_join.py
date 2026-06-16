@@ -21,7 +21,11 @@ diagnostic for comparison. The unstripped subhalo is NFW(M_vir,s, c_s) with c_s
 from the DASH index. DASH is scale-free; we anchor an arbitrary host (M_vir,h =
 1e12, c_h = 10, the DASH value) -- xi is a ratio, scale drops.
 
-    python scripts/dash_tail_join.py [nruns]
+The l_t equation is selectable: 'King62' (yc=1, centrifugal term, default) or
+'Tormen98' (yc=0, no centrifugal term -- the form Du+24 use). Non-default choices
+write a suffixed pickle (dash_tail_join_<choice>.pkl).
+
+    python scripts/dash_tail_join.py [lt_choice]
 """
 import os
 import pickle
@@ -119,7 +123,7 @@ def tail_slope(r, rho, r_lo, r_hi):
     return float(np.polyfit(np.log(r[m]), np.log(rho[m]), 1)[0])
 
 
-def one_snapshot(bins, m_row, rho_row, pos, vel, sub_nfw):
+def one_snapshot(bins, m_row, rho_row, pos, vel, sub_nfw, lt_choice='King62'):
     """xi at the requested slopes for one snapshot, or None if unusable.
 
     M(<r) (m_row) builds the NumericProfile for l_t; the simulation's binned
@@ -133,7 +137,7 @@ def one_snapshot(bins, m_row, rho_row, pos, vel, sub_nfw):
         return None
     hi = grow[-1] + 2                           # keep one flat point past the edge
     sub = NumericProfile(r[:hi], M_phys[:hi])
-    lt = ev.ltidal(sub, [HOST], xv_cyl(pos, vel), 'King62')
+    lt = ev.ltidal(sub, [HOST], xv_cyl(pos, vel), lt_choice)
     if not np.isfinite(lt) or lt <= cfg.Rres:
         return None
     rho = rho_row * MV_S / RVIR_S**3            # to Msun/kpc^3 (rho in M_vir,s/r_vir,s^3)
@@ -157,6 +161,8 @@ def one_snapshot(bins, m_row, rho_row, pos, vel, sub_nfw):
 
 def main():
     import glob
+    lt_choice = sys.argv[1] if len(sys.argv) > 1 else 'King62'
+    suffix = '' if lt_choice == 'King62' else '_' + lt_choice.lower()
     repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
     dashroot = os.path.join(os.path.dirname(__file__), '..', 'etc', 'dash',
                             'DASH_19.05.09')
@@ -169,7 +175,7 @@ def main():
     print(f"host: r_vir,h={RVIR_H:.1f} kpc, v_vir,h={VVIR_H:.1f} kpc/Gyr; "
           f"r_vir,s={RVIR_S:.2f} kpc", flush=True)
     print(f"scanning {len(runs)} DASH runs with profiles, "
-          f"f_b in [{FB_LO},{FB_HI}]", flush=True)
+          f"f_b in [{FB_LO},{FB_HI}], l_t={lt_choice}", flush=True)
 
     recs = []
     for k, d in enumerate(runs):
@@ -189,7 +195,7 @@ def main():
             if 1 + sid >= M.shape[0] or 1 + sid >= rho.shape[0]:
                 continue
             r = one_snapshot(bins, M[1 + sid, 1:], rho[1 + sid, 1:],
-                             evo[sid, 1:4], evo[sid, 4:7], sub_nfw)
+                             evo[sid, 1:4], evo[sid, 4:7], sub_nfw, lt_choice)
             if r is None:
                 continue
             r.update(c_s=meta.get('cs', np.nan), eta=meta.get('eta', np.nan),
@@ -200,7 +206,7 @@ def main():
             print(f"  {k+1}/{len(runs)} runs, {len(recs)} snapshots", flush=True)
 
     out = os.path.join(os.path.dirname(__file__), '..', 'etc', 'calibration_runs',
-                       'dash_tail_join.pkl')
+                       f'dash_tail_join{suffix}.pkl')
     pickle.dump(recs, open(out, 'wb'))
     series = (('xi_rte (join)', np.array([r['xi_rte'] for r in recs])),
               ('xi(-4) diag', np.array([r['xi4'] for r in recs])),
