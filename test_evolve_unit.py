@@ -514,3 +514,188 @@ class TestTruncateKazantzidis:
                                        slope=-3.5)
             assert abs(cut.Mh - frac * prof.Mh) / (frac * prof.Mh) < 1e-4
             assert np.all(np.isfinite(cut.Mr))
+
+
+# ---------------------------------------------------------------------------
+# truncate_powerlaw tests — slope-deficit power-law tail
+# ---------------------------------------------------------------------------
+
+class TestTruncatePowerlaw:
+    """Slope-deficit tail: C1 at the join, asymptoting to rho ~ r^-n."""
+
+    def _numprofile(self):
+        from subhalo_functions import NumericProfile
+        sat = NFW(1e9, 20.)
+        ri = np.logspace(np.log10(1e-3 * sat.rh), np.log10(sat.rh), 300)
+        return NumericProfile(ri, sat.M(ri)), sat
+
+    @staticmethod
+    def _logslope(profile, r, d=1e-3):
+        return ((np.log(float(profile.rho(r * (1. + d))))
+                 - np.log(float(profile.rho(r * (1. - d)))))
+                / (2. * np.log(1. + d)))
+
+    def test_solved_beta_hits_target_mass(self):
+        """The solved beta makes the total enclosed mass = m_total."""
+        from subhalo_functions import truncate_powerlaw
+        prof, _ = self._numprofile()
+        r_t = 0.4 * prof.rh
+        for frac in (0.95, 0.8):
+            m_target = frac * prof.Mh
+            tp = truncate_powerlaw(prof, r_t, m_total=m_target)
+            assert abs(tp.Mh - m_target) / m_target < 1e-4
+
+    def test_c1_join_and_inner_preserved(self):
+        """Log-slope is continuous across the join (no jump in the gradient
+        density), the inner profile is unchanged, and the tail declines
+        monotonically outward."""
+        from subhalo_functions import truncate_powerlaw
+        prof, _ = self._numprofile()
+        r_t = 0.3 * prof.rh
+        tp = truncate_powerlaw(prof, r_t, m_total=0.85 * prof.Mh)
+        assert abs(float(tp.rho(r_t)) / float(prof.rho(r_t)) - 1.) < 0.05
+        s_in = self._logslope(tp, r_t * 0.98)
+        s_out = self._logslope(tp, r_t * 1.02)
+        assert abs(s_out - s_in) < 0.15, f"slope jump at join: {s_in} vs {s_out}"
+        r_mid = 0.1 * prof.rh
+        assert abs(float(tp.rho(r_mid)) / float(prof.rho(r_mid)) - 1.) < 0.05
+        assert abs(float(tp.M(r_mid)) / float(prof.M(r_mid)) - 1.) < 1e-3
+        rho_tail = np.array([float(tp.rho(r_t * f)) for f in (1.2, 1.6, 2.5, 5.)])
+        assert np.all(np.diff(rho_tail) < 0.), "tail density not monotone declining"
+
+    def test_asymptotic_slope_reaches_minus_n(self):
+        """Far out the local log-slope approaches -n (a sustained power law,
+        not the Kazantzidis exponential plunge). The slope deficit decays as
+        u^-beta with the solved beta, so the approach rate is budget-
+        dependent; assert convergence, not a fixed offset."""
+        from subhalo_functions import truncate_powerlaw
+        prof, _ = self._numprofile()
+        r_t = 0.3 * prof.rh
+        for n in (5., 6.):
+            tp = truncate_powerlaw(prof, r_t, n=n, m_total=0.9 * prof.Mh)
+            r_far = min(20. * r_t, 0.8 * tp.rh)
+            assert r_far > 5. * r_t, "tail grid too short to probe the asymptote"
+            res_near = abs(self._logslope(tp, 3. * r_t) - (-n))
+            res_far = abs(self._logslope(tp, r_far) - (-n))
+            assert res_far < 0.5 * res_near, \
+                f"n={n}: slope deficit not converging ({res_near:.2f} -> {res_far:.2f})"
+            assert res_far < 0.5, \
+                f"n={n}: slope {-n + res_far:.2f} at {r_far/r_t:.0f} r_t"
+
+    def test_budget_below_floor_hard_cuts(self):
+        """A budget below the pure r^-n floor 4 pi rho_t r_t^3/(n-3) has no
+        index-n tail; the fallback hard cut still conserves mass."""
+        import config as cfg
+        from subhalo_functions import truncate_powerlaw
+        prof, _ = self._numprofile()
+        r_t = 0.4 * prof.rh
+        M_t = float(prof.M(r_t))
+        floor = cfg.FourPi * float(prof.rho(r_t)) * r_t**3 / 2.  # n=5
+        m_total = M_t + 0.5 * floor
+        tp = truncate_powerlaw(prof, r_t, n=5., m_total=m_total)
+        assert abs(tp.Mh - m_total) / m_total < 1e-4
+        assert tp.rh < 1.5 * r_t, "no extended tail below the floor"
+
+    def test_zero_budget_recovers_hard_cut(self):
+        """m_total = M(<r_t) leaves no tail -- the result is cut at r_t."""
+        from subhalo_functions import truncate_powerlaw
+        prof, _ = self._numprofile()
+        r_t = 0.4 * prof.rh
+        M_t = float(prof.M(r_t))
+        tp = truncate_powerlaw(prof, r_t, m_total=M_t * (1. + 1e-12))
+        assert abs(tp.rh - r_t) / r_t < 1e-6
+        assert abs(tp.Mh - M_t) / M_t < 1e-9
+
+    def test_fixed_beta_matches_direct_integration(self):
+        """Fixed-beta tail mass matches a direct quadrature of the analytic
+        density -- validates the incomplete-gamma mass formula."""
+        from subhalo_functions import truncate_powerlaw
+        prof, _ = self._numprofile()
+        r_t = prof.rh  # the profile's own outer knot (sat.rh up to roundoff)
+        s = -1. - 2. * 20. / 21.  # NFW dln(rho)/dln(r) at r=rvir, c=20
+        n, beta = 5., 2.
+        tp = truncate_powerlaw(prof, r_t, n=n, beta=beta, slope=s)
+        rho_t = float(prof.rho(r_t))
+        integ = quad(lambda r: 4. * np.pi * r**2 * rho_t * (r / r_t)**(-n)
+                     * np.exp((n + s) / beta
+                              * (1. - (r / r_t)**(-beta))), r_t, tp.rh)[0]
+        M_t = float(prof.M(r_t))
+        assert abs((tp.Mh - M_t) - integ) / integ < 1e-3
+
+    def test_tail_beyond_rmax_preserves_rmax(self):
+        """A tail stitched well outside r_max leaves r_max, V_max unchanged."""
+        from subhalo_functions import truncate_powerlaw
+        prof, _ = self._numprofile()
+        r_t = 0.5 * prof.rh
+        tp = truncate_powerlaw(prof, r_t, m_total=0.9 * prof.Mh)
+        assert abs(tp.rmax - prof.rmax) / prof.rmax < 1e-3
+        assert abs(tp.Vmax - prof.Vmax) / prof.Vmax < 1e-3
+
+    def test_requires_exactly_one_of_beta_mtotal(self):
+        from subhalo_functions import truncate_powerlaw
+        prof, _ = self._numprofile()
+        with pytest.raises(ValueError):
+            truncate_powerlaw(prof, 0.4 * prof.rh)
+        with pytest.raises(ValueError):
+            truncate_powerlaw(prof, 0.4 * prof.rh, beta=1., m_total=1e8)
+
+    def test_join_steeper_than_asymptote(self):
+        """A join slope steeper than -n has no slope-deficit tail: the
+        m_total path falls back to a mass-conserving hard cut, the fixed-beta
+        path raises."""
+        from subhalo_functions import truncate_powerlaw
+        prof, _ = self._numprofile()
+        r_t = 0.4 * prof.rh
+        m_total = 0.9 * prof.Mh
+        cut = truncate_powerlaw(prof, r_t, n=5., m_total=m_total, slope=-5.5)
+        assert abs(cut.Mh - m_total) / m_total < 1e-4
+        assert np.all(np.isfinite(cut.Mr))
+        with pytest.raises(ValueError):
+            truncate_powerlaw(prof, r_t, n=5., beta=1., slope=-5.5)
+
+    def test_n_must_exceed_3(self):
+        """n <= 3 has divergent tail mass and is rejected."""
+        from subhalo_functions import truncate_powerlaw
+        prof, _ = self._numprofile()
+        with pytest.raises(ValueError):
+            truncate_powerlaw(prof, 0.4 * prof.rh, n=3., m_total=0.9 * prof.Mh)
+
+
+class TestNumericProfileValidation:
+    """Bad inputs raise at construction instead of producing a silently
+    broken profile (NaN Mh, density clamped from a negative shell mass)."""
+
+    def _grid(self):
+        sat = NFW(1e9, 20.)
+        ri = np.logspace(np.log10(1e-3 * sat.rh), np.log10(sat.rh), 50)
+        return ri, sat.M(ri)
+
+    def test_nonfinite_raises(self):
+        from subhalo_functions import NumericProfile
+        ri, Mr = self._grid()
+        Mr = Mr.copy()
+        Mr[10] = np.nan
+        with pytest.raises(ValueError, match="non-finite"):
+            NumericProfile(ri, Mr)
+
+    def test_non_monotone_ri_raises(self):
+        from subhalo_functions import NumericProfile
+        ri, Mr = self._grid()
+        ri = ri.copy()
+        ri[20] = ri[19]  # duplicate kills strict monotonicity
+        with pytest.raises(ValueError, match="strictly increasing"):
+            NumericProfile(ri, Mr)
+
+    def test_decreasing_mass_raises(self):
+        from subhalo_functions import NumericProfile
+        ri, Mr = self._grid()
+        Mr = Mr.copy()
+        Mr[30] = 0.5 * Mr[29]  # enclosed mass dips outward -- negative shell
+        with pytest.raises(ValueError, match="non-decreasing"):
+            NumericProfile(ri, Mr)
+
+    def test_length_mismatch_raises(self):
+        from subhalo_functions import NumericProfile
+        ri, Mr = self._grid()
+        with pytest.raises(ValueError):
+            NumericProfile(ri, Mr[:-1])

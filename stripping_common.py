@@ -1,17 +1,42 @@
 # shared evolution routines and plots for tidal stripping notebooks
 
-import numpy as np
-import matplotlib.pyplot as plt
-from matplotlib.lines import Line2D
 from dataclasses import dataclass
+from typing import Optional
+
+import matplotlib.pyplot as plt
+import numpy as np
+from matplotlib.lines import Line2D
 from scipy.optimize import brentq
 
 import config as cfg
-from profiles import NFW, Dekel, Green, Vcirc, tdyn
-from orbit import orbit
 import evolve as ev
+from orbit import orbit
+from profiles import NFW, Dekel, Green, Vcirc, tdyn
 from subhalo_functions import (NumericProfile, heat_profile, tidalTensor,
-                               truncate_kazantzidis)
+                               truncate_kazantzidis, truncate_powerlaw)
+
+
+class OverstripError(ValueError):
+    """King62 step is too coarse: alpha*dt/T_strip exceeds STRIP_CFL_MAX, so
+    the bound-mass excess would underflow to a numerical hard cut. An
+    infeasible (params, dt) point a calibrator can catch and score as -inf,
+    distinct from a bare ValueError signalling a real bug. Subclasses
+    ValueError so existing `except ValueError` / pytest.raises(ValueError)
+    paths still match."""
+
+
+# Ceiling on the per-step stripping number cfl = alpha*dt/T_strip. The name is by
+# analogy to the Courant-Friedrichs-Lewy condition (a step-size / timescale
+# ratio); the limit here is floating-point underflow, not integration stability.
+#
+# Each King62 step relaxes the unbound-mass excess (m - M(<lt)) toward M(<lt) by a
+# factor exp(-cfl). At cfl = 10 that factor is exp(-10) ~ 5e-5: a single step
+# already removes ~5 orders of magnitude of the excess. Much beyond that the
+# excess underflows to numerical zero -- a spurious instantaneous hard cut instead
+# of resolved gradual stripping. So when a step would exceed STRIP_CFL_MAX,
+# evolve_heating raises OverstripError (dt too coarse / alpha too large). Normal
+# steps sit at cfl ~ 1, even at a deep pericenter, well below the ceiling.
+STRIP_CFL_MAX = 10.0
 
 
 # Stripping bookkeeping: Zentner+05 / Du+24 eq. 35 with T_dyn = t_orb
@@ -42,6 +67,12 @@ class EvolutionResult:
     rmax0: float = 0.
     vmax0: float = 0.
     label: str = ''
+    # per-step shell-crossing clamp activity, aligned to t/m/lt (NaN on skipped
+    # steps). clamp is the shells clamped that step; clamp_worst the largest
+    # overshoot the clamp removed (%). None for non-heating evolvers. Bin by
+    # m (bound fraction) or t for clamp-vs-stage analysis.
+    clamp: Optional[np.ndarray] = None
+    clamp_worst: Optional[np.ndarray] = None
 
 
 def make_orbit(host, R0=1., z0=0., phi0=0., VR0=0., Vz0=0., eta=1.):
@@ -53,6 +84,26 @@ def make_orbit(host, R0=1., z0=0., phi0=0., VR0=0., Vz0=0., eta=1.):
     Vphi0 = eta * Vcirc(host, r0, 0.)
     xv0 = np.array([R0, phi0, z0, VR0, Vphi0, Vz0])
     return xv0, orbit(xv0)
+
+
+# Du+24 Section II.A idealized setup (arXiv:2403.09597): NFW host 1e12 Msun,
+# NFW subhalo 1e9 Msun -- the gamma_subhalo=1 reference for the stripping study.
+DU24_MV_HOST, DU24_C_HOST = 1.0e12, 263.2 / 23.69   # rs=23.69, rvir=263.2 kpc
+DU24_MV_SUB, DU24_C_SUB = 1.0e9, 26.32 / 1.279      # rs=1.279, rvir=26.32 kpc
+DU24_ETA = {'1/5': 0.404, '1/20': 0.131}            # circularity -> R_p/R_a
+
+
+def du24_nfw_setup(nr=200):
+    """NFW host + subhalo on the Du+24 II.A ICs.
+
+    Returns (host, sat, rvals, M_sub). sat is the analytic NFW (callers that
+    need r_vir or the virial-edge slope use it); the stripped evolution starts
+    from NumericProfile(rvals, M_sub).
+    """
+    host = NFW(DU24_MV_HOST, DU24_C_HOST)
+    sat = NFW(DU24_MV_SUB, DU24_C_SUB)
+    rvals = np.logspace(np.log10(cfg.Rres), np.log10(sat.rh), nr)
+    return host, sat, rvals, sat.M(rvals)
 
 
 def _vmax_rmax(profile):
@@ -288,8 +339,13 @@ class _HeatingStepper:
         c2, sig2, rh = self.c2, self.sig2, self.rh
 
         def eps_r(r_, _h=d_H, _ds=d_sqrt, _c2=c2, _s2=sig2, _rh=rh):
+            # vectorized over r_ (heat_profile passes the full shell grid):
+            # sigma_r^2 is only defined within the half-mass radius, zero
+            # beyond. np.where masks the out-of-range spline values (the
+            # interpolator's clamp/NaN tail) before the sqrt.
+            r_ = np.asarray(r_, dtype=float)
             e1 = _h * r_**2
-            s2 = max(float(_s2(r_)), 0.) if r_ <= _rh else 0.
+            s2 = np.where(r_ <= _rh, np.maximum(_s2(r_), 0.), 0.)
             return e1 + _c2 * r_ * np.sqrt(s2) * _ds
 
         self.H = H_new
@@ -308,11 +364,84 @@ class _HeatingStepper:
         self.rh = numProfile.rh
 
 
+def _truncate_hard(newProfile, m_new):
+    """Hard cut: rebuild on a fresh log grid truncated at rmaxNew = M^-1(m_new).
+
+    A fresh grid (rather than inheriting the parent's) avoids shedding knots as
+    rmaxNew shrinks, which clumps the (rmax, Vmax) track at deep stripping. The
+    inner bound max(Rres, ri[0]) keeps samples off the PCHIP boundary clamp
+    below ri[0] (a constant-M plateau that np.gradient turns into alternating
+    zero / spurious rho inside NumericProfile).
+    """
+    m_new = min(m_new, float(newProfile.M(newProfile.rh)))  # keep bisect bracket valid
+    rmaxNew = brentq(lambda r_: float(newProfile.M(r_)) - m_new,
+                     newProfile.ri[0], newProfile.rh, xtol=1e-8)
+    rvals_new = np.logspace(np.log10(max(cfg.Rres, float(newProfile.ri[0]))),
+                            np.log10(rmaxNew), len(newProfile.ri))
+    Mr_new = newProfile.M(rvals_new)
+    Mr_new[-1] = m_new  # heat_profile spline can land M(rmaxNew) slightly off m_new
+    return NumericProfile(rvals_new, Mr_new)
+
+
+def _strip_and_truncate(profile, newProfile, potential, xv, t_orb, dt, alpha,
+                        t_dyn_mode, truncation, t, tail_n=5., tail_xi=0.):
+    """One King62 strip + retruncate step. Returns (profile, m, lt).
+
+    Zentner+05 / Du+24 eq. 35 relaxes the bound mass toward M(<lt) on T_strip;
+    `profile` is the current bound profile and `newProfile` its heated form for
+    this step. lt beyond the bound profile leaves it intact; a bound mass that
+    falls to the floor keeps the last bound `profile`.
+    """
+    lt = float(ev.ltidal(newProfile, potential, xv, 'King62'))  # type: ignore[arg-type]
+    if lt >= newProfile.rh:
+        return newProfile, newProfile.Mh, lt
+    # PCHIP eval at lt < rh can return M(lt) > Mh at floating-point precision
+    # (~1e-16 relative) due to roundoff, even though the spline is monotone on
+    # monotone input. Clamp to M(<r) <= Mh so the relaxation excess stays >= 0.
+    M_at_lt = min(float(newProfile.M(lt)), float(newProfile.Mh))
+    if t_dyn_mode == 'sub_lt':
+        T_strip = (np.pi / 2.) * (
+            np.sqrt(lt**3 / (cfg.G * M_at_lt)) if M_at_lt > 0.
+            else newProfile.rmax / newProfile.Vmax
+        )
+    else:
+        T_strip = t_orb
+    # Over a step lt (hence M(<lt), T_strip) is fixed, so the excess m - M(<lt)
+    # relaxes as exp(-alpha dt/T_strip). The closed form asymptotes to M(<lt)
+    # from above and never crosses it, so m_new >= M(<lt) for any dt.
+    cfl = alpha * dt / T_strip
+    if cfl > STRIP_CFL_MAX:
+        raise OverstripError(
+            f"Stripping step alpha*dt/T_strip = {cfl:.1f} > {STRIP_CFL_MAX} "
+            f"at lt={lt:.2f} kpc, t={t:.2f} Gyr; the bound-mass excess would "
+            f"underflow. Increase Nstep to reduce dt or decrease alpha"
+        )
+    m_new = max(M_at_lt + (newProfile.Mh - M_at_lt) * np.exp(-cfl), cfg.Mres)
+    if m_new <= cfg.Mres:
+        return profile, m_new, lt
+    if truncation == 'hard':
+        return _truncate_hard(newProfile, m_new), m_new, lt
+    if truncation == 'powerlaw':
+        # slope-deficit tail: C1 join at r_join = lt * 10^xi, asymptoting to
+        # rho ~ r^-n (see truncate_powerlaw); beta solved so the tail carries
+        # the King62 budget m_new - M(<r_join). xi=0 joins at the tidal
+        # radius; xi and n are calibration knobs.
+        r_join = lt * 10.**tail_xi
+        return truncate_powerlaw(newProfile, r_join, n=tail_n,
+                                 m_total=m_new), m_new, lt
+    # Kazantzidis+06 exponential tail at lt: keep M(<lt) and attach a tail
+    # carrying the King62 budget m_new - M(<lt) so the loosely-bound envelope is
+    # shed smoothly rather than clipped.
+    return truncate_kazantzidis(newProfile, lt, m_total=m_new), m_new, lt
+
+
 def evolve_heating(host, numProfile0, xv0, tmax=10., Nstep=10000,
                    epsh=3., gamma=2.5, alpha=1., beta_h=1.,
                    second_order=False, f2=0.406, chi_v=-0.333,
                    t_dyn_mode='sub_lt', truncation='hard',
-                   n_snapshots=10, label=None):
+                   tail_n=5., tail_xi=0.,
+                   n_snapshots=10, label=None, early_terminate=False,
+                   dynamical_friction=True):
     # t_dyn_mode controls only the timescale T in the King62 stripping rate
     # (Du+24 eq. 35):
     #   'host':   T = T_dyn,host(r_sub) = tdyn(host, r_sub).
@@ -326,30 +455,34 @@ def evolve_heating(host, numProfile0, xv0, tmax=10., Nstep=10000,
     # guard all use host-side t_orb regardless. Du+24 integrate the tensor
     # cumulant on the host orbital time and strip on the subhalo dynamical
     # time (eqs. 35, 38-39); 'sub_lt' reproduces that split.
-    # The defaults are the SIS-host parameter set used in
-    # stripping_sis.ipynb (epsh=3, gamma=2.5, alpha=1, beta_h=1, f2=0.406,
-    # chi_v=-0.333, t_dyn_mode='sub_lt'). Only f2/chi_v are the Benson+Du22
-    # second-order heating fit; Benson+Du22 do not calibrate the King62
-    # mass-loss model (alpha and the timescale T) -- they inherit the
-    # Yang+20 mass-loss model. For Du+24's NFW-host calibration override to
-    # (epsh=0.0741, gamma=0, alpha=3.93, beta_h=0.278, f2=0.547,
-    # chi_v=-0.333); both sets strip on t_dyn_mode='sub_lt'.
+    # The defaults are the SIS-host set from stripping_sis.ipynb (epsh=3,
+    # gamma=2.5, alpha=1, beta_h=1, f2=0.406, chi_v=-0.333, t_dyn_mode='sub_lt').
+    # Of these only f2/chi_v come from the Benson+Du22 second-order fit;
+    # Benson+Du22 do not calibrate the King62 mass-loss (alpha, T) -- that is
+    # Yang+20. The calibrated NFW-host set (Du+24 Table IV, gamma=1) lives in
+    # model_params.DU24_TABLE_IV; it also strips on t_dyn_mode='sub_lt'.
     """Du+24 monotonic shell expansion + King62 stripping.
 
     second_order=True adds the Benson+Du22 second-order correction (eq. 4):
         dE = dE_1 + c2 * sqrt(dE_1 * sigma_r^2),  c2 = sqrt(2) f_2 (1+chi_v)
-    Defaults f_2=0.406, chi_v=-0.333 are the Benson+Du22 SIS-host fit. For
-    an NFW host use Du+24 Table IV (gamma=1 column): f_2=0.547.
+    Defaults f_2=0.406, chi_v=-0.333 are the Benson+Du22 SIS-host fit; the
+    calibrated NFW-host set is model_params.DU24_TABLE_IV.
 
     beta_h sets the cumulant decay rate in eq. 39 of Du+24:
         dG_ab/dt = g_ab - beta_h * G_ab / T_orbit
-    The default beta_h=1 matches Benson+Du22 eq. 16. Du+24 Table IV gives
-    beta_h=0.278 for an NFW subhalo on an NFW host.
+    The default beta_h=1 matches Benson+Du22 eq. 16.
 
     truncation selects how the stripped profile is rebuilt each step:
         'hard'        -- truncate at rmaxNew = M^-1(m_new) (default).
         'kazantzidis' -- keep M(<lt), attach a Kazantzidis+06 exponential
                          tail carrying the King62 budget m_new - M(<lt).
+        'powerlaw'    -- keep M(<r_join), attach a slope-deficit power-law
+                         tail (truncate_powerlaw) asymptoting to
+                         rho ~ r^-tail_n, C1 at r_join = lt * 10^tail_xi,
+                         carrying the King62 budget. tail_xi=0 joins at the
+                         tidal radius; tail_n and tail_xi are calibration
+                         knobs (stripped N-body envelopes are r^-5..-6,
+                         Springel+08 / Green & van den Bosch 2019).
 
     Benson+Du22 is a per-shock budget: dE_1 and sigma_r^2 are quantities accumulated
     over one full orbital encounter. The sqrt does not split linearly across
@@ -366,8 +499,8 @@ def evolve_heating(host, numProfile0, xv0, tmax=10., Nstep=10000,
     if label is None:
         label = '1st+2nd order heating' if second_order else '1st order heating'
     assert cfg.Mres is not None, "cfg.Mres must be set before calling evolve_heating"
-    assert truncation in ('hard', 'kazantzidis'), \
-        f"truncation must be 'hard' or 'kazantzidis', got {truncation!r}"
+    assert truncation in ('hard', 'kazantzidis', 'powerlaw'), \
+        f"truncation must be 'hard', 'kazantzidis' or 'powerlaw', got {truncation!r}"
     potential = host
     timesteps = np.linspace(0., tmax, Nstep + 1)[1:]
 
@@ -400,13 +533,28 @@ def evolve_heating(host, numProfile0, xv0, tmax=10., Nstep=10000,
     tt_int = np.zeros((3, 3))  # running tidal-tensor time integral [kpc/Gyr]^2
 
     heater = _HeatingStepper(numProfile, second_order, f2=f2, chi_v=chi_v)
+    clamp_arr = np.full(Nstep, np.nan)
+    clamp_worst_arr = np.full(Nstep, np.nan)
 
     for i, t in enumerate(timesteps):
         dt = t - tprevious
         if r <= cfg.Rres:
             tprevious = t
             continue
-        o.integrate(t, potential, m)
+        if early_terminate and m <= cfg.Mres:
+            # subhalo dissolved -- King62 rate keeps m clamped at Mres, so
+            # later steps just no-op heating + reuse the frozen profile.
+            # Record the terminal state once and exit; later slots stay NaN.
+            t_arr[i] = t
+            r_arr[i] = r
+            m_arr[i] = cfg.Mres
+            vmax_arr[i] = numProfile.Vmax
+            rmax_arr[i] = numProfile.rmax
+            lt_arr[i] = cfg.Rres
+            clamp_arr[i] = 0.
+            clamp_worst_arr[i] = 0.
+            break
+        o.integrate(t, potential, m if dynamical_friction else None)
         xv = o.xv
         r = np.sqrt(xv[0]**2 + xv[2]**2)
         V = np.sqrt(xv[3]**2 + xv[4]**2 + xv[5]**2)
@@ -438,75 +586,16 @@ def evolve_heating(host, numProfile0, xv0, tmax=10., Nstep=10000,
 
         if m <= cfg.Mres:
             m, lt = cfg.Mres, cfg.Rres
+            clamp_arr[i] = 0.
+            clamp_worst_arr[i] = 0.
         else:
-            newProfile = heat_profile(numProfile, eps_r)
-            lt = float(ev.ltidal(newProfile, potential, xv, 'King62'))  # type: ignore[arg-type]
-            if lt >= newProfile.rh:
-                numProfile, m = newProfile, newProfile.Mh
-            else:
-                # Zentner+05 / Du+24 eq. 35. Drain the mass past lt at rate
-                # alpha (Mh - M(<lt)) / T; truncate at rmaxNew=M^-1(m_new).
-                # PCHIP eval at lt < rh can return M(lt) > Mh at
-                # floating-point precision (~1e-16 relative) due to
-                # roundoff, even though the spline is monotone on
-                # monotone input. In the deep-stripping asymptote where
-                # Mh - M(<lt) is itself near zero, that tiny overshoot
-                # flips the sign of (Mh - M_at_lt) and trips the
-                # overstrip check below on floating-point noise rather
-                # than a real overshoot. Clamp to enforce the analytic
-                # constraint M(<r) <= Mh; real overshoots
-                # (alpha * dt / T_strip > 1) still raise below.
-                M_at_lt = min(float(newProfile.M(lt)), float(newProfile.Mh))
-                T_strip = t_orb
-                if t_dyn_mode == 'sub_lt':
-                    T_strip = (np.pi / 2.) * (
-                        np.sqrt(lt**3 / (cfg.G * M_at_lt)) if M_at_lt > 0.
-                        else newProfile.rmax / newProfile.Vmax
-                    )
-                dm = max(float(alpha * (newProfile.Mh - M_at_lt) * dt / T_strip), 0.)
-                m_new = max(newProfile.Mh - dm, cfg.Mres)
-                # rate equation asymptotes to M(<lt), never below: without
-                # the cap, dt/T_strip > 1/alpha takes m_new < M_at_lt in
-                # one step (rmaxNew < lt, unphysical).
-                if m_new < M_at_lt:
-                    raise ValueError(
-                        f"Detected overstripping: m_new={m_new:.2e} < "
-                        f"M(<lt)={M_at_lt:.2e} at lt={lt:.2f} kpc; "
-                        f"increase Nstep to reduce dt or decrease alpha"
-                    )
-                if m_new > cfg.Mres:
-                    if truncation == 'hard':
-                        # clamp to spline at rh to keep the bisect bracket valid
-                        m_new = min(m_new, float(newProfile.M(newProfile.rh)))
-                        rmaxNew = brentq(
-                            lambda r_: float(newProfile.M(r_)) - m_new,
-                            newProfile.ri[0], newProfile.rh, xtol=1e-8,
-                        )
-                        # fresh log-spaced grid: inheriting the outer-truncated
-                        # parent grid sheds knots as rmaxNew shrinks, causing
-                        # clumps in the (rmax, Vmax) track at deep stripping.
-                        # Inner bound is max(Rres, newProfile.ri[0]): sampling
-                        # below newProfile.ri[0] hits the PCHIP boundary
-                        # clamp (returns the boundary M-value), producing a
-                        # constant-M plateau that np.gradient turns into
-                        # alternating zero / spurious-large rho values inside
-                        # NumericProfile.
-                        n_grid = len(newProfile.ri)
-                        rvals_new = np.logspace(
-                            np.log10(max(cfg.Rres, float(newProfile.ri[0]))),
-                            np.log10(rmaxNew), n_grid,
-                        )
-                        Mr_new = newProfile.M(rvals_new)
-                        Mr_new[-1] = m_new  # heat_profile spline can put M(rmaxNew) slightly off m_new
-                        numProfile = NumericProfile(rvals_new, Mr_new)
-                    else:
-                        # Kazantzidis+06 exponential tail at lt in place of the
-                        # hard cut: keep M(<lt), attach a tail carrying the
-                        # King62 budget m_new - M(<lt) so the loosely-bound
-                        # envelope is shed smoothly rather than clipped.
-                        numProfile = truncate_kazantzidis(
-                            newProfile, lt, m_total=m_new)
-                m = m_new
+            tally = {}
+            newProfile = heat_profile(numProfile, eps_r, tally=tally)
+            clamp_arr[i] = tally['shells']
+            clamp_worst_arr[i] = tally['worst_pct']
+            numProfile, m, lt = _strip_and_truncate(
+                numProfile, newProfile, potential, xv, t_orb, dt, alpha,
+                t_dyn_mode, truncation, t, tail_n=tail_n, tail_xi=tail_xi)
 
         if should_reset:
             heater.reset(numProfile, t)
@@ -536,6 +625,7 @@ def evolve_heating(host, numProfile0, xv0, tmax=10., Nstep=10000,
         t=t_arr, r=r_arr, m=m_arr, vmax=vmax_arr, rmax=rmax_arr, lt=lt_arr,
         r_grid=r_grids, rho_snapshots=rho_snaps, M_snapshots=M_snaps,
         snapshot_steps=track_steps, rmax0=rmax0, vmax0=vmax0, label=label,
+        clamp=clamp_arr, clamp_worst=clamp_worst_arr,
     )
 
 

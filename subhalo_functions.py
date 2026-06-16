@@ -1,22 +1,40 @@
 # SatGen imports
 # other imports
 import warnings
+from functools import cached_property
 from typing import cast
 
 import numpy as np
 from scipy.integrate import quad
 from scipy.interpolate import InterpolatedUnivariateSpline, PchipInterpolator
 from scipy.optimize import brentq
-from scipy.special import gammaincc, gammaln
+from scipy.special import gammainc, gammaincc, gammaincinv, gammaln
 
 import config as cfg
 import cosmo as co
 
 
-# heat_profile is called every ODE step (~30k/run); the local monotonic
-# clamp fires routinely near the inner grid edge. One warning per process
-# is enough to flag the issue without spamming the log.
-_heat_profile_clamp_warned = False
+class ShellClampWarning(RuntimeWarning):
+    """heat_profile's local monotonic shell-crossing clamp fired.
+
+    Routine near the inner grid edge and on the negligible-mass outer
+    Kazantzidis tail (eps_r ~ r^2 overshoots there); not an error. Off by
+    default. Re-enable to audit clamping:
+        warnings.simplefilter('always', ShellClampWarning)
+    """
+
+
+class HeatingUnbindsError(RuntimeError):
+    """Tidal heating leaves <=2 bound shells -- the halo is destroyed in one
+    step. A genuine boundary at extreme heating parameters, not a code bug;
+    callers exploring parameter space (e.g. MCMC) catch it as an infeasible
+    point rather than crashing."""
+
+
+# heat_profile clamps on most ODE steps (~30k/run), so the warning is silenced
+# by default. Full Du+24 IV.C r_crossing handling is still a TODO; the clamp is
+# the present-tense approximation.
+warnings.filterwarnings('ignore', category=ShellClampWarning)
 
 
 class SIS(object):
@@ -130,8 +148,16 @@ def _log_pchip(x, y, eps_rel=1e-30, clamp_below='value', clamp_above='value',
     hi_val = y_hi if clamp_above == 'value' else 0.
 
     def f(r):
-        scalar_in = np.ndim(r) == 0
-        r_arr = np.atleast_1d(np.asarray(r, dtype=float))
+        # scalar fast path: brentq/quad hammer this with single floats, so skip
+        # the array allocation + boolean-mask machinery in that case
+        if np.ndim(r) == 0:
+            rv = float(r)
+            if rv < x_lo:
+                return lo_val
+            if rv > x_hi:
+                return hi_val
+            return float(np.exp(pchip(np.log(rv))))
+        r_arr = np.asarray(r, dtype=float)
         out = np.empty_like(r_arr)
         below = r_arr < x_lo
         above = r_arr > x_hi
@@ -140,7 +166,7 @@ def _log_pchip(x, y, eps_rel=1e-30, clamp_below='value', clamp_above='value',
             out[inside] = np.exp(pchip(np.log(r_arr[inside])))
         out[below] = lo_val
         out[above] = hi_val
-        return out.item() if scalar_in else out
+        return out
     return f
 
 
@@ -154,6 +180,23 @@ def tidalTensor(hostProfile, coords):
 
 class NumericProfile(object):
     def __init__(self, ri, Mr):
+        ri = np.asarray(ri, dtype=float)
+        Mr = np.asarray(Mr, dtype=float)
+        if ri.ndim != 1 or ri.shape != Mr.shape or ri.size < 2:
+            raise ValueError(
+                f"NumericProfile needs matching 1D ri, Mr with >=2 knots; "
+                f"got ri{ri.shape}, Mr{Mr.shape}")
+        if not (np.all(np.isfinite(ri)) and np.all(np.isfinite(Mr))):
+            raise ValueError("NumericProfile: non-finite value in ri or Mr")
+        if np.any(np.diff(ri) <= 0.):
+            raise ValueError("NumericProfile: ri must be strictly increasing")
+        # M(<r) is an enclosed mass: non-decreasing outward. A roundoff margin
+        # absorbs FD/PCHIP noise on plateaus; a real dip is a negative shell
+        # mass (upstream construction bug) and must surface, not get papered
+        # over by the np.maximum(dMdr, 0) density clamp below.
+        if np.min(np.diff(Mr)) < -1e-9 * np.max(np.abs(Mr)):
+            raise ValueError(
+                "NumericProfile: Mr must be non-decreasing (enclosed mass)")
         self.ri = ri
         self.Mr = Mr
         self.rh = np.max(ri)
@@ -177,6 +220,15 @@ class NumericProfile(object):
                                   leading_only=True)
                        or PchipInterpolator(self.ri, self.rhovals, extrapolate=False))
 
+    # rmax/Vmax, r_half/omega_p, and sigma_r^2 are deferred: the forward model
+    # builds an intermediate heated profile every step (heat_profile) on which
+    # only M and rho are read (via ev.ltidal); the per-step root-finding and the
+    # cubic sigma_r^2 spline below dominated __init__ and were thrown away
+    # unread. sigma_r^2 in particular is consumed only at peri-to-peri resets.
+    # Each property caches on first access.
+
+    @cached_property
+    def _rmax_vmax(self):
         # rmax / Vmax via root-finding of f(r) = 4*pi*r^3*rho - M = 0,
         # the dVc/dr = 0 condition. Heated/stripped profiles can be
         # multimodal: a small outer Vc bump (from the heating-induced
@@ -196,21 +248,28 @@ class NumericProfile(object):
         idx_pm = np.where((f_grid[:-1] > 0.) & (f_grid[1:] < 0.))[0]
         idx_pm = idx_pm[idx_pm < len(rr) - 5]
         if len(idx_pm) == 0:
-            self.rmax = np.nan
-            self.Vmax = float(np.max(self.Vcirc(rr)))
-        else:
-            best_r, best_V = -1., -1.
-            for k in idx_pm:
-                rk = cast(float, brentq(
-                    lambda r: 4.0*np.pi*r**3 * float(self.rho(r)) - float(self.MInt(r)),
-                    rr[int(k)], rr[int(k)+1], xtol=1e-8,
-                ))
-                Vk = float(self.Vcirc(rk))
-                if Vk > best_V:
-                    best_r, best_V = rk, Vk
-            self.rmax = float(best_r)
-            self.Vmax = float(best_V)
+            return np.nan, float(np.max(self.Vcirc(rr)))
+        best_r, best_V = -1., -1.
+        for k in idx_pm:
+            rk = cast(float, brentq(
+                lambda r: 4.0*np.pi*r**3 * float(self.rho(r)) - float(self.MInt(r)),
+                rr[int(k)], rr[int(k)+1], xtol=1e-8,
+            ))
+            Vk = float(self.Vcirc(rk))
+            if Vk > best_V:
+                best_r, best_V = rk, Vk
+        return float(best_r), float(best_V)
 
+    @property
+    def rmax(self):
+        return self._rmax_vmax[0]
+
+    @property
+    def Vmax(self):
+        return self._rmax_vmax[1]
+
+    @cached_property
+    def _sig2(self):
         # sigma_r^2 at ri grid points via exact spline antiderivative (Jeans, isotropic)
         fvals = np.maximum(self.rhovals, 0.) * np.maximum(self.Mr, 0.) / self.ri**2
         f_spl = InterpolatedUnivariateSpline(self.ri, fvals, k=3, ext=1)
@@ -219,9 +278,11 @@ class NumericProfile(object):
         sig2_vals = np.zeros_like(self.rhovals)
         np.divide(cfg.G * cumint, self.rhovals, out=sig2_vals, where=self.rhovals > 0)
         sig2_pos = np.maximum(sig2_vals, 0.)
-        self._sig2 = (_log_pchip(self.ri, sig2_pos)
-                      or InterpolatedUnivariateSpline(self.ri, sig2_pos, k=3, ext=3))
+        return (_log_pchip(self.ri, sig2_pos)
+                or InterpolatedUnivariateSpline(self.ri, sig2_pos, k=3, ext=3))
 
+    @cached_property
+    def _rhalf_omega(self):
         # half-mass radius and angular frequency at r_half, for the
         # adiabatic correction in tidal heating (Pullen+14 / Gnedin+99,
         # Benson+Du22 eq. 3, Du+24 sec. IV.C — omega_p evaluated at the
@@ -230,25 +291,32 @@ class NumericProfile(object):
         m_inner = float(self.MInt(self.ri[0]))
         m_outer = float(self.MInt(self.ri[-1]))
         if M_target <= m_inner:
-            self.r_half = self.ri[0]
+            r_half = self.ri[0]
         elif M_target >= m_outer:
-            self.r_half = self.ri[-1]
+            r_half = self.ri[-1]
         else:
-            try:
-                self.r_half = brentq(lambda r: float(self.MInt(r)) - M_target,
-                                     self.ri[0], self.ri[-1])
-            except (ValueError, RuntimeError):
-                idx = max(1, min(np.searchsorted(self.Mr, M_target), len(self.ri) - 1))
-                dM = max(self.Mr[idx] - self.Mr[idx-1], 1e-30)
-                frac = (M_target - self.Mr[idx-1]) / dM
-                self.r_half = self.ri[idx-1] + frac * (self.ri[idx] - self.ri[idx-1])
+            # m_inner < M_target < m_outer (branch above) brackets a sign
+            # change, so brentq cannot fail to converge; a raise here means
+            # MInt is non-monotone or broken, which must surface rather than
+            # fall back to a silently-different linear interpolation.
+            r_half = brentq(lambda r: float(self.MInt(r)) - M_target,
+                            self.ri[0], self.ri[-1])
         # use M(<r_half), not M_target = Mh/2: when r_half clamps to a grid
         # edge (degenerate cases where Mh/2 falls outside [m_inner, m_outer])
         # the two are not equal and the formula must follow the actual r_half
-        M_at_rhalf = float(self.MInt(self.r_half))
+        M_at_rhalf = float(self.MInt(r_half))
         # max() guards against r_half == 0 (impossible by construction, but
         # keeps the division robust if ri[0] is ever set to zero)
-        self.omega_p = np.sqrt(cfg.G * M_at_rhalf / max(self.r_half, self.ri[0])**3)
+        omega_p = np.sqrt(cfg.G * M_at_rhalf / max(r_half, self.ri[0])**3)
+        return r_half, omega_p
+
+    @property
+    def r_half(self):
+        return self._rhalf_omega[0]
+
+    @property
+    def omega_p(self):
+        return self._rhalf_omega[1]
 
     def rho(self, R, z=0.):
         r = np.sqrt(R**2 + z**2)
@@ -301,7 +369,7 @@ class NumericProfile(object):
         return np.sqrt(integ/self.rho(r))
 
 
-def heat_profile(profile: NumericProfile, eps, count_per_decade=100):
+def heat_profile(profile: NumericProfile, eps, count_per_decade=100, tally=None):
     """
     Apply monotonic heating algorithm to a NumericProfile.
 
@@ -313,6 +381,11 @@ def heat_profile(profile: NumericProfile, eps, count_per_decade=100):
         Specific energy injection function eps(r)
     count_per_decade : int
         Radial resolution
+    tally : dict, optional
+        If given, populated with this call's shell-crossing clamp telemetry:
+        'shells' (shells clamped), 'worst_pct' (largest overshoot removed, %),
+        'worst_r' (its radius, kpc). Lets the caller record clamp activity per
+        step without parsing the ShellClampWarning.
 
     Returns
     -------
@@ -320,7 +393,6 @@ def heat_profile(profile: NumericProfile, eps, count_per_decade=100):
         Heated profile
     """
 
-    global _heat_profile_clamp_warned
     G = cfg.G
 
     rvir = profile.rh
@@ -337,9 +409,8 @@ def heat_profile(profile: NumericProfile, eps, count_per_decade=100):
     ri = np.logspace(np.log10(rmin), np.log10(rmax), count_r)
 
     Menc = profile.M(ri)
-    perturb = np.zeros_like(ri)
 
-    # clamp telemetry (first-occurrence warning below)
+    # clamp telemetry (warning below)
     clamp_count = 0
     clamp_worst_excess = 0.0
     clamp_worst_r = np.nan
@@ -347,36 +418,38 @@ def heat_profile(profile: NumericProfile, eps, count_per_decade=100):
     # --------------------------------------------------
     # Compute perturbation outer → inner
     # --------------------------------------------------
-    for i in reversed(range(count_r)):
+    # eps does spline lookups whose Python overhead is per-call, so evaluate it
+    # once on the whole grid. broadcast_to covers eps closures that return a
+    # scalar for array input (e.g. a constant eps(r)=0).
+    eps_vals = np.broadcast_to(np.asarray(eps(ri), dtype=float), ri.shape)
+    # m <= 0 shells (spline undershoot at small r) carry no perturbation;
+    # masking the division keeps it off non-positive Menc.
+    perturb = np.zeros_like(ri)
+    pos = Menc > 0.
+    perturb[pos] = 2.0 * eps_vals[pos] * ri[pos] / (G * Menc[pos])
 
-        r = ri[i]
-        m = Menc[i]
-
-        if m > 0:
-            perturb[i] = 2.0 * eps(r) * r / (G * m)
-        else:
-            perturb[i] = 0.0
-
-        # Local shell-crossing clamp. r_f(r_i) <= r_f(r_{i+1}) gives a
-        # per-shell upper bound on xi (with an extra (M_i/M_{i+1})^(-1/3)
-        # factor that tightens the constraint to keep adjacent shells from
-        # crowding). Skip when either Menc is non-positive (spline
-        # undershoot at small r); the (M_i/M_{i+1})^(-1/3) factor is
-        # undefined there.
-        # TODO(fabio): add the full Du+24 §IV.C shell-crossing handling.
-        # The clamp below is a local, shell-by-shell limit. Du+24 eqs. 41-44
-        # do more: find the single radius r_crossing where dxi/dr = 0
-        # (eq. 44) and xi is continuous (eq. 43), then for r < r_crossing
-        # replace eps(r) with
-        # xi(r_crossing) * G*M(r) / (2r) (eq. 42), making eps proportional
-        # to the gravitational potential inward of r_crossing. The clamp
-        # approximates this globally-flattened xi(r) with a chain of local
-        # inequalities; the two coincide for smooth-enough profiles but
-        # not in general (see Du+24 Fig. 7 for the cored gamma=0 case).
-        if i < count_r - 1 and Menc[i] > 0 and Menc[i + 1] > 0:
+    # Local shell-crossing clamp. r_f(r_i) <= r_f(r_{i+1}) gives a per-shell
+    # upper bound on xi (with an extra (M_i/M_{i+1})^(-1/3) factor that
+    # tightens the constraint to keep adjacent shells from crowding). The cap
+    # on shell i is built from the already-capped shell i+1 and branches on a
+    # min, so this is an inherently serial outer->inner scan. Skip when either
+    # Menc is non-positive (spline undershoot at small r); the
+    # (M_i/M_{i+1})^(-1/3) factor is undefined there, leaving perturb[i]
+    # unclamped.
+    # TODO(fabio): add the full Du+24 §IV.C shell-crossing handling. The clamp
+    # here is a local, shell-by-shell limit. Du+24 eqs. 41-44 do more: find
+    # the single radius r_crossing where dxi/dr = 0 (eq. 44) and xi is
+    # continuous (eq. 43), then for r < r_crossing replace eps(r) with
+    # xi(r_crossing) * G*M(r) / (2r) (eq. 42), making eps proportional to the
+    # gravitational potential inward of r_crossing. The clamp approximates
+    # this globally-flattened xi(r) with a chain of local inequalities; the
+    # two coincide for smooth-enough profiles but not in general (see Du+24
+    # Fig. 7 for the cored gamma=0 case).
+    for i in reversed(range(count_r - 1)):
+        if Menc[i] > 0. and Menc[i + 1] > 0.:
             limit = (
                 1.0
-                - r / ri[i + 1]
+                - ri[i] / ri[i + 1]
                 * (Menc[i] / Menc[i + 1]) ** (-1.0 / 3.0)
                 * (1.0 - perturb[i + 1])
             )
@@ -385,20 +458,24 @@ def heat_profile(profile: NumericProfile, eps, count_per_decade=100):
                 excess = (perturb[i] / limit) - 1.0 if limit > 0 else np.inf
                 if excess > clamp_worst_excess:
                     clamp_worst_excess = excess
-                    clamp_worst_r = r
+                    clamp_worst_r = ri[i]
                 perturb[i] = limit
 
-    if clamp_count > 0 and not _heat_profile_clamp_warned:
-        _heat_profile_clamp_warned = True
+    if clamp_count > 0:
         warnings.warn(
             f"heat_profile clamped {clamp_count} shell(s) to the local "
             f"monotonic limit; worst overshoot "
             f"{clamp_worst_excess * 100.0:.2f}% at r={clamp_worst_r:.3e} kpc. "
             f"Full Du+24 §IV.C r_crossing handling not yet implemented "
-            f"(TODO in heat_profile). Suppressed after first occurrence.",
-            RuntimeWarning,
+            f"(TODO in heat_profile).",
+            ShellClampWarning,
             stacklevel=2,
         )
+
+    if tally is not None:
+        tally['shells'] = clamp_count
+        tally['worst_pct'] = clamp_worst_excess * 100.
+        tally['worst_r'] = clamp_worst_r
 
     # --------------------------------------------------
     # Final energies
@@ -424,7 +501,7 @@ def heat_profile(profile: NumericProfile, eps, count_per_decade=100):
     # If halo destroyed
     # --------------------------------------------------
     if np.count_nonzero(bound) <= 2:
-        raise RuntimeError("Heating unbinds the halo")
+        raise HeatingUnbindsError("Heating unbinds the halo")
 
     r_bound = rf[bound]
     Mshell_bound = Mshell[bound]
@@ -542,6 +619,36 @@ def _profile_cut(profile, m_total):
     return NumericProfile(rvals, Mr)
 
 
+def _join_state(profile, r_t, slope):
+    """Join quantities for a tail truncation at r_t: clamps r_t into the
+    profile's grid and returns (r_t, rho_t, M_t, s, degenerate).
+
+    s is the log density slope at r_t: `slope` if given, else central-
+    differenced (one step back from the outer edge when r_t sits at rh --
+    less accurate there, callers pass `slope` instead). degenerate flags a
+    non-positive join density or undefined slope; no tail can be attached
+    and callers fall back to a hard cut.
+    """
+    r_t = float(min(max(r_t, profile.ri[0] * (1. + 1e-6)), profile.rh))
+    rho_t = float(profile.rho(r_t))
+    M_t = float(profile.M(r_t))
+    degenerate = not (rho_t > 0.)
+    if slope is not None:
+        s = float(slope)
+    else:
+        delta = 3e-3
+        if r_t * (1. + delta) <= profile.rh:
+            r_lo, r_hi = r_t * (1. - delta), r_t * (1. + delta)
+        else:
+            r_lo, r_hi = r_t * (1. - 2. * delta), r_t
+        rho_lo, rho_hi = float(profile.rho(r_lo)), float(profile.rho(r_hi))
+        if rho_lo > 0. and rho_hi > 0.:
+            s = (np.log(rho_hi) - np.log(rho_lo)) / (np.log(r_hi) - np.log(r_lo))
+        else:
+            s, degenerate = 0., True
+    return r_t, rho_t, M_t, s, degenerate
+
+
 def truncate_kazantzidis(profile, r_t, r_decay=None, m_total=None, slope=None):
     """Kazantzidis+06 exponentially-truncated tail stitched onto a
     NumericProfile at r_t, in place of a hard cut.
@@ -569,29 +676,10 @@ def truncate_kazantzidis(profile, r_t, r_decay=None, m_total=None, slope=None):
     if (r_decay is None) == (m_total is None):
         raise ValueError("pass exactly one of r_decay, m_total")
 
-    r_t = float(min(max(r_t, profile.ri[0] * (1. + 1e-6)), profile.rh))
-    rho_t = float(profile.rho(r_t))
-    M_t = float(profile.M(r_t))
-
     # a Kazantzidis tail needs a positive join density and a defined join
     # slope; a heated profile in deep stripping can have rho ~ 0 near r_t.
     # There fall back to a hard cut (mass-conserving; m_total must be given).
-    degenerate = not (rho_t > 0.)
-    if slope is not None:
-        s = float(slope)
-    else:
-        # central difference when r_t is interior; one step back from the
-        # outer edge otherwise (less accurate -- callers pass `slope` there)
-        delta = 3e-3
-        if r_t * (1. + delta) <= profile.rh:
-            r_lo, r_hi = r_t * (1. - delta), r_t * (1. + delta)
-        else:
-            r_lo, r_hi = r_t * (1. - 2. * delta), r_t
-        rho_lo, rho_hi = float(profile.rho(r_lo)), float(profile.rho(r_hi))
-        if rho_lo > 0. and rho_hi > 0.:
-            s = (np.log(rho_hi) - np.log(rho_lo)) / (np.log(r_hi) - np.log(r_lo))
-        else:
-            s, degenerate = 0., True
+    r_t, rho_t, M_t, s, degenerate = _join_state(profile, r_t, slope)
 
     if degenerate:
         if m_total is None:
@@ -648,5 +736,190 @@ def truncate_kazantzidis(profile, r_t, r_decay=None, m_total=None, slope=None):
         # deep-stripping parameters; hard-cut that step (mass still conserved)
         if m_total is None:
             raise ValueError("truncate_kazantzidis: non-finite tail at fixed r_decay")
+        return _profile_cut(profile, m_total)
+    return NumericProfile(rvals, Mr)
+
+
+def _ln_gamma_lower(a, x):
+    """ln of the unnormalized lower incomplete gamma int_0^x t^(a-1) e^-t dt,
+    for a > 0. gammaln + log(gammainc) keeps a large `a` from overflowing
+    gamma(a). gammainc underflows to 0 only when x sits far below a (a join
+    slope approaching -n, routed to a hard cut upstream); the tiny floor
+    gives a large-negative ln (-> exp -> 0), the M_tail -> 0 limit, not a
+    masked error.
+    """
+    if a <= 0.:
+        raise ValueError(f"_ln_gamma_lower requires a > 0, got a={a}")
+    x = np.asarray(x, dtype=float)
+    gi = gammainc(a, x)
+    return gammaln(a) + np.log(np.where(gi > 0., gi, np.finfo(float).tiny))
+
+
+def _powerlaw_lnM_inf(beta, r_t, rho_t, s, n):
+    """ln of the total slope-deficit tail mass beyond r_t (analytic).
+
+    With u = r/r_t the tail rho = rho_t u^-n exp[(n+s)/beta (1 - u^-beta)]
+    (see truncate_powerlaw) has mass
+    4 pi rho_t r_t^3 Int_1^inf u^(2-n) exp[...] du;
+    substituting t = u^-beta turns the integral into
+
+        e^a gamma_low(k, a) / (beta a^k),  a = (n+s)/beta,  k = (n-3)/beta
+
+    Requires n + s > 0 and n > 3; everything stays in logs so small beta
+    (a, k both large) cannot overflow.
+    """
+    a = (n + s) / beta
+    k = (n - 3.) / beta
+    return (np.log(cfg.FourPi * rho_t) + 3. * np.log(r_t)
+            + a + _ln_gamma_lower(k, a) - np.log(beta) - k * np.log(a))
+
+
+def _solve_beta(target, r_t, rho_t, s, n):
+    """Find beta so the slope-deficit tail beyond r_t carries `target` mass.
+
+    Tail mass is monotone decreasing in beta: beta -> inf is the pure r^-n
+    floor 4 pi rho_t r_t^3 / (n-3); beta -> 0 is the join power law r^s,
+    unbounded for s > -3 and saturating at 4 pi rho_t r_t^3 / (-s-3)
+    otherwise. A target outside the reachable range raises, as does a join
+    with n + s <= 0 (already steeper than the asymptote); the caller falls
+    back to a hard cut.
+    """
+    if n + s <= 0.:
+        raise ValueError(
+            f"slope-deficit tail needs n + s > 0; join slope {s:.2f} at "
+            f"r_t={r_t:.3e} kpc is steeper than the r^-{n:g} asymptote")
+    floor = cfg.FourPi * rho_t * r_t**3 / (n - 3.)
+    if target <= floor * (1. + 1e-9):
+        raise ValueError(
+            f"target M_tail={target:.3e} Msun is at or below the pure "
+            f"r^-{n:g} floor {floor:.3e} at r_t={r_t:.3e} kpc")
+    ln_target = np.log(target)
+    # g is finite for any beta (lnM is computed in logs), so the brackets
+    # never hand brentq an inf endpoint
+    g = lambda b: float(_powerlaw_lnM_inf(b, r_t, rho_t, s, n)) - ln_target
+    if g(1.) > 0.:
+        lo, hi = 1., 2.
+        while g(hi) > 0.:  # terminates: target > floor = the beta->inf limit
+            hi *= 2.
+            if hi > 1e8:
+                raise ValueError(f"could not bracket beta above at r_t={r_t:.3e}")
+    else:
+        lo, hi = 0.5, 1.
+        while g(lo) <= 0.:
+            lo *= 0.5
+            if lo < 1e-6:
+                raise ValueError(
+                    f"slope-deficit tail cannot carry M_tail={target:.3e} Msun "
+                    f"at r_t={r_t:.3e} kpc (join slope {s:.2f}): tail mass saturates")
+    return cast(float, brentq(g, lo, hi))
+
+
+def truncate_powerlaw(profile, r_t, n=5., beta=None, m_total=None, slope=None):
+    """Slope-deficit power-law tail stitched onto a NumericProfile at r_t,
+    in place of a hard cut.
+
+    For r <= r_t the profile is unchanged. For r > r_t, with u = r/r_t,
+
+        rho(r) = rho'(r_t) u^-n exp[(n + s)/beta (1 - u^-beta)]
+        s      = dln(rho')/dln(r)|_{r_t}
+
+    This is the local log slope -n + (n + s) u^-beta integrated in ln u:
+    s at the join (C1, whatever the inner profile's slope there) bending to
+    a sustained -n asymptote, which is what stripped N-body subhalos show
+    over a decade in radius (Springel+08; the DASH fits in Green & van den
+    Bosch 2019 give rho ~ r^-5..-6). A single fixed-index power law cannot
+    be C1-matched (its slope is -n everywhere); beta is the second
+    parameter that buys the join, the role r_decay plays for the
+    Kazantzidis exponential -- but the exponential prefactor here is
+    bounded (-> exp[(n+s)/beta]), so the tail stays a power law instead of
+    plunging into a cutoff. Enclosed mass beyond r_t is the analytic
+    incomplete-gamma integral of that density.
+
+    Exactly one of beta, m_total is given:
+      beta    -- a fixed transition sharpness (larger = faster bend to -n).
+      m_total -- total enclosed mass of the result; beta is solved so the
+                 tail carries m_total - M(<r_t). The tail mass cannot go
+                 below the pure r^-n tail 4 pi rho_t r_t^3/(n-3) (the
+                 beta -> inf limit); a budget below that floor falls back
+                 to a hard cut at M^-1(m_total), as do degenerate joins.
+
+    `slope` overrides the join logarithmic density slope as in
+    truncate_kazantzidis (pass it when r_t sits at profile.rh).
+
+    Returns a NumericProfile spanning [profile.ri[0], r_out] with r_out at
+    the radius enclosing 99.9% of the tail mass, capped at 100 r_t.
+    """
+    if (beta is None) == (m_total is None):
+        raise ValueError("pass exactly one of beta, m_total")
+    if n <= 3.:
+        raise ValueError(f"tail index n must exceed 3 for finite mass, got n={n}")
+
+    r_t, rho_t, M_t, s, degenerate = _join_state(profile, r_t, slope)
+
+    if degenerate:
+        if m_total is None:
+            raise ValueError("truncate_powerlaw: degenerate join, pass m_total")
+        return _profile_cut(profile, m_total)
+
+    if m_total is not None:
+        target = m_total - M_t
+        if target <= max(1e-9 * M_t, 0.):
+            return _profile_cut(profile, m_total)  # nothing to put in the tail
+        try:
+            beta = _solve_beta(target, r_t, rho_t, s, n)
+        except ValueError:
+            # no index-n tail fits this budget at the local join (below the
+            # pure r^-n floor, a saturated shallow budget, or a join steeper
+            # than -n) -- hard-cut at M^-1(m_total) instead
+            return _profile_cut(profile, m_total)
+    assert beta is not None  # one of beta/m_total is set (checked above)
+    if n + s <= 0.:
+        # only reachable on the fixed-beta path; _solve_beta raises first on
+        # the m_total path (caught into the hard cut)
+        raise ValueError(
+            f"truncate_powerlaw: join slope {s:.2f} steeper than the "
+            f"r^-{n:g} asymptote; no slope-deficit tail exists")
+
+    a = (n + s) / beta
+    k = (n - 3.) / beta
+    lnM_inf = float(_powerlaw_lnM_inf(beta, r_t, rho_t, s, n))
+    P_a = float(gammainc(k, a))
+    if not (P_a > 0.):
+        # regularized gamma underflow (join slope ~ -n at small beta): the
+        # mass split between grid points is unresolvable in float64
+        if m_total is None:
+            raise ValueError("truncate_powerlaw: gamma underflow at fixed beta")
+        return _profile_cut(profile, m_total)
+
+    # outer grid edge at 99.9% of the tail mass: the fraction beyond u is
+    # P(k, a u^-beta)/P(k, a), inverted analytically with gammaincinv
+    x_out = float(gammaincinv(k, 1e-3 * P_a))
+    u_out = (a / x_out)**(1. / beta) if x_out > 0. else 100.
+    u_out = min(max(u_out, 1.5), 100.)
+    r_out = u_out * r_t
+
+    # one uniform log grid across [ri[0], r_out] -- a single spacing keeps
+    # np.gradient density continuous across r_t (a split inner/outer grid
+    # would jump)
+    n_grid = max(300, int(np.log10(r_out / profile.ri[0]) * 100.))
+    rvals = np.logspace(np.log10(profile.ri[0]), np.log10(r_out), n_grid)
+    inner = rvals <= r_t
+    Mr = np.empty_like(rvals)
+    Mr[inner] = profile.M(rvals[inner])
+    u_tail = rvals[~inner] / r_t
+    Mr[~inner] = (M_t + np.exp(lnM_inf)
+                  * (1. - gammainc(k, a * u_tail**(-beta)) / P_a))
+    if m_total is not None:
+        # The analytic tail (mass M_inf == budget) approaches m_total from
+        # below, but adding the small M_inf to a much larger M_t leaves the
+        # outermost grid points a hair (~1e-8 relative) over m_total in float64.
+        # The exact m_total override at r_out would then dip below its neighbour
+        # and NumericProfile would reject it. Clamp the tail to m_total so the
+        # override stays the monotone maximum.
+        Mr[~inner] = np.minimum(Mr[~inner], m_total)
+        Mr[-1] = m_total  # the 0.1% tail remainder past r_out
+    if not np.all(np.isfinite(Mr)):
+        if m_total is None:
+            raise ValueError("truncate_powerlaw: non-finite tail at fixed beta")
         return _profile_cut(profile, m_total)
     return NumericProfile(rvals, Mr)

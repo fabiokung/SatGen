@@ -407,6 +407,30 @@ class TestHeatProfile:
         G, Mh, rh = cfg.G, p.Mh, p.rh
         return lambda r: 0.6 * G * Mh / rh * (r / rh) ** 2
 
+    def test_tally_out_param_matches_warning(self, small_nfw_profile):
+        """The optional tally out-param reports the same shell-clamp count as the
+        ShellClampWarning channel, without changing the returned profile (default
+        tally=None leaves all existing callers untouched)."""
+        import re
+        import warnings
+        from subhalo_functions import ShellClampWarning
+        p = small_nfw_profile
+        eps = self._stripping_eps(p)
+        tally = {}
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter('always', ShellClampWarning)
+            heated = heat_profile(p, eps, tally=tally)
+        assert set(tally) == {'shells', 'worst_pct', 'worst_r'}
+        w = [x for x in caught if issubclass(x.category, ShellClampWarning)]
+        if w:
+            n = int(re.search(r'clamped (\d+) shell', str(w[0].message)).group(1))
+            assert tally['shells'] == n
+            assert tally['worst_pct'] > 0.
+        else:
+            assert tally['shells'] == 0
+        # default path (no tally) returns an identical profile
+        assert np.allclose(heated.Mr, heat_profile(p, eps).Mr)
+
     def test_no_zero_mass_shells_in_bound_region(self, small_nfw_profile):
         """Every consecutive pair of shells in the output must carry positive mass
         (no flat spot in the cumulative mass profile inside the bound region)."""
