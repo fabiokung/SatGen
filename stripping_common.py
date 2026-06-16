@@ -9,6 +9,7 @@ from matplotlib.lines import Line2D
 from scipy.optimize import brentq
 
 import config as cfg
+import cosmo as co
 import evolve as ev
 from orbit import orbit
 from profiles import NFW, Dekel, Green, Vcirc, tdyn
@@ -88,20 +89,32 @@ def make_orbit(host, R0=1., z0=0., phi0=0., VR0=0., Vz0=0., eta=1.):
 
 # Du+24 Section II.A idealized setup (arXiv:2403.09597): NFW host 1e12 Msun,
 # NFW subhalo 1e9 Msun -- the gamma_subhalo=1 reference for the stripping study.
-DU24_MV_HOST, DU24_C_HOST = 1.0e12, 263.2 / 23.69   # rs=23.69, rvir=263.2 kpc
-DU24_MV_SUB, DU24_C_SUB = 1.0e9, 26.32 / 1.279      # rs=1.279, rvir=26.32 kpc
+DU24_MV_HOST, DU24_C_HOST = 1.0e12, 263.2 / 23.69   # rs=23.69, rvir=263.2 kpc (eqs.5-6)
+DU24_MV_SUB, DU24_C_SUB = 1.0e9, 26.32 / 1.279      # rs=1.279, rvir=26.32 kpc (eqs.11-12)
 DU24_ETA = {'1/5': 0.404, '1/20': 0.131}            # circularity -> R_p/R_a
+
+# Du+24 set Mvir/rvir via the virial overdensity, NOT SatGen's default Delta=200.
+# Their host (eqs. 4-7) is rho0=3.797e6 Msun/kpc^3, rs=23.69, rvir=263.2, Mvir=1e12;
+# building NFW(1e12, c) at Delta=200 puts the host at rvir=206, rs=18.6 (1.28x too
+# compact) and shortens every dynamical time by 1.28^1.5 ~ 1.44x. Recover their
+# overdensity from the stated host rvir: Delta = 3 Mvir / (4 pi rvir^3 rho_crit).
+# rho_crit cancels in NFW's rho0 = rho_crit*Delta/3 * c^3/f(c) = Mvir/(4 pi rs^3 f(c)),
+# so this reproduces Du+24's rho0/rs exactly, independent of the cfg cosmology. The
+# subhalo's rvir (eq.12) implies the same Delta, so both share it.
+DU24_DELTA = 3. * DU24_MV_HOST / (cfg.FourPi * 263.2**3
+                                  * co.rhoc(0., cfg.h, cfg.Om, cfg.OL))
 
 
 def du24_nfw_setup(nr=200):
-    """NFW host + subhalo on the Du+24 II.A ICs.
+    """NFW host + subhalo on the Du+24 II.A ICs (virial overdensity DU24_DELTA,
+    not Delta=200 -- matches Du+24's rho0/rs/rvir exactly).
 
     Returns (host, sat, rvals, M_sub). sat is the analytic NFW (callers that
     need r_vir or the virial-edge slope use it); the stripped evolution starts
     from NumericProfile(rvals, M_sub).
     """
-    host = NFW(DU24_MV_HOST, DU24_C_HOST)
-    sat = NFW(DU24_MV_SUB, DU24_C_SUB)
+    host = NFW(DU24_MV_HOST, DU24_C_HOST, Delta=DU24_DELTA)
+    sat = NFW(DU24_MV_SUB, DU24_C_SUB, Delta=DU24_DELTA)
     rvals = np.logspace(np.log10(cfg.Rres), np.log10(sat.rh), nr)
     return host, sat, rvals, sat.M(rvals)
 
