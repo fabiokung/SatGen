@@ -5,6 +5,15 @@ FIGURE
 # we'll probably put FIGURE in eventually once we have some example figs
 changelog
 truncation_experiments.pkl
+etc/calibration_runs/
+# DASH N-body library (615MB archive + extracted runs); keep dash_index.pkl
+etc/dash/DASH_19.05.09/
+etc/dash/*.tar.gz
+etc/dash/*.joblib
 .vscode/
+*.code-workspace
 slurm/
 .venv/
+
+# macOS Spotlight marker
+.metadata_never_index
