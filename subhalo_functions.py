@@ -619,7 +619,7 @@ def _profile_cut(profile, m_total):
     return NumericProfile(rvals, Mr)
 
 
-def _join_state(profile, r_t, slope):
+def _join_state(profile, r_t, slope, rho_t=None):
     """Join quantities for a tail truncation at r_t: clamps r_t into the
     profile's grid and returns (r_t, rho_t, M_t, s, degenerate).
 
@@ -628,9 +628,13 @@ def _join_state(profile, r_t, slope):
     less accurate there, callers pass `slope` instead). degenerate flags a
     non-positive join density or undefined slope; no tail can be attached
     and callers fall back to a hard cut.
+
+    rho_t overrides the join density. Like `slope`, pass it when r_t sits at
+    profile.rh, where the NumericProfile's np.gradient density is unreliable --
+    then the tail normalization is exact rather than finite-differenced.
     """
     r_t = float(min(max(r_t, profile.ri[0] * (1. + 1e-6)), profile.rh))
-    rho_t = float(profile.rho(r_t))
+    rho_t = float(profile.rho(r_t)) if rho_t is None else float(rho_t)
     M_t = float(profile.M(r_t))
     degenerate = not (rho_t > 0.)
     if slope is not None:
@@ -649,7 +653,8 @@ def _join_state(profile, r_t, slope):
     return r_t, rho_t, M_t, s, degenerate
 
 
-def truncate_kazantzidis(profile, r_t, r_decay=None, m_total=None, slope=None):
+def truncate_kazantzidis(profile, r_t, r_decay=None, m_total=None, slope=None,
+                         rho_t=None):
     """Kazantzidis+06 exponentially-truncated tail stitched onto a
     NumericProfile at r_t, in place of a hard cut.
 
@@ -667,9 +672,10 @@ def truncate_kazantzidis(profile, r_t, r_decay=None, m_total=None, slope=None):
       m_total -- total enclosed mass of the result; r_decay is solved so the
                  tail carries m_total - M(<r_t).
 
-    `slope` overrides the join logarithmic density slope dln(rho)/dln(r)|_{r_t}.
-    Pass it when r_t sits at profile.rh -- a NumericProfile's np.gradient
-    density is unreliable at its outer knot. Left None it is finite-differenced.
+    `slope` and `rho_t` override the join logarithmic density slope
+    dln(rho)/dln(r)|_{r_t} and the join density rho'(r_t). Pass them when r_t
+    sits at profile.rh -- a NumericProfile's np.gradient density is unreliable at
+    its outer knot. Left None they are finite-differenced / read off the profile.
 
     Returns a NumericProfile spanning [profile.ri[0], r_t + 50 r_decay].
     """
@@ -679,7 +685,7 @@ def truncate_kazantzidis(profile, r_t, r_decay=None, m_total=None, slope=None):
     # a Kazantzidis tail needs a positive join density and a defined join
     # slope; a heated profile in deep stripping can have rho ~ 0 near r_t.
     # There fall back to a hard cut (mass-conserving; m_total must be given).
-    r_t, rho_t, M_t, s, degenerate = _join_state(profile, r_t, slope)
+    r_t, rho_t, M_t, s, degenerate = _join_state(profile, r_t, slope, rho_t)
 
     if degenerate:
         if m_total is None:
@@ -814,7 +820,8 @@ def _solve_beta(target, r_t, rho_t, s, n):
     return cast(float, brentq(g, lo, hi))
 
 
-def truncate_powerlaw(profile, r_t, n=5., beta=None, m_total=None, slope=None):
+def truncate_powerlaw(profile, r_t, n=5., beta=None, m_total=None, slope=None,
+                      rho_t=None):
     """Slope-deficit power-law tail stitched onto a NumericProfile at r_t,
     in place of a hard cut.
 
@@ -843,8 +850,8 @@ def truncate_powerlaw(profile, r_t, n=5., beta=None, m_total=None, slope=None):
                  beta -> inf limit); a budget below that floor falls back
                  to a hard cut at M^-1(m_total), as do degenerate joins.
 
-    `slope` overrides the join logarithmic density slope as in
-    truncate_kazantzidis (pass it when r_t sits at profile.rh).
+    `slope` and `rho_t` override the join slope and density as in
+    truncate_kazantzidis (pass them when r_t sits at profile.rh).
 
     Returns a NumericProfile spanning [profile.ri[0], r_out] with r_out at
     the radius enclosing 99.9% of the tail mass, capped at 100 r_t.
@@ -854,7 +861,7 @@ def truncate_powerlaw(profile, r_t, n=5., beta=None, m_total=None, slope=None):
     if n <= 3.:
         raise ValueError(f"tail index n must exceed 3 for finite mass, got n={n}")
 
-    r_t, rho_t, M_t, s, degenerate = _join_state(profile, r_t, slope)
+    r_t, rho_t, M_t, s, degenerate = _join_state(profile, r_t, slope, rho_t)
 
     if degenerate:
         if m_total is None:

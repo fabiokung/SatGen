@@ -109,14 +109,76 @@ def du24_nfw_setup(nr=200):
     """NFW host + subhalo on the Du+24 II.A ICs (virial overdensity DU24_DELTA,
     not Delta=200 -- matches Du+24's rho0/rs/rvir exactly).
 
+    The subhalo IC is the full Du+24 profile: NFW within r_vir (eq. 8) plus the
+    exponential outer truncation of eqs. 9-10 (r_decay = 0.1 r_vir), density- and
+    slope-matched at r_vir. That outer tail carries ~16% of M_vir for the gamma=1
+    NFW (Du+24's total M_sub = 1.02-1.2 M_vir), so a bare cut at r_vir would leave
+    the bound-mass normalization ~16% low. The Kazantzidis+06 truncation
+    (truncate_kazantzidis) is exactly eqs. 9-10 -- its kappa = r_t/r_decay +
+    dln(rho)/dln(r)|_{r_t} matches eq. 10. The analytic NFW slope and density at
+    r_vir are passed so the join is exact, not finite-differenced off the
+    NumericProfile's outer knot.
+
     Returns (host, sat, rvals, M_sub). sat is the analytic NFW (callers that
     need r_vir or the virial-edge slope use it); the stripped evolution starts
     from NumericProfile(rvals, M_sub).
     """
     host = NFW(DU24_MV_HOST, DU24_C_HOST, Delta=DU24_DELTA)
     sat = NFW(DU24_MV_SUB, DU24_C_SUB, Delta=DU24_DELTA)
+    r_in = np.logspace(np.log10(cfg.Rres), np.log10(sat.rh), nr)
+    nfw = NumericProfile(r_in, sat.M(r_in))
+    sub = truncate_kazantzidis(nfw, r_t=sat.rh, r_decay=0.1 * sat.rh,
+                               slope=-sat.s(sat.rh), rho_t=sat.rho(sat.rh))
+    return host, sat, sub.ri, sub.Mr
+
+
+# DASH (Ogiya+19, arXiv:1901.08601) scale-free ICs: analytic NFW host fixed at
+# the origin, M_vir,h/M_vir,s = 1000, inner slope a_h=a_s=1. Everything is in
+# units of (r_vir,h, v_vir,h, M_vir,s), so we anchor an arbitrary host (1e12,
+# the fiducial c_h=10) and scale the dimensionless ICs by its r_vir, V_vir. All
+# comparison observables are dimensionless (V/V0, R/R0 vs f_b; m/m0 vs t/T_r),
+# so the host's Delta and cosmology cancel.
+DASH_MV_HOST, DASH_C_HOST, DASH_RATIO = 1.0e12, 10.0, 1000.0
+
+
+def _radial_period(host, xv0, tmax=40., n=8000):
+    """Radial orbital period [Gyr] from peri-to-peri in the fixed host potential.
+
+    DF-off -> param-independent, so callers compute this once per DASH cell and
+    cache it as the clock for the m(t) comparison.
+    """
+    o = orbit(xv0)
+    t = np.linspace(0., tmax, n)
+    o.integrate(t, [host])
+    r = np.hypot(o.xvArray[:, 0], o.xvArray[:, 2])
+    mn = np.where((r[1:-1] < r[:-2]) & (r[1:-1] < r[2:]))[0] + 1
+    if mn.size >= 2:
+        return float(t[mn[1]] - t[mn[0]])
+    mx = np.where((r[1:-1] > r[:-2]) & (r[1:-1] > r[2:]))[0] + 1
+    if mx.size >= 2:
+        return float(t[mx[1]] - t[mx[0]])
+    raise ValueError("could not measure radial period (orbit too short for tmax)")
+
+
+def dash_nfw_setup(cell, nr=200):
+    """NFW host + subhalo + orbit on a DASH cell (subhalo_evo row-0 phase space).
+
+    cell: a dash_index.pkl record (uses cell['cs'] and cell['file']). Returns
+    (host, sat, rvals, M_sub, xv0, T_r). T_r is the radial period [Gyr]. The
+    orbit ICs come from the actual N-body row 0 (com pos in r_vir,h, vel in
+    v_vir,h), not an (xc, eta) reconstruction.
+    """
+    host = NFW(DASH_MV_HOST, DASH_C_HOST)
+    rvir_h, vvir_h = host.rh, host.Vcirc(host.rh)
+    sat = NFW(DASH_MV_HOST / DASH_RATIO, cell['cs'])
     rvals = np.logspace(np.log10(cfg.Rres), np.log10(sat.rh), nr)
-    return host, sat, rvals, sat.M(rvals)
+    evo0 = np.loadtxt(cell['file'], comments='#')[0]
+    pos, vel = evo0[1:4] * rvir_h, evo0[4:7] * vvir_h
+    R = np.hypot(pos[0], pos[1])
+    xv0 = np.array([R, np.arctan2(pos[1], pos[0]), pos[2],
+                    (pos[0] * vel[0] + pos[1] * vel[1]) / R,
+                    (pos[0] * vel[1] - pos[1] * vel[0]) / R, vel[2]])
+    return host, sat, rvals, sat.M(rvals), xv0, _radial_period(host, xv0)
 
 
 def _vmax_rmax(profile):
@@ -144,7 +206,7 @@ def _vmax_rmax(profile):
 
 def evolve_satgen_dekel(host, sat, xv0, tmax=10., Nstep=10000, alpha=1.,
                         n_snapshots=10, label='SatGen (Dekel / P10 track)'):
-    """Dekel/P10 tidal-track evolution (Baseline A)."""
+    """Dekel/P10 tidal-track evolution."""
     assert cfg.Mres is not None, "cfg.Mres must be set before calling evolve_satgen_dekel"
     potential = host
     timesteps = np.linspace(0., tmax, Nstep + 1)[1:]
@@ -221,7 +283,7 @@ def evolve_satgen_dekel(host, sat, xv0, tmax=10., Nstep=10000, alpha=1.,
 def evolve_satgen_green(host, ma, c2a, xv0, tmax=10., Nstep=10000,
                         alpha='conc', Delta=200., z=0.,
                         n_snapshots=10, label='SatGen (Green / DASH track)'):
-    """Green+21 DASH transfer-function evolution (Baseline B).
+    """Green+21 DASH transfer-function evolution.
 
     alpha='conc' uses concentration-dependent stripping efficiency (ev.alpha_from_c2).
     """

@@ -17,10 +17,11 @@ integrations. Run with:
 
 import numpy as np
 import pytest
+from scipy.integrate import quad
 
 import config as cfg
 from profiles import NFW
-from subhalo_functions import NumericProfile
+from subhalo_functions import NumericProfile, truncate_kazantzidis
 from orbit import orbit
 import stripping_common as sc
 
@@ -211,3 +212,59 @@ def test_truncate_powerlaw_monotone_at_large_budget():
                             m_total=float(d['m_total']))
     assert np.all(np.diff(res.Mr) >= 0.)                     # non-decreasing
     assert res.Mr[-1] == pytest.approx(float(d['m_total']))   # mass conserved
+
+
+def _du24_sub_M_analytic(sat, r):
+    """Enclosed mass of the Du+24 subhalo (eqs. 8-10) at radius r: NFW within
+    r_vir, exponential truncation (r_decay = 0.1 r_vir, kappa from eq. 10)
+    beyond it -- the profile du24_nfw_setup should reproduce."""
+    rvir, rdecay = sat.rh, 0.1 * sat.rh
+    kappa = rvir / rdecay - sat.s(rvir)          # eq. 10 (sat.s = -dln rho/dln r)
+    rho_t = float(sat.rho(rvir))
+    if r <= rvir:
+        return float(sat.M(r))
+    tail = quad(lambda s: 4. * np.pi * s**2 * rho_t * (s / rvir)**kappa
+                * np.exp(-(s - rvir) / rdecay), rvir, r)[0]
+    return float(sat.Mh + tail)
+
+
+def test_du24_subhalo_matches_analytic_profile():
+    """du24_nfw_setup builds the full Du+24 subhalo (eqs. 8-10), not a bare NFW
+    cut at r_vir. The enclosed mass tracks the analytic profile at all radii."""
+    _, sat, rvals, M_sub = sc.du24_nfw_setup()
+    sub = NumericProfile(rvals, M_sub)
+    for x in (0.05, 0.3, 1.0, 1.5, 2.5):
+        r = x * sat.rh
+        assert float(sub.M(r)) == pytest.approx(_du24_sub_M_analytic(sat, r),
+                                                rel=2e-3), f"M(<{x} rvir) off"
+
+
+def test_du24_subhalo_total_mass_and_virial_mass():
+    """The eq. 9-10 tail carries ~16% of M_vir for the gamma=1 NFW, so the IC
+    total is ~1.16 M_vir (Du+24 quote 1.02-1.2). The mass within r_vir is still
+    exactly M_vir -- the tail is added beyond it, the NFW body is untouched."""
+    _, sat, rvals, M_sub = sc.du24_nfw_setup()
+    sub = NumericProfile(rvals, M_sub)
+    assert float(sub.M(sat.rh)) == pytest.approx(sat.Mh, rel=1e-3)
+    assert 1.10 < sub.Mh / sat.Mh < 1.22
+
+
+def test_truncate_kazantzidis_rho_t_override():
+    """rho_t makes the join density exact when r_t sits at the profile's outer
+    knot, where np.gradient density is unreliable. The tail mass then matches
+    the analytic incomplete-gamma integral at that density; the finite-difference
+    join (no override) is off, so the override is load-bearing for an edge join."""
+    nfw = NFW(1e9, 20.0)
+    rvir, rdecay = nfw.rh, 0.1 * nfw.rh
+    r = np.logspace(np.log10(cfg.Rres), np.log10(rvir), 200)
+    num = NumericProfile(r, nfw.M(r))
+    slope = -nfw.s(rvir)
+    kappa = rvir / rdecay + slope
+    rho_t = float(nfw.rho(rvir))
+    tail = quad(lambda s: 4. * np.pi * s**2 * rho_t * (s / rvir)**kappa
+                * np.exp(-(s - rvir) / rdecay), rvir, rvir + 60. * rdecay)[0]
+    over = truncate_kazantzidis(num, r_t=rvir, r_decay=rdecay, slope=slope,
+                                rho_t=rho_t)
+    assert over.Mh == pytest.approx(float(nfw.M(rvir)) + tail, rel=1e-4)
+    fd = truncate_kazantzidis(num, r_t=rvir, r_decay=rdecay, slope=slope)
+    assert abs(fd.Mh - over.Mh) / over.Mh > 1e-3
