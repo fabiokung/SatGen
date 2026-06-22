@@ -10,10 +10,16 @@ etc/calibration_runs/
 etc/dash/DASH_19.05.09/
 etc/dash/*.tar.gz
 etc/dash/*.joblib
+# Aguirre-Santaella+25 N-body archive + any extracted runs; keep README.md
+etc/aguirre25_nbody/*.zip
+etc/aguirre25_nbody/tidal_tracks_subhaloes/
 .vscode/
 *.code-workspace
 slurm/
 .venv/
+# Galacticus comparison data (large hdf5) + per-run cache
+analysis/galacticus_subhalos.hdf5
+analysis/galacticus_runs_cache.pkl
 
 # macOS Spotlight marker
 .metadata_never_index
