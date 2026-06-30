@@ -350,7 +350,14 @@ def ltidal(sp,potential,xv,choice='King62'):
     fa = Findlt(a,sp,rhs)
     fb = Findlt(b,sp,rhs)
     if fa*fb>0.:
-        lt = cfg.Rres
+        # No root in [a,b]: M(<l)/l^3 - rhs keeps one sign (mean density is monotone
+        # decreasing for these profiles, so at most one crossing). The two cases are
+        # opposite, so split on it. fa<0: the subhalo is less dense than the
+        # tidal field even at Rres -> fully stripped, lt=Rres. fa>0: it is denser
+        # than the tidal field all the way out to its edge -> the tidal radius
+        # lies beyond the profile, nothing is stripped, lt=rh (returning Rres
+        # here would instead strip the whole bound mass).
+        lt = cfg.Rres if fa<0. else sp.rh
     else:
         lt = brentq(Findlt, a,b, args=(sp,rhs),
             rtol=1e-5,maxiter=1000)

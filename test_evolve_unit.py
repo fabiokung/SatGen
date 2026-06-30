@@ -218,6 +218,37 @@ class TestLtidal:
         lt = ev.ltidal(dekel_sat, [host_halo, host_disk], xv_inside, choice='King62')
         assert lt > 0.
 
+    def test_dense_subhalo_unstripped_returns_rh(self):
+        """A subhalo denser than the tidal field all the way out to its profile
+        edge has no root in [Rres, 9.999 rh]: the tidal radius lies beyond the
+        profile, so nothing is stripped and ltidal must return rh -- not the Rres
+        floor, which would instead strip the whole bound mass."""
+        from subhalo_functions import NumericProfile
+        original = cfg.Rres
+        cfg.Rres = 1e-5
+        try:
+            host = NFW(1e9, 25.)
+            sub_nfw = NFW(3e6, 1400.)               # ~pc-scale, ultra-dense cusp
+            ri = np.logspace(np.log10(cfg.Rres), np.log10(sub_nfw.rs), 200)
+            sub = NumericProfile(ri, sub_nfw.M(ri))  # truncated at its scale radius
+            xv = np.array([1.0, 0., 0., 0., float(host.Vcirc(1.0)), 0.])
+            lt = ev.ltidal(sub, host, xv, choice='Tormen98')
+            assert lt == pytest.approx(sub.rh)
+            assert lt > 100. * cfg.Rres              # not the degenerate Rres floor
+        finally:
+            cfg.Rres = original
+
+    def test_diffuse_subhalo_fully_stripped_returns_Rres(self):
+        """The other no-root branch: a subhalo less dense than the tidal field even
+        at Rres (fa<0) has no bound material -> ltidal returns Rres."""
+        from subhalo_functions import NumericProfile
+        host = NFW(1e12, 10.)
+        ri = np.logspace(np.log10(cfg.Rres), np.log10(2.0), 100)
+        sub = NumericProfile(ri, 4. / 3. * np.pi * 1.0 * ri**3)  # uniform 1 Msun/kpc^3
+        r = 0.05 * host.rh
+        xv = np.array([r, 0., 0., 0., float(host.Vcirc(r)), 0.])
+        assert ev.ltidal(sub, host, xv, choice='King62') == pytest.approx(cfg.Rres)
+
 
 # ---------------------------------------------------------------------------
 # msub tests
