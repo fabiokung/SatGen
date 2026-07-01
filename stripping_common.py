@@ -359,6 +359,30 @@ def evolve_satgen_green(host, ma, c2a, xv0, tmax=10., Nstep=10000,
     )
 
 
+def _cumulant_step(G, g, beta_h, t_orb, dt):
+    """One step of Du+24 eq. 39: dG_ab/dt = g_ab - beta_h G_ab / T_orb.
+
+    Linear ODE with a stiff decay term. Integrate it exactly over the step,
+    holding g and T_orb at their step values (the piecewise-constant assumption
+    every other per-step quantity already makes):
+
+        G_{n+1} = G_n e^{-b} + (T_orb g / beta_h)(1 - e^{-b}),  b = beta_h dt / T_orb
+
+    The exact decay factor e^{-b} in (0, 1] is unconditionally positive; forward
+    Euler's truncated 1 - b goes negative for b > 1 and rings the cumulant. As
+    beta_h -> 0 this reduces to the plain integral G_n + g dt. beta_h=1 recovers
+    Benson+Du22 eq. 16; Du+24 Table IV calibrates beta_h=0.278 for an NFW subhalo
+    on an NFW host.
+    """
+    if beta_h <= 0.:
+        return G + g * dt
+    b = beta_h * dt / t_orb
+    # -expm1(-b) = 1 - e^{-b}, accurate as b -> 0 where the plain 1 - e^{-b}
+    # cancels catastrophically; the forcing weight (t_orb/beta_h)(1-e^{-b})
+    # then -> g dt continuously.
+    return G * np.exp(-b) - g * (t_orb / beta_h) * np.expm1(-b)
+
+
 class _HeatingStepper:
     """Per-step Benson+Du22 second-order bookkeeping. Hides the peri-to-peri
     cumulant H(t), the pericentre detection, and the frozen sigma_r^2
@@ -662,11 +686,10 @@ def evolve_heating(host, numProfile0, xv0, tmax=10., Nstep=10000,
             )
 
         tt_cur = tidalTensor(potential, [x, y, z_c])
-        # Du+24 eq. 39: dG_ab/dt = g_ab - beta_h * G_ab / T_orb, integrated
-        # on the host orbital time. beta_h=1 recovers Benson+Du22 eq. 16;
-        # Du+24 Table IV calibrates beta_h=0.278 for an NFW subhalo on an
-        # NFW host.
-        tt_int += (tt_cur - beta_h * tt_int / t_orb) * dt
+        # Du+24 eq. 39 cumulant, integrated exactly over the step on the host
+        # orbital time (see _cumulant_step). The exact exponential decay avoids
+        # forward Euler's sign flip at beta_h dt/t_orb > 1.
+        tt_int = _cumulant_step(tt_int, tt_cur, beta_h, t_orb, dt)
         # adiabatic correction (Pullen+14 / Gnedin+99, Benson+Du22 eq. 3):
         # omega_p at the subhalo half-mass radius, T_shock = r/V (the
         # instantaneous orbital timescale at the current position — small

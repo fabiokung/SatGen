@@ -289,3 +289,93 @@ def test_truncate_kazantzidis_rho_t_override():
     assert over.Mh == pytest.approx(float(nfw.M(rvir)) + tail, rel=1e-4)
     fd = truncate_kazantzidis(num, r_t=rvir, r_decay=rdecay, slope=slope)
     assert abs(fd.Mh - over.Mh) / over.Mh > 1e-3
+
+
+def test_cumulant_step_matches_closed_form():
+    # composing exact steps with constant g, t_orb reproduces the analytic
+    # solution of Du+24 eq. 39, G(t) = (t_orb g / beta_h)(1 - e^{-beta_h t/t_orb}).
+    g = np.array([[1.0, 0.3], [0.3, -0.5]])
+    beta_h, t_orb, dt, N = 3.0, 1.7, 0.01, 500
+    G = np.zeros_like(g)
+    for _ in range(N):
+        G = sc._cumulant_step(G, g, beta_h, t_orb, dt)
+    t = N * dt
+    G_analytic = (t_orb * g / beta_h) * (1. - np.exp(-beta_h * t / t_orb))
+    assert np.allclose(G, G_analytic, rtol=1e-12, atol=0.)
+
+
+def test_cumulant_step_positive_where_euler_flips():
+    # for b = beta_h dt/t_orb > 1 forward Euler's 1 - b factor goes negative and
+    # drives a decaying cumulant (g=0) below zero; the exact step keeps it in
+    # (0, G_0].
+    G0 = np.full((3, 3), 2.0)
+    g = np.zeros((3, 3))
+    Gx = sc._cumulant_step(G0, g, beta_h=2.0, t_orb=1.0, dt=1.0)
+    assert np.all(Gx > 0.) and np.all(Gx < G0)
+    euler = G0 + (g - 2.0 * G0 / 1.0) * 1.0
+    assert np.all(euler < 0.)
+
+
+def test_cumulant_step_zero_beta_is_riemann_sum():
+    # beta_h -> 0 has no decay, so the cumulant is the plain time integral of g.
+    g = np.array([[0.5, -0.2], [-0.2, 0.9]])
+    t_orb, dt, N = 1.0, 0.01, 300
+    G = np.zeros_like(g)
+    for _ in range(N):
+        G = sc._cumulant_step(G, g, 0.0, t_orb, dt)
+    assert np.allclose(G, g * (N * dt), rtol=1e-13)
+
+
+def test_cumulant_step_beta_to_zero_limit():
+    # the t_orb g / beta_h term is a 0/0 as beta_h -> 0; the step must approach
+    # the plain integral G + g dt continuously rather than blow up.
+    G0 = np.full((3, 3), 0.7)
+    g = np.array([[1.0, 0.3, 0.0], [0.3, -0.5, 0.2], [0.0, 0.2, 0.4]])
+    t_orb, dt = 1.7, 0.05
+    riemann = G0 + g * dt
+    assert np.array_equal(sc._cumulant_step(G0, g, 0.0, t_orb, dt), riemann)
+    # error is O(beta_h) above the roundoff floor of (t_orb g/beta_h)(1-e^{-b}):
+    # each 100x drop in beta_h shrinks the gap to the beta_h=0 integral ~100x
+    errs = [np.abs(sc._cumulant_step(G0, g, b, t_orb, dt) - riemann).max()
+            for b in (1e-1, 1e-3, 1e-6)]
+    assert errs[0] < 1e-2
+    assert errs[1] < 0.05 * errs[0] and errs[2] < 0.05 * errs[1]
+    # expm1 keeps the small-beta_h forcing weight accurate: no 0/0 blow-up and
+    # the step still matches the beta_h=0 integral to ~machine precision
+    G_tiny = sc._cumulant_step(G0, g, 1e-12, t_orb, dt)
+    assert np.all(np.isfinite(G_tiny)) and np.abs(G_tiny - riemann).max() < 1e-12
+
+
+def test_cumulant_step_dt_to_zero_matches_euler():
+    # both schemes share the leading term G + (g - beta_h G/T) dt, so their
+    # difference is O(dt^2): halving dt cuts the exact-vs-Euler gap ~4x.
+    G0 = np.full((3, 3), 0.7)
+    g = np.full((3, 3), 1.3)
+    beta_h, t_orb = 6.0, 1.1
+
+    def gap(dt):
+        ex = sc._cumulant_step(G0, g, beta_h, t_orb, dt)
+        eu = G0 + (g - beta_h * G0 / t_orb) * dt
+        return np.abs(ex - eu).max()
+
+    d1, d2 = gap(1e-2), gap(5e-3)
+    assert d1 > 0.
+    assert 3.5 < d1 / d2 < 4.5
+
+
+def test_cumulant_step_more_accurate_than_euler():
+    # for a large step (b = beta_h dt/t_orb ~ 1) the exact step reproduces the
+    # analytic single-step solution to machine precision while forward Euler's
+    # first-order truncation is off by ~b^2/2 |G_eq - G_0|.
+    G0 = np.full((3, 3), 0.7)
+    g = np.full((3, 3), 1.3)
+    beta_h, t_orb, dt = 6.0, 1.1, 0.2  # b = 6*0.2/1.1 ~ 1.09
+    b = beta_h * dt / t_orb
+    G_eq = t_orb * g / beta_h
+    analytic = G0 * np.exp(-b) + G_eq * (1. - np.exp(-b))
+    err_exact = np.abs(sc._cumulant_step(G0, g, beta_h, t_orb, dt) - analytic).max()
+    euler = G0 + (g - beta_h * G0 / t_orb) * dt
+    err_euler = np.abs(euler - analytic).max()
+    assert err_exact < 1e-14
+    assert err_euler > 1e-2
+    assert err_euler > 1e6 * max(err_exact, 1e-16)
