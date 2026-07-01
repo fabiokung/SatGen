@@ -390,7 +390,8 @@ class _HeatingStepper:
     on second_order at every per-step decision.
 
     For second_order=False, .step returns the plain Pullen+14 first-order
-    eps(r) = dt * tidalHR * r**2 and never signals a reset. For
+    eps(r) = dI * r**2, dI the trapezoidal time-integral of the heating rate
+    over the step, and never signals a reset. For
     second_order=True it tracks the cumulant from the previous pericentre
     and emits a per-step Benson+Du22 increment that adds up over each
     peri-to-peri segment to the per-orbit kick (see evolve_heating
@@ -400,6 +401,7 @@ class _HeatingStepper:
 
     def __init__(self, numProfile, second_order, f2=0.406, chi_v=-0.333):
         self.second_order = second_order
+        self.hr_prev = None  # previous step's heating rate, for trapezoidal
         if not second_order:
             return
         # Benson+Du22 eq. (4) calibrates f_2=0.406 against an SIS host;
@@ -420,8 +422,17 @@ class _HeatingStepper:
 
     def step(self, dt, tidalHR, r, t_now, t_orb):
         """Returns (eps_r, should_reset). Advances internal state."""
+        # trapezoidal time-integral of the heating rate over the step (2nd order
+        # vs the rectangle dt*tidalHR): dI = (tidalHR_prev + tidalHR) dt / 2.
+        # The per-orbit H reset lands on a sample point and only zeroes the
+        # accumulator, so reusing tidalHR at that boundary stays exact. The
+        # first step has no left sample -> rectangle.
+        hr_prev = tidalHR if self.hr_prev is None else self.hr_prev
+        dI = 0.5 * (hr_prev + tidalHR) * dt
+        self.hr_prev = tidalHR
+
         if not self.second_order:
-            return (lambda r_: dt * tidalHR * r_**2), False
+            return (lambda r_, dI=dI: dI * r_**2), False
 
         # pericentre detector: r_p1 was a local minimum if r_p2 > r_p1 < r.
         # 4*t_dyn fallback ensures near-circular orbits still reset.
@@ -431,21 +442,21 @@ class _HeatingStepper:
         self.r_p2 = self.r_p1
         self.r_p1 = r
 
-        d_H = max(tidalHR * dt, 0.)
+        d_H = max(dI, 0.)
         H_new = self.H + d_H
         sqrt_H_new = np.sqrt(H_new)
         d_sqrt = sqrt_H_new - self.sqrt_H
         c2, sig2, rh = self.c2, self.sig2, self.rh
 
-        def eps_r(r_, _h=d_H, _ds=d_sqrt, _c2=c2, _s2=sig2, _rh=rh):
+        def eps_r(r_, d_H=d_H, d_sqrt=d_sqrt, c2=c2, sig2=sig2, rh=rh):
             # vectorized over r_ (heat_profile passes the full shell grid):
             # sigma_r^2 is only defined within the half-mass radius, zero
             # beyond. np.where masks the out-of-range spline values (the
             # interpolator's clamp/NaN tail) before the sqrt.
             r_ = np.asarray(r_, dtype=float)
-            e1 = _h * r_**2
-            s2 = np.where(r_ <= _rh, np.maximum(_s2(r_), 0.), 0.)
-            return e1 + _c2 * r_ * np.sqrt(s2) * _ds
+            e1 = d_H * r_**2
+            s2 = np.where(r_ <= rh, np.maximum(sig2(r_), 0.), 0.)
+            return e1 + c2 * r_ * np.sqrt(s2) * d_sqrt
 
         self.H = H_new
         self.sqrt_H = sqrt_H_new

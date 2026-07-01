@@ -379,3 +379,66 @@ def test_cumulant_step_more_accurate_than_euler():
     assert err_exact < 1e-14
     assert err_euler > 1e-2
     assert err_euler > 1e6 * max(err_exact, 1e-16)
+
+
+def test_heating_stepper_trapezoidal_increment():
+    # first-order path: the per-step energy amplitude eps_r(r)/r^2 is the
+    # trapezoidal time-integral of the heating rate, (hr_prev + hr)/2 * dt. The
+    # first step has no left sample and falls back to the rectangle hr*dt.
+    st = sc._HeatingStepper(None, second_order=False)
+    dt = 0.1
+    hrs = [2.0, 4.0, 6.0, 3.0]
+    amp = [st.step(dt, hr, r=1.0, t_now=0., t_orb=1.0)[0](1.0) for hr in hrs]
+    expected = [2.0 * dt, 0.5 * (2 + 4) * dt, 0.5 * (4 + 6) * dt,
+                0.5 * (6 + 3) * dt]
+    assert np.allclose(amp, expected)
+
+
+def test_heating_stepper_trapezoidal_H_spans_reset():
+    # second-order H accumulates the same trapezoidal increment, and the
+    # per-orbit reset zeroes the accumulator but not the quadrature's left
+    # sample, so the increment straddling a reset still uses the boundary hr.
+    class _Stub:
+        rh = 1.0
+        _sig2 = staticmethod(lambda r_: np.zeros_like(np.asarray(r_, float)))
+
+    st = sc._HeatingStepper(_Stub(), second_order=True)
+    dt = 0.1
+    st.step(dt, 2.0, r=3.0, t_now=0.0, t_orb=1.0)   # rectangle: H = 2*dt
+    st.step(dt, 4.0, r=2.0, t_now=0.1, t_orb=1.0)   # trap: H += (2+4)/2*dt
+    assert st.H == pytest.approx((2.0 + 0.5 * (2 + 4)) * dt)
+    st.reset(_Stub(), t_now=0.2)                    # H -> 0, hr_prev kept at 4
+    st.step(dt, 6.0, r=2.5, t_now=0.2, t_orb=1.0)   # trap across reset: (4+6)/2*dt
+    assert st.H == pytest.approx(0.5 * (4 + 6) * dt)
+
+
+def test_heating_stepper_trapezoidal_is_second_order():
+    # integrating a smooth heating rate f(t) over the run, the stepper's
+    # trapezoidal H converges as O(dt^2) while the rectangle sum is O(dt): the
+    # trapezoid is far closer at the same resolution and improves ~4x when dt
+    # halves (vs ~2x for the rectangle).
+    import math
+
+    class _Stub:
+        rh = 1.0
+        _sig2 = staticmethod(lambda r_: np.zeros_like(np.asarray(r_, float)))
+
+    f = lambda t: math.sin(t) + 0.5 * t        # smooth, nonlinear, non-periodic
+    F = lambda t: -math.cos(t) + 0.25 * t**2   # antiderivative
+    T = 2.0
+
+    def errs(N):
+        dt = T / N
+        st = sc._HeatingStepper(_Stub(), second_order=True)
+        rect = 0.
+        for t in np.linspace(0., T, N + 1)[1:]:
+            st.step(dt, f(t), r=1.0, t_now=t, t_orb=1e9)  # t_orb huge: no reset
+            rect += f(t) * dt
+        analytic = F(T) - F(0.)
+        return abs(st.H - analytic), abs(rect - analytic)
+
+    et1, er1 = errs(64)
+    et2, er2 = errs(128)
+    assert et1 < 0.1 * er1              # trapezoid much closer at same N
+    assert 3.5 < et1 / et2 < 4.5        # O(dt^2)
+    assert 1.7 < er1 / er2 < 2.3        # rectangle only O(dt)
