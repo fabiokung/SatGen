@@ -517,7 +517,7 @@ def evolve_heating(host, numProfile0, xv0, tmax=10., Nstep=10000,
                    t_dyn_mode='sub_lt', truncation='hard',
                    tail_n=5., tail_xi=0., lt_choice='King62',
                    n_snapshots=10, label=None, early_terminate=False,
-                   dynamical_friction=True):
+                   dynamical_friction=True, r_stop=None):
     # t_dyn_mode controls only the timescale T in the King62 stripping rate
     # (Du+24 eq. 35):
     #   'host':   T = T_dyn,host(r_sub) = tdyn(host, r_sub).
@@ -638,6 +638,19 @@ def evolve_heating(host, numProfile0, xv0, tmax=10., Nstep=10000,
         o.integrate(t, potential, m if dynamical_friction else None)
         xv = o.xv
         r = np.sqrt(xv[0]**2 + xv[2]**2)
+        if r_stop is not None and r < r_stop:
+            # parked: the orbit has decayed to r_stop (e.g. the dynamical-friction
+            # stall radius). Stop here rather than plunge toward the cusp centre,
+            # where the DF force diverges. Record the terminal state and exit.
+            t_arr[i] = t
+            r_arr[i] = r
+            m_arr[i] = m
+            vmax_arr[i] = numProfile.Vmax
+            rmax_arr[i] = numProfile.rmax
+            lt_arr[i] = lt
+            clamp_arr[i] = 0.
+            clamp_worst_arr[i] = 0.
+            break
         V = np.sqrt(xv[3]**2 + xv[4]**2 + xv[5]**2)
         x = xv[0] * np.cos(xv[1])
         y = xv[0] * np.sin(xv[1])
