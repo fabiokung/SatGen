@@ -814,7 +814,7 @@ ax2.tick_params('y',colors='dodgerblue',direction='in',
 ax.plot(timesteps,TidalRadius,lw=lw,color='k',label='tidal')
 #ax.plot(timesteps,RamPressureRadius,lw=lw,ls='--',color='k',label='RP')
 ax.plot(timesteps,10.*EffectiveRadius,lw=lw,ls='-.',color='k',
-    label='$10\ l_\mathrm{eff}$')
+    label=r'$10\ l_\mathrm{eff}$')
 #
 #ax2.plot(timesteps,concentration,lw=lw,color='dodgerblue',)
 ax2.plot(timesteps,slope,lw=lw,color='dodgerblue',)
