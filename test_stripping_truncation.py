@@ -135,6 +135,22 @@ def test_clamp_track_aligned_to_evolution(du24_setup):
     assert np.nansum(res.clamp) > 0                 # the 1/20 orbit does clamp
 
 
+def test_revirial_clamp_telemetry_populated(du24_setup):
+    """evolve_heating_revirial records shell-clamp telemetry per re-virialization
+    (res.clamp shells, clamp_worst %, clamp_worst_r radius), aligned to the mass
+    track: finite on the apocentre re-virialization steps, NaN elsewhere."""
+    res = _run(du24_setup, 'kazantzidis', second_order=True, engine='revirial')
+    for arr in (res.clamp, res.clamp_worst, res.clamp_worst_r):
+        assert arr is not None and arr.shape == res.m.shape
+    revir = np.isfinite(res.clamp)
+    assert revir.sum() > 0                          # some re-virializations happened
+    assert np.all(res.clamp[revir] >= 0.)           # shells clamped: a count
+    assert np.nansum(res.clamp) > 0                 # kazantzidis tail clamps on 1/20
+    fired = revir & (res.clamp > 0)                 # steps where a shell actually clamped
+    assert np.all(np.isfinite(res.clamp_worst_r[fired]))
+    assert np.all(res.clamp_worst_r[fired] > 0.)
+
+
 def _final_mass_ratio(setup, nstep, alpha=3.93):
     hNFW, rvals, M_sub, xv0_20 = setup
     res = sc.evolve_heating(

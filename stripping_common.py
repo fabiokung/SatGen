@@ -80,11 +80,13 @@ class EvolutionResult:
     vmax0: float = 0.
     label: str = ''
     # per-step shell-crossing clamp activity, aligned to t/m/lt (NaN on skipped
-    # steps). clamp is the shells clamped that step; clamp_worst the largest
-    # overshoot the clamp removed (%). None for non-heating evolvers. Bin by
-    # m (bound fraction) or t for clamp-vs-stage analysis.
+    # steps; for the revirial engine only the apocentre re-virialization steps carry
+    # values). clamp is the shells clamped that step, clamp_worst the largest
+    # overshoot the clamp removed (%), clamp_worst_r its radius (kpc). None for
+    # non-heating evolvers. Bin by m (bound fraction), t, or r for clamp analysis.
     clamp: Optional[np.ndarray] = None
     clamp_worst: Optional[np.ndarray] = None
+    clamp_worst_r: Optional[np.ndarray] = None
 
 
 def make_orbit(host, R0=1., z0=0., phi0=0., VR0=0., Vz0=0., eta=1.):
@@ -842,14 +844,15 @@ def _revirialize(ref, Q, c2, m, lt_join, truncation, tail_n, tail_xi):
             s2 = np.where(rr <= rh, np.maximum(sig2(rr), 0.), 0.)
             de = de + c2 * np.sqrt(np.maximum(Q * rr**2 * s2, 0.))
         return de
-    heated = heat_profile(ref, eps_fn)
+    tally = {}
+    heated = heat_profile(ref, eps_fn, tally=tally)
     m = min(m, float(heated.M(heated.rh)))
     if truncation == 'hard':
-        return _truncate_hard(heated, m), m
+        return _truncate_hard(heated, m), m, tally
     if truncation == 'powerlaw':
         return truncate_powerlaw(heated, lt_join * 10.**tail_xi,
-                                 n=tail_n, m_total=m), m
-    return truncate_kazantzidis(heated, lt_join, m_total=m), m
+                                 n=tail_n, m_total=m), m, tally
+    return truncate_kazantzidis(heated, lt_join, m_total=m), m, tally
 
 
 def evolve_heating_revirial(host, numProfile0, xv0, tmax=10.,
@@ -922,6 +925,7 @@ def evolve_heating_revirial(host, numProfile0, xv0, tmax=10.,
 
     t_list, r_list, m_list = [], [], []
     vmax_list, rmax_list, lt_list = [], [], []
+    clamp_list, cw_list, cwr_list = [], [], []   # shells, worst %, worst r (NaN off revir)
     cur_vmax, cur_rmax = ref.Vmax, ref.rmax
     t_last_revir = 0.
     dt_prev = np.inf
@@ -996,6 +1000,7 @@ def evolve_heating_revirial(host, numProfile0, xv0, tmax=10.,
             t_list.append(t); r_list.append(r_new); m_list.append(m)
             vmax_list.append(cur_vmax); rmax_list.append(cur_rmax)
             lt_list.append(lt)
+            clamp_list.append(np.nan); cw_list.append(np.nan); cwr_list.append(np.nan)
             break
 
         if m > cfg.Mres:
@@ -1013,13 +1018,15 @@ def evolve_heating_revirial(host, numProfile0, xv0, tmax=10.,
         # re-virialize at apocentre (r local max), with a host-orbit-time cap so
         # near-circular / distorted orbits (no clean apocentre) still settle: apply
         # the accumulated heating in one shell expansion and reshape to bound mass m.
+        step_clamp = (np.nan, np.nan, np.nan)
         apo = (r_p1 is not None and r_p2 is not None
                and r_p1 > r_p2 and r_p1 > r_new)
         if (apo or t - t_last_revir >= revir_fallback * t_orb) \
                 and Q > 0. and m > cfg.Mres:
             lt_join = lt_min if np.isfinite(lt_min) else lt
-            ref, m = _revirialize(ref, Q, c2, m, lt_join,
-                                  truncation, tail_n, tail_xi)
+            ref, m, tally = _revirialize(ref, Q, c2, m, lt_join,
+                                         truncation, tail_n, tail_xi)
+            step_clamp = (tally['shells'], tally['worst_pct'], tally['worst_r'])
             r_ref, M_ref, sig2_ref = _reference_arrays(ref, c2)
             omega_p = ref.omega_p
             cur_vmax, cur_rmax = ref.Vmax, ref.rmax
@@ -1029,6 +1036,8 @@ def evolve_heating_revirial(host, numProfile0, xv0, tmax=10.,
         # Vmax/rmax step-update at re-virialization; carry between (aligned to t).
         t_list.append(t); r_list.append(r_new); m_list.append(m)
         vmax_list.append(cur_vmax); rmax_list.append(cur_rmax); lt_list.append(lt)
+        clamp_list.append(step_clamp[0]); cw_list.append(step_clamp[1])
+        cwr_list.append(step_clamp[2])
         r_p2, r_p1 = r_p1, r_new
         dt_prev = dt
         nstep += 1
@@ -1043,8 +1052,10 @@ def evolve_heating_revirial(host, numProfile0, xv0, tmax=10.,
     # disrupted (m at the floor) -- there is nothing to settle.
     if Q > 0. and m > cfg.Mres and t_list:
         lt_join = lt_min if np.isfinite(lt_min) else lt
-        ref, m = _revirialize(ref, Q, c2, m, lt_join, truncation, tail_n, tail_xi)
+        ref, m, tally = _revirialize(ref, Q, c2, m, lt_join, truncation, tail_n, tail_xi)
         m_list[-1], vmax_list[-1], rmax_list[-1] = m, ref.Vmax, ref.rmax
+        clamp_list[-1], cw_list[-1], cwr_list[-1] = (
+            tally['shells'], tally['worst_pct'], tally['worst_r'])
 
     return EvolutionResult(
         t=np.asarray(t_list), r=np.asarray(r_list), m=np.asarray(m_list),
@@ -1052,7 +1063,9 @@ def evolve_heating_revirial(host, numProfile0, xv0, tmax=10.,
         lt=np.asarray(lt_list),
         r_grid=np.zeros((1, 1)), rho_snapshots=np.zeros((1, 1)),
         M_snapshots=np.zeros((1, 1)), snapshot_steps=np.asarray([]),
-        rmax0=rmax0, vmax0=vmax0, label=label, clamp=None, clamp_worst=None,
+        rmax0=rmax0, vmax0=vmax0, label=label,
+        clamp=np.asarray(clamp_list), clamp_worst=np.asarray(cw_list),
+        clamp_worst_r=np.asarray(cwr_list),
     )
 
 
