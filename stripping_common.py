@@ -6,6 +6,7 @@ from typing import Optional
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.lines import Line2D
+from scipy.interpolate import PchipInterpolator
 from scipy.optimize import brentq
 
 import config as cfg
@@ -13,8 +14,9 @@ import cosmo as co
 import evolve as ev
 from orbit import orbit
 from profiles import NFW, Dekel, Green, Vcirc, tdyn
-from subhalo_functions import (NumericProfile, heat_profile, tidalTensor,
-                               truncate_kazantzidis, truncate_powerlaw)
+from subhalo_functions import (NumericProfile, _log_pchip, heat_profile,
+                               tidalTensor, truncate_kazantzidis,
+                               truncate_powerlaw)
 
 
 class OverstripError(ValueError):
@@ -24,6 +26,15 @@ class OverstripError(ValueError):
     distinct from a bare ValueError signalling a real bug. Subclasses
     ValueError so existing `except ValueError` / pytest.raises(ValueError)
     paths still match."""
+
+
+class PericentreUnresolvedError(OverstripError):
+    """evolve_heating_revirial: the King62 strip still saturates (realized strip
+    number > strip_number_max) even at the finest allowed step dt_min, so the
+    pericentre cannot be resolved within the step budget -- the orbit is out of
+    the resolvable regime. Subclasses OverstripError so an `except OverstripError`
+    handler catches both; the distinct type separates an unresolvable orbit from
+    the coarse-dt OverstripError."""
 
 
 # Ceiling on the per-step stripping number cfl = alpha*dt/T_strip. The name is by
@@ -755,6 +766,293 @@ def evolve_heating(host, numProfile0, xv0, tmax=10., Nstep=10000,
         r_grid=r_grids, rho_snapshots=rho_snaps, M_snapshots=M_snaps,
         snapshot_steps=track_steps, rmax0=rmax0, vmax0=vmax0, label=label,
         clamp=clamp_arr, clamp_worst=clamp_worst_arr,
+    )
+
+
+class _ExpandedProfile:
+    """Reference profile expanded analytically by the accumulated heating scalar
+    Q (Pullen+14 shell map, eq. 18, with the Du+24 2nd-order term), exposing only
+    M(r) and rh -- all ev.ltidal needs from the subhalo. No PCHIP/tail rebuild;
+    the full heat_profile + reshape happens once per apocentre.
+
+    Shell energy Delta_eps(r) = Q r^2 + c2 sqrt(Q r^2 sigma_r^2(r)); the shell at
+    reference radius r moves to r/(1 - perturb), perturb = 2 Delta_eps r / (G M),
+    conserving M(<r) per shell -- so {r_cur, M_ref} is the expanded M(<r) curve.
+    """
+    __slots__ = ('rh', '_r', '_M', '_mint')
+
+    def __init__(self, r_ref, M_ref, sig2_ref, Q, c2):
+        de = Q * r_ref**2
+        if c2:
+            de = de + c2 * np.sqrt(np.maximum(de * sig2_ref, 0.))
+        perturb = np.zeros_like(r_ref)
+        pos = M_ref > 0.
+        # cap perturb < 1 (shell stays bound/finite); the monotone-accumulate
+        # below is the cheap shell-crossing guard (l_t sits in the low-perturb
+        # core, so this rarely binds there -- the full clamp is in heat_profile).
+        perturb[pos] = np.clip(2. * de[pos] * r_ref[pos] / (cfg.G * M_ref[pos]),
+                               None, 0.95)
+        x = np.maximum.accumulate(r_ref / (1. - perturb))
+        keep = np.ones(len(x), bool)
+        keep[1:] = np.diff(x) > 0.
+        self._r, self._M = x[keep], M_ref[keep]
+        self.rh = float(self._r[-1])
+        self._mint = (_log_pchip(self._r, self._M)
+                      or PchipInterpolator(self._r, self._M, extrapolate=False))
+
+    def M(self, r):
+        return self._mint(r)
+
+
+def _t_strip(profile, potential, xv, lt_choice, t_dyn_mode, t_orb):
+    """(T_strip, lt, M(<lt)) for the King62 rate on `profile` at xv."""
+    lt = float(ev.ltidal(profile, potential, xv, lt_choice))  # type: ignore[arg-type]
+    if lt >= profile.rh:
+        return np.inf, lt, float(profile.M(profile.rh))
+    M_at_lt = float(profile.M(lt))
+    if t_dyn_mode == 'sub_lt':
+        T_strip = (np.pi / 2.) * (np.sqrt(lt**3 / (cfg.G * M_at_lt))
+                                  if M_at_lt > 0. else np.inf)
+    else:
+        T_strip = t_orb
+    return T_strip, lt, M_at_lt
+
+
+def _reference_arrays(prof, c2):
+    """Frozen-reference grid (radii, enclosed mass, sigma_r^2) that the per-step
+    analytic expansion and the apocentre reshape read. sigma_r^2 is masked to zero
+    beyond the half-mass edge and only built for the 2nd-order term (c2 != 0)."""
+    r_ref = prof.ri
+    M_ref = np.asarray(prof.M(r_ref), float)
+    if c2:
+        sig2 = np.where(r_ref <= prof.rh, np.maximum(prof._sig2(r_ref), 0.), 0.)
+    else:
+        sig2 = np.zeros_like(r_ref)
+    return r_ref, M_ref, np.asarray(sig2, float)
+
+
+def _revirialize(ref, Q, c2, m, lt_join, truncation, tail_n, tail_xi):
+    """Expand the frozen reference by the accumulated heating (Q, 1st+2nd order) in
+    one shell mapping, then reshape to bound mass m. Returns (profile, m). The join
+    for the tail sits at the orbit's deepest tidal radius (lt_join)."""
+    def eps_fn(rr, Q=Q, c2=c2, rh=ref.rh, sig2=ref._sig2):
+        rr = np.asarray(rr, float)
+        de = Q * rr**2
+        if c2:
+            s2 = np.where(rr <= rh, np.maximum(sig2(rr), 0.), 0.)
+            de = de + c2 * np.sqrt(np.maximum(Q * rr**2 * s2, 0.))
+        return de
+    heated = heat_profile(ref, eps_fn)
+    m = min(m, float(heated.M(heated.rh)))
+    if truncation == 'hard':
+        return _truncate_hard(heated, m), m
+    if truncation == 'powerlaw':
+        return truncate_powerlaw(heated, lt_join * 10.**tail_xi,
+                                 n=tail_n, m_total=m), m
+    return truncate_kazantzidis(heated, lt_join, m_total=m), m
+
+
+def evolve_heating_revirial(host, numProfile0, xv0, tmax=10.,
+                            step_frac=0.01, dt_growth_max=3.0,
+                            strip_number_max=1.0, floor_orbit_frac=1e-3,
+                            dt_abs_frac=1e-6, max_steps=200000,
+                            revir_fallback=4.0,
+                            epsh=3., gamma=2.5, alpha=1., beta_h=1.,
+                            second_order=False, f2=0.406, chi_v=-0.333,
+                            t_dyn_mode='sub_lt', truncation='hard',
+                            tail_n=5., tail_xi=0., lt_choice='King62',
+                            label=None, early_terminate=False,
+                            dynamical_friction=True, r_stop=None):
+    """Re-virialization-cadence forward model (Pullen+14/Du+24, impulse).
+
+    Heating and stripping run on their physical cadences:
+      - per dt (adaptive): accumulate the position-independent energy scalar Q
+        (frozen reference radii, no shell expansion applied) and the Du+24 eq.39
+        tidal-tensor cumulant; relax the bound mass m by King62 (eq.35), with lt
+        computed on the ANALYTICALLY expanded profile (_ExpandedProfile) so the
+        rate sees this-orbit's partial expansion without a heat_profile call.
+      - once per apocentre (re-virialization): apply the full shell expansion
+        (heat_profile on the frozen reference with total accumulated Q, 1st+2nd
+        order) and reshape to the current bound mass m (hard cut or tail),
+        producing the ground-truth-comparable equilibrium. Reset Q, cumulant.
+
+    Pullen+14 (eqs. 15-18) tracks the position-independent Q = E/x^2 with the shell
+    radius x frozen (impulse approximation); the shell then expands once, using the
+    energy at its initial radius. The shell response takes ~a dynamical time, so the
+    expansion is applied once per orbit (apocentre) rather than sub-stepped -- the
+    heating-application count is then set by the orbit, not the timestep, so the
+    bound-mass and structural tracks are dt-convergent.
+
+    step_frac caps dt on both timescales: dt <= step_frac * min(t_orb, T_strip/alpha).
+    The King62 T_strip collapses at pericentre, so the adaptive dt resolves the
+    strip there (each step is cheap scalar work -- no heat_profile). revir_fallback
+    re-virializes if more than revir_fallback * t_orb elapses without an apocentre
+    (a near-circular / distorted orbit with no clean r maximum still settles).
+
+    Track points (Vmax, rmax) step-update at each apocentre -- where the profile is
+    a re-virialized equilibrium, matching where Du+24 measure -- and carry between;
+    t/r/m are recorded per accepted step. lt beyond the profile edge halts stripping.
+    truncation selects the apocentre reshape ('hard', 'kazantzidis', 'powerlaw');
+    see evolve_heating for the shared per-step physics (heat_profile, _cumulant_step,
+    the King62 rate, the truncation tails).
+    """
+    if label is None:
+        label = ('1st+2nd order heating (revirial)' if second_order
+                 else '1st order heating (revirial)')
+    assert cfg.Mres is not None, "cfg.Mres must be set before calling"
+    assert truncation in ('hard', 'kazantzidis', 'powerlaw'), truncation
+    potential = host
+    dt_abs = dt_abs_frac * tmax
+    c2 = np.sqrt(2.) * f2 * (1. + chi_v) if second_order else 0.
+
+    ref = numProfile0
+    r_ref, M_ref, sig2_ref = _reference_arrays(ref, c2)
+    rmax0, vmax0 = ref.rmax, ref.Vmax
+
+    o = orbit(xv0)
+    r = np.sqrt(xv0[0]**2 + xv0[2]**2)
+    m = ref.Mh
+    Q = 0.
+    tt_int = np.zeros((3, 3))
+    hr_prev = None
+    lt_min = np.inf
+    lt = cfg.Rres
+    r_p1 = r_p2 = None  # apocentre detector (r local max)
+    omega_p = ref.omega_p
+
+    t_list, r_list, m_list = [], [], []
+    vmax_list, rmax_list, lt_list = [], [], []
+    cur_vmax, cur_rmax = ref.Vmax, ref.rmax
+    t_last_revir = 0.
+    dt_prev = np.inf
+    nstep = 0
+    t = 0.
+
+    while t < tmax - dt_abs:
+        if nstep >= max_steps:
+            raise PericentreUnresolvedError(
+                f"exceeded max_steps={max_steps} at t={t:.3f}/{tmax} Gyr")
+
+        t_orb = tdyn(potential, r)
+        dt_min = max(dt_abs, floor_orbit_frac * t_orb)
+        if r > cfg.Rres and m > cfg.Mres:
+            exp_pred = _ExpandedProfile(r_ref, M_ref, sig2_ref, Q, c2)
+            T_strip_pred, _, _ = _t_strip(exp_pred, potential, o.xv,
+                                          lt_choice, t_dyn_mode, t_orb)
+        else:
+            T_strip_pred = np.inf
+        dt = min(step_frac * t_orb, step_frac * T_strip_pred / alpha,
+                 dt_growth_max * dt_prev, tmax - t)
+        dt = max(dt, dt_min)
+
+        # defaults so a terminal-break step (r<=Rres / r_stop) leaves the
+        # accumulators unchanged rather than referencing unset trial vars
+        Q_trial, tt_int_trial, tidalHR = Q, tt_int, hr_prev
+        strip_number, lt_step, M_at_lt = 0., lt, 0.
+        t0, xv0_step = o.t, o.xv.copy()
+        while True:
+            o.t, o.xv = t0, xv0_step.copy()
+            o.integrate(t + dt, potential, m if dynamical_friction else None)
+            xv = o.xv
+            r_new = np.sqrt(xv[0]**2 + xv[2]**2)
+            if r_new <= cfg.Rres or (r_stop is not None and r_new < r_stop):
+                break
+            V = np.sqrt(xv[3]**2 + xv[4]**2 + xv[5]**2)
+            x, y, z_c = xv[0] * np.cos(xv[1]), xv[0] * np.sin(xv[1]), xv[2]
+            tt_cur = tidalTensor(potential, [x, y, z_c])
+            tt_int_trial = _cumulant_step(tt_int, tt_cur, beta_h, t_orb, dt)
+            T_shock = r_new / V if V > 0. else 1e10
+            adiabatic = (1. + (omega_p * T_shock)**2)**(-gamma)
+            tidalHR = (epsh / 3) * adiabatic * np.sum(tt_cur * tt_int_trial)
+            dQ = 0.5 * ((tidalHR if hr_prev is None else hr_prev) + tidalHR) * dt
+            Q_trial = max(Q + dQ, 0.)
+
+            if m <= cfg.Mres:
+                strip_number, lt_step, M_at_lt, T_strip = 0., cfg.Rres, 0., np.inf
+            else:
+                exp = _ExpandedProfile(r_ref, M_ref, sig2_ref, Q_trial, c2)
+                T_strip, lt_step, M_at_lt = _t_strip(
+                    exp, potential, xv, lt_choice, t_dyn_mode, t_orb)
+                strip_number = alpha * dt / T_strip
+            if strip_number > strip_number_max and dt > dt_min:
+                dt = max(0.5 * dt, dt_min)
+                continue
+            if strip_number > strip_number_max:
+                raise PericentreUnresolvedError(
+                    f"strip number={strip_number:.1f} > {strip_number_max} at "
+                    f"dt_min={dt_min:.2e} Gyr, t={t:.3f} Gyr; unresolvable")
+            break
+
+        t += dt
+        r = r_new
+        Q, tt_int, hr_prev = Q_trial, tt_int_trial, tidalHR
+
+        if r_new <= cfg.Rres:
+            dt_prev = dt
+            continue
+        if r_stop is not None and r_new < r_stop:
+            # parked at the decay/stall radius: record the terminal state (bound
+            # mass preserved, not floored) and stop before plunging to the cusp.
+            t_list.append(t); r_list.append(r_new); m_list.append(m)
+            vmax_list.append(cur_vmax); rmax_list.append(cur_rmax)
+            lt_list.append(lt)
+            break
+
+        if m > cfg.Mres:
+            # King62 removes only mass bound beyond lt. M(<lt) is read off the
+            # analytically expanded profile, whose total mass is the last
+            # re-virialization's bound mass (mass-conserving expansion) and so
+            # exceeds the King62-reduced m; capping it at m keeps the relaxation
+            # one-sided -- a lt enclosing all bound mass strips nothing, rather
+            # than relaxing m back up.
+            m_lt = min(M_at_lt, m)
+            m = max(m_lt + (m - m_lt) * np.exp(-strip_number), cfg.Mres)
+            lt = lt_step
+            lt_min = min(lt_min, lt)
+
+        # re-virialize at apocentre (r local max), with a host-orbit-time cap so
+        # near-circular / distorted orbits (no clean apocentre) still settle: apply
+        # the accumulated heating in one shell expansion and reshape to bound mass m.
+        apo = (r_p1 is not None and r_p2 is not None
+               and r_p1 > r_p2 and r_p1 > r_new)
+        if (apo or t - t_last_revir >= revir_fallback * t_orb) \
+                and Q > 0. and m > cfg.Mres:
+            lt_join = lt_min if np.isfinite(lt_min) else lt
+            ref, m = _revirialize(ref, Q, c2, m, lt_join,
+                                  truncation, tail_n, tail_xi)
+            r_ref, M_ref, sig2_ref = _reference_arrays(ref, c2)
+            omega_p = ref.omega_p
+            cur_vmax, cur_rmax = ref.Vmax, ref.rmax
+            Q, tt_int, hr_prev, lt_min = 0., np.zeros((3, 3)), None, np.inf
+            t_last_revir = t
+
+        # Vmax/rmax step-update at re-virialization; carry between (aligned to t).
+        t_list.append(t); r_list.append(r_new); m_list.append(m)
+        vmax_list.append(cur_vmax); rmax_list.append(cur_rmax); lt_list.append(lt)
+        r_p2, r_p1 = r_p1, r_new
+        dt_prev = dt
+        nstep += 1
+        if early_terminate and m <= cfg.Mres:
+            break
+
+    # Flush heating accumulated since the last apocentre into a final
+    # re-virialization, so the reported final (m, Vmax, rmax, profile) describe one
+    # self-consistent equilibrium rather than a current m against a stale last-
+    # apocentre structure. If the run ends mid-orbit this is the equilibrium the
+    # subhalo relaxes toward (settling takes ~a dynamical time). Skipped once
+    # disrupted (m at the floor) -- there is nothing to settle.
+    if Q > 0. and m > cfg.Mres and t_list:
+        lt_join = lt_min if np.isfinite(lt_min) else lt
+        ref, m = _revirialize(ref, Q, c2, m, lt_join, truncation, tail_n, tail_xi)
+        m_list[-1], vmax_list[-1], rmax_list[-1] = m, ref.Vmax, ref.rmax
+
+    return EvolutionResult(
+        t=np.asarray(t_list), r=np.asarray(r_list), m=np.asarray(m_list),
+        vmax=np.asarray(vmax_list), rmax=np.asarray(rmax_list),
+        lt=np.asarray(lt_list),
+        r_grid=np.zeros((1, 1)), rho_snapshots=np.zeros((1, 1)),
+        M_snapshots=np.zeros((1, 1)), snapshot_steps=np.asarray([]),
+        rmax0=rmax0, vmax0=vmax0, label=label, clamp=None, clamp_worst=None,
     )
 
 

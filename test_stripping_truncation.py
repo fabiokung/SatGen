@@ -39,32 +39,47 @@ def du24_setup():
     cfg.Mres = original
 
 
-def _run(setup, truncation, second_order=False):
+def _run(setup, truncation, second_order=False, engine='uniform'):
+    """Run one short evolution on the 1/20 orbit through either engine. The uniform
+    grid takes Nstep; the revirialization scheme takes step_frac (dt <= step_frac *
+    min(t_orb, T_strip/alpha)) and reshapes the profile once per apocentre."""
     hNFW, rvals, M_sub, xv0_20 = setup
+    sub = NumericProfile(rvals, M_sub)
+    if engine == 'revirial':
+        return sc.evolve_heating_revirial(
+            hNFW, sub, xv0_20, tmax=12., step_frac=0.02,
+            epsh=0.0741, gamma=0., beta_h=0.278, alpha=3.93, t_dyn_mode='sub_lt',
+            second_order=second_order, truncation=truncation)
     return sc.evolve_heating(
-        hNFW, NumericProfile(rvals, M_sub), xv0_20,
-        tmax=12., Nstep=12000, epsh=0.0741, gamma=0., beta_h=0.278,
-        alpha=3.93, t_dyn_mode='sub_lt', second_order=second_order,
-        truncation=truncation)
+        hNFW, sub, xv0_20, tmax=12., Nstep=12000,
+        epsh=0.0741, gamma=0., beta_h=0.278, alpha=3.93, t_dyn_mode='sub_lt',
+        second_order=second_order, truncation=truncation)
 
 
-def test_hard_cut_survives_on_radial_orbit(du24_setup):
+# both engines evolve the same physics; the survival/track behaviour is asserted
+# against both. Thresholds bracket both engines' converged values -- the corrected
+# per-apocentre heating of the revirialization scheme strips a dense core somewhat
+# less deeply than the uniform grid, so a shared ratio bound is looser than either
+# engine alone (dt-robustness is pinned per-engine in the dedicated tests below).
+@pytest.mark.parametrize('engine', ['uniform', 'revirial'])
+def test_hard_cut_survives_on_radial_orbit(du24_setup, engine):
     """A dense NFW subhalo on the radial orbit strips to a bound remnant, not to the
     mass floor: once the remnant is denser than the tidal field out to its edge its
     tidal radius exceeds the profile (l_t = rh) and stripping halts. Guards the
     tidal-radius logic against over-stripping dense cores, under the hard cut at the
     Du+24 Table IV rate (alpha=3.93, the most aggressive stripping we run)."""
-    res = _run(du24_setup, 'hard')
+    res = _run(du24_setup, 'hard', engine=engine)
     m = res.m[np.isfinite(res.m)]
     assert np.all(m > cfg.Mres), "a dense core must not be stripped to the floor"
-    assert m[-1] / m[0] < 0.05         # heavily stripped (~0.8% remains) but bound
+    assert m[-1] / m[0] < 0.15         # heavily stripped but bound
     assert m[-1] / cfg.Mres > 100      # remnant stays well above the mass floor
 
 
-def test_kazantzidis_tail_survives(du24_setup):
+@pytest.mark.parametrize('engine', ['uniform', 'revirial'])
+def test_kazantzidis_tail_survives(du24_setup, engine):
     """The Kazantzidis l_t tail with the second-order term keeps the subhalo bound,
     with a finite Vmax, out to late times on the radial orbit."""
-    res = _run(du24_setup, 'kazantzidis', second_order=True)
+    res = _run(du24_setup, 'kazantzidis', second_order=True, engine=engine)
     m = res.m[np.isfinite(res.m)]
     assert np.all(m > cfg.Mres), "kazantzidis run should not hit the mass floor"
     late = np.isfinite(res.t) & (res.t > 9.)
@@ -73,7 +88,8 @@ def test_kazantzidis_tail_survives(du24_setup):
         "the Kazantzidis remnant keeps a resolved Vmax peak at late times"
 
 
-def test_powerlaw_tail_survives_at_calibrated_params(du24_setup):
+@pytest.mark.parametrize('engine', ['uniform', 'revirial'])
+def test_powerlaw_tail_survives_at_calibrated_params(du24_setup, engine):
     """The slope-deficit power-law tail keeps the subhalo bound with a finite
     Vmax through 12 Gyr on the 1/20 orbit at the MCMC-calibrated (p50)
     stripping rate -- the regime the model operates in.
@@ -81,17 +97,23 @@ def test_powerlaw_tail_survives_at_calibrated_params(du24_setup):
     Not run at the Du+24 Table IV rate (alpha=3.93) like the Kazantzidis
     test: that rate over-strips, the King62 budget then sits below the tail's
     minimum mass 4 pi rho_t lt^3/(n-3) (an r^-n envelope cannot carry less)
-    on ~90% of steps, and the per-step fallback hard cut disrupts the
-    subhalo just as truncation='hard' does."""
+    on ~90% of steps, and the fallback hard cut disrupts the subhalo just as
+    truncation='hard' does."""
     hNFW, rvals, M_sub, xv0_20 = du24_setup
-    res = sc.evolve_heating(
-        hNFW, NumericProfile(rvals, M_sub), xv0_20,
-        tmax=12., Nstep=12000, epsh=0.0708, gamma=0.0094, beta_h=0.906,
-        alpha=0.171, f2=0.188, t_dyn_mode='sub_lt', second_order=True,
-        truncation='powerlaw')
+    sub = NumericProfile(rvals, M_sub)
+    if engine == 'revirial':
+        res = sc.evolve_heating_revirial(
+            hNFW, sub, xv0_20, tmax=12., step_frac=0.02,
+            epsh=0.0708, gamma=0.0094, beta_h=0.906, alpha=0.171, f2=0.188,
+            t_dyn_mode='sub_lt', second_order=True, truncation='powerlaw')
+    else:
+        res = sc.evolve_heating(
+            hNFW, sub, xv0_20, tmax=12., Nstep=12000,
+            epsh=0.0708, gamma=0.0094, beta_h=0.906, alpha=0.171, f2=0.188,
+            t_dyn_mode='sub_lt', second_order=True, truncation='powerlaw')
     m = res.m[np.isfinite(res.m)]
     assert np.all(m > cfg.Mres), "powerlaw run should not hit the mass floor"
-    assert m[-1] / m[0] < 0.05, "the 1/20 orbit strips deeply, not frozen"
+    assert m[-1] / m[0] < 0.15, "the 1/20 orbit strips deeply, not frozen"
     late = np.isfinite(res.t) & (res.t > 9.)
     assert np.sum(late) > 0
     assert np.all(np.isfinite(res.vmax[late])), \
@@ -215,6 +237,120 @@ def test_evolve_heating_df_off_matches_collisionless(du24_setup):
     fon = np.isfinite(res_on.r)
     assert res_on.r[fon].min() < res_off.r[fin].min(), \
         "DF on deepens the pericentre vs DF off"
+
+
+def _revir(setup, **kw):
+    hNFW, rvals, M_sub, xv0_20 = setup
+    return sc.evolve_heating_revirial(
+        hNFW, NumericProfile(rvals, M_sub), xv0_20, tmax=12.,
+        epsh=0.0741, gamma=0., beta_h=0.278, alpha=3.93, t_dyn_mode='sub_lt',
+        second_order=True, truncation='hard', **kw)
+
+
+def _n_revir(res):
+    """Re-virialization count = step-updates of the (piecewise-constant between
+    apocentres) Vmax track."""
+    v = res.vmax[np.isfinite(res.vmax)]
+    return int(np.sum(np.abs(np.diff(v)) > 0.))
+
+
+def test_revirial_apocentre_count_is_dt_independent(du24_setup):
+    """The re-virialization count is set by the orbit (one per apocentre), not by
+    the timestep: refining step_frac leaves both the number of re-virializations and
+    the final bound mass unchanged. This is what makes the heating dt-convergent --
+    heat_profile is applied a fixed number of times regardless of dt."""
+    coarse = _revir(du24_setup, step_frac=0.05)
+    fine = _revir(du24_setup, step_frac=0.02)
+    assert _n_revir(coarse) == _n_revir(fine)
+    assert _n_revir(coarse) > 5    # the 1/20 re-virializes at every apocentre
+    rc = coarse.m[np.isfinite(coarse.m)]
+    rf = fine.m[np.isfinite(fine.m)]
+    assert rc[-1] / rc[0] == pytest.approx(rf[-1] / rf[0], rel=0.05), \
+        "final bound mass is dt-convergent (no plateau-then-jump)"
+
+
+def test_revirial_profile_frozen_between_apocentres(du24_setup):
+    """Between re-virializations the reference profile is held fixed: Vmax is
+    piecewise-constant, stepping only at apocentres. Many steps share each level."""
+    res = _revir(du24_setup, step_frac=0.05)
+    v = res.vmax[np.isfinite(res.vmax)]
+    n_levels = len(np.unique(np.round(v, 8)))
+    assert n_levels >= 5                  # multiple re-virialization events
+    assert n_levels < len(v) / 5          # but far fewer than steps (frozen between)
+
+
+def test_revirial_fallback_revirializes_without_apocentre(du24_setup):
+    """Re-virialization normally fires at each apocentre (r local maximum). When the
+    orbit has no local maximum over the integration -- a window shorter than half a
+    radial period (a monotone-ish plunge from apocentre, as here), a perfectly
+    circular orbit, or an orbit distorted by a future time-evolving host -- the
+    revir_fallback timer re-virializes after revir_fallback * t_orb instead, so the
+    accumulated heating does not grow unbounded. The 1/20 starts at apocentre and
+    plunges, so a 1.5 Gyr window registers no apocentre: without the fallback the
+    only re-virialization is the terminal flush; with it, heating feeds back into the
+    profile repeatedly during the plunge."""
+    def run(fb):
+        hNFW, rvals, M_sub, xv0_20 = du24_setup
+        return sc.evolve_heating_revirial(
+            hNFW, NumericProfile(rvals, M_sub), xv0_20, tmax=1.5, step_frac=0.02,
+            revir_fallback=fb, epsh=0.0741, gamma=0., beta_h=0.278, alpha=3.93,
+            t_dyn_mode='sub_lt', second_order=True, truncation='hard',
+            dynamical_friction=False)
+    no_fb = run(1e9)
+    with_fb = run(0.3)
+    # no apocentre in a sub-radial-period plunge: the only re-virialization is the
+    # end-of-evolution flush (one step-update of Vmax, at the final step)
+    assert _n_revir(no_fb) == 1
+    # the fallback re-virializes repeatedly mid-plunge, well before the end
+    assert _n_revir(with_fb) > 1
+
+
+def test_revirial_r_stop_parks(du24_setup):
+    """r_stop halts the integration once the orbit dips inside it: the terminal
+    record sits below r_stop with the bound mass preserved (not floored)."""
+    hNFW, rvals, M_sub, _ = du24_setup
+    xv0, _ = sc.make_orbit(hNFW, R0=0.5 * hNFW.rh, z0=0., eta=0.3)
+    r0 = np.hypot(xv0[0], xv0[2])
+    rstop = 0.6 * r0
+    res = sc.evolve_heating_revirial(
+        hNFW, NumericProfile(rvals, M_sub), xv0, tmax=12., step_frac=0.05,
+        epsh=0.0741, gamma=0., beta_h=0.278, alpha=3.93, t_dyn_mode='sub_lt',
+        truncation='hard', dynamical_friction=False, r_stop=rstop)
+    r = res.r[np.isfinite(res.r)]
+    m = res.m[np.isfinite(res.m)]
+    assert r[-1] < rstop               # terminal record is inside r_stop
+    assert m[-1] > cfg.Mres            # bound mass preserved, not floored
+
+
+def test_revirial_raises_pericentre_unresolved_over_budget(du24_setup):
+    """Exceeding the step budget raises PericentreUnresolvedError -- a subclass of
+    OverstripError, so an `except OverstripError` handler catches it while the
+    distinct type flags an unresolvable orbit."""
+    hNFW, rvals, M_sub, xv0_20 = du24_setup
+    with pytest.raises(sc.OverstripError):
+        sc.evolve_heating_revirial(
+            hNFW, NumericProfile(rvals, M_sub), xv0_20, tmax=12., step_frac=0.02,
+            max_steps=50, epsh=0.0741, gamma=0., beta_h=0.278, alpha=3.93,
+            t_dyn_mode='sub_lt', second_order=True, truncation='hard')
+    assert issubclass(sc.PericentreUnresolvedError, sc.OverstripError)
+
+
+def test_revirial_disruption_terminates_without_revirializing(du24_setup):
+    """A subhalo stripped to the mass floor ends via early_terminate at m = Mres,
+    with no final re-virialization -- a floored profile has no bound structure to
+    settle, and re-virializing one is meaningless/fragile. A high mass floor forces
+    the otherwise-surviving dense 1/20 to disrupt."""
+    hNFW, rvals, M_sub, xv0_20 = du24_setup
+    sub0 = NumericProfile(rvals, M_sub)
+    cfg.Mres = 0.3 * sub0.Mh              # high floor: the deep 1/20 crosses it
+    res = sc.evolve_heating_revirial(
+        hNFW, sub0, xv0_20, tmax=37., step_frac=0.02,
+        epsh=0.0741, gamma=0., beta_h=0.278, alpha=3.93, t_dyn_mode='sub_lt',
+        second_order=True, truncation='hard', early_terminate=True)
+    fin = np.isfinite(res.m)
+    assert res.m[fin][-1] <= cfg.Mres * (1. + 1e-9)     # ended at the floor
+    assert res.t[fin][-1] < 37. * 0.999                 # stopped before tmax
+    assert np.all(np.isfinite(res.vmax[fin]))           # no floored-reshape garbage
 
 
 def test_truncate_powerlaw_monotone_at_large_budget():
