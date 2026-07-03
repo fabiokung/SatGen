@@ -14,7 +14,8 @@ from scipy.integrate import quad
 
 import config as cfg
 from profiles import NFW
-from subhalo_functions import NumericProfile, heat_profile, tidalTensor
+from subhalo_functions import (NumericProfile, _expand_shells, heat_profile,
+                               tidalTensor)
 
 
 # ---------------------------------------------------------------------------
@@ -474,6 +475,139 @@ class TestHeatProfile:
                 "Unbound shell(s) sandwiched inside bound region at indices: "
                 f"{np.where(~interior)[0]}"
             )
+
+
+# ---------------------------------------------------------------------------
+# _expand_shells: vectorized Du+24 eq.(36) map vs a serial reference
+# ---------------------------------------------------------------------------
+
+def _expand_shells_serial(ri, Menc, eps_vals, thresh=1e-10):
+    """Readable outer->inner reference for _expand_shells: the same eq.(36) shell
+    map, but the no-crossing clamp is the plain serial loop. The vectorized
+    _clamp_monotone must reproduce this exactly; this is the oracle."""
+    G = cfg.G
+    n = len(ri)
+    eps_vals = np.broadcast_to(np.asarray(eps_vals, float), ri.shape)
+    perturb = np.zeros_like(ri)
+    pos = Menc > 0.
+    perturb[pos] = 2. * eps_vals[pos] * ri[pos] / (G * Menc[pos])
+
+    shells = 0
+    worst_excess = 0.
+    worst_r = np.nan
+    for i in reversed(range(n - 1)):
+        if Menc[i] > 0. and Menc[i + 1] > 0.:
+            limit = (1. - ri[i] / ri[i + 1]
+                     * (Menc[i] / Menc[i + 1]) ** (-1. / 3.)
+                     * (1. - perturb[i + 1]))
+            if perturb[i] > limit:
+                excess = (perturb[i] / limit) - 1. if limit > 0 else np.inf
+                if excess > thresh:
+                    shells += 1
+                    if excess > worst_excess:
+                        worst_excess, worst_r = excess, ri[i]
+                perturb[i] = limit
+    tally = dict(shells=shells, worst_pct=worst_excess * 100. if shells else 0.,
+                 worst_r=worst_r if shells else np.nan)
+
+    Ef = G * Menc / ri * (perturb - 1.)
+    Mshell = np.empty_like(Menc)
+    Mshell[0] = Menc[0]
+    Mshell[1:] = np.diff(Menc)
+    bound = (Ef < 0.) & (Mshell > 0.)
+    rf = ri / (1. - perturb)
+    order = np.argsort(rf[bound])
+    r_bound = rf[bound][order]
+    M_bound = np.cumsum(Mshell[bound][order])
+    keep = np.ones(len(r_bound), bool)
+    keep[:-1] = r_bound[:-1] != r_bound[1:]
+    return r_bound[keep], M_bound[keep], tally
+
+
+def _nfw_grid(M=1e9, c=11.68, npts=300, rlo=1e-3, kind="nfw"):
+    h = NFW(M, c)
+    ri = np.logspace(np.log10(rlo * h.rh), np.log10(h.rh), npts)
+    Mr = np.asarray(h.M(ri), float)
+    if kind == "cored":
+        rc = 0.3 * h.rh
+        rho0 = h.M(rc) / (4. / 3. * np.pi * rc ** 3)
+        Mr = np.where(ri < rc, 4. / 3. * np.pi * ri ** 3 * rho0, Mr)
+    return ri, Mr, h
+
+
+class TestExpandShells:
+    """The vectorized _expand_shells must match the serial reference to rounding
+    across the profile/heating regimes the forward model sees, including the
+    numerical edge cases (inner spline undershoot, cored inner bump, low-density
+    ringing outer tail, fine grids)."""
+
+    def _cases(self):
+        cases = []
+        ri, M, h = _nfw_grid()
+        sc = cfg.G * h.M(h.rh) / h.rh
+        cases.append(("nfw_mild", ri, M, 0.01 * sc * (ri / h.rh) ** 2))
+        cases.append(("nfw_strong", ri, M, 0.6 * sc * (ri / h.rh) ** 2))
+        cases.append(("nfw_catastrophic", ri, M, 50. * sc * (ri / h.rh) ** 2))
+        cases.append(("nfw_const_eps", ri, M, np.full_like(ri, 0.02 * sc)))
+        # inner spline undershoot: a few negative Menc knots at small r
+        M_us = M.copy()
+        M_us[:5] = -1e-3 * M.max() * np.array([5., 4., 3., 2., 1.])
+        cases.append(("undershoot_inner", ri, M_us, 0.3 * sc * (ri / h.rh) ** 2))
+        # cored profile: constant-density core -> non-monotone perturb
+        ric, Mc, hc = _nfw_grid(kind="cored")
+        scc = cfg.G * hc.M(hc.rh) / hc.rh
+        cases.append(("cored_strong", ric, Mc, 0.5 * scc * (ric / hc.rh) ** 2))
+        cases.append(("cored_inner_bump", ric, Mc, 0.15 * scc * (ric / hc.rh)))
+        # low-density outer tail with ringing (kept a valid enclosed mass)
+        rng = np.random.default_rng(0)
+        M_ring = M.copy()
+        tail = ri > 0.5 * h.rh
+        M_ring[tail] *= (1. + 1e-4 * rng.standard_normal(tail.sum())).cumprod()
+        M_ring = np.maximum.accumulate(M_ring)
+        cases.append(("ringing_tail", ri, M_ring, 0.4 * sc * (ri / h.rh) ** 2))
+        # fine grid: A cumprod over many shells
+        rif, Mf, hf = _nfw_grid(npts=2000, rlo=1e-4)
+        scf = cfg.G * hf.M(hf.rh) / hf.rh
+        cases.append(("fine_grid", rif, Mf, 0.5 * scf * (rif / hf.rh) ** 2))
+        return cases
+
+    def test_matches_serial(self):
+        for name, ri, Menc, eps in self._cases():
+            rb_v, Mb_v = _expand_shells(ri, Menc, eps, tally=(tv := {}))
+            rb_s, Mb_s, ts = _expand_shells_serial(ri, Menc, eps)
+            assert len(rb_v) == len(rb_s), f"{name}: bound-shell count differs"
+            np.testing.assert_allclose(rb_v, rb_s, rtol=1e-9,
+                                       err_msg=f"{name}: r_bound diverges")
+            np.testing.assert_allclose(Mb_v, Mb_s, rtol=1e-9,
+                                       err_msg=f"{name}: M_bound diverges")
+            assert tv['shells'] == ts['shells'], f"{name}: clamp count differs"
+            if ts['shells']:
+                assert abs(tv['worst_pct'] - ts['worst_pct']) <= \
+                    1e-6 * abs(ts['worst_pct']), f"{name}: worst_pct differs"
+                assert tv['worst_r'] == ts['worst_r'], f"{name}: worst_r differs"
+
+    def test_unbound_is_contiguous_outer_block(self):
+        """The clamp guarantees bound-outer => bound-inner, so the surviving
+        bound shells are the innermost ones: M(<r) is monotone with no gap."""
+        for name, ri, Menc, eps in self._cases():
+            rb, Mb = _expand_shells(ri, Menc, eps)
+            assert np.all(np.diff(rb) > 0.), f"{name}: r_bound not increasing"
+            assert np.all(np.diff(Mb) > 0.), f"{name}: M_bound not increasing"
+
+    def test_mass_conserved_when_all_bound(self):
+        """Mild heating unbinds nothing, so total mass is preserved (shell map
+        conserves M(<r) per shell)."""
+        ri, M, h = _nfw_grid()
+        eps = 1e-4 * cfg.G * h.M(h.rh) / h.rh * (ri / h.rh) ** 2
+        _, Mb = _expand_shells(ri, M, eps)
+        assert abs(Mb[-1] - M[-1]) < 1e-9 * M[-1]
+
+    def test_stronger_heating_unbinds_more(self):
+        ri, M, h = _nfw_grid()
+        sc = cfg.G * h.M(h.rh) / h.rh
+        _, Mb_lo = _expand_shells(ri, M, 0.2 * sc * (ri / h.rh) ** 2)
+        _, Mb_hi = _expand_shells(ri, M, 0.8 * sc * (ri / h.rh) ** 2)
+        assert Mb_hi[-1] < Mb_lo[-1] <= M[-1] * (1. + 1e-9)
 
 
 # ---------------------------------------------------------------------------

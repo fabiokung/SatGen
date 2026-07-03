@@ -151,6 +151,66 @@ def test_revirial_clamp_telemetry_populated(du24_setup):
     assert np.all(res.clamp_worst_r[fired] > 0.)
 
 
+def test_revirial_expand_clamp_discriminable_from_revir(du24_setup):
+    """The per-step _ExpandedProfile clamp telemetry (expand_clamp*) is recorded
+    separately from the apocentre reshape telemetry (clamp*), so the two clamp
+    regimes can be told apart: the reshape telemetry is finite only on the
+    (few) re-virialization steps, the expansion telemetry on (almost) every step.
+    On the cuspy NFW subhalo neither actually clamps -- perturb rises monotonically
+    outward, so heating only unbinds a contiguous outer block."""
+    res = _run(du24_setup, 'hard', engine='revirial')
+    for arr in (res.expand_clamp, res.expand_clamp_worst, res.expand_clamp_worst_r):
+        assert arr is not None and arr.shape == res.m.shape
+    revir = np.isfinite(res.clamp)              # apocentre reshape steps
+    expand = np.isfinite(res.expand_clamp)      # per-step expansion steps
+    # the expansion runs far more often than the reshape (per step vs per orbit)
+    assert expand.sum() > 5 * revir.sum()
+    assert np.all(res.expand_clamp[expand] >= 0.)
+    # cuspy subhalo: no shell crossing anywhere, only outer-block unbinding
+    assert np.nansum(res.clamp) == 0
+    assert np.nansum(res.expand_clamp) == 0
+
+
+def test_expanded_profile_raises_when_heating_unbinds():
+    """_ExpandedProfile raises HeatingUnbindsError when the accumulated heating
+    leaves <=2 bound shells, mirroring heat_profile's catastrophic-heating guard."""
+    from subhalo_functions import HeatingUnbindsError
+    h = NFW(1e9, 11.68)
+    ri = np.logspace(np.log10(1e-3 * h.rh), np.log10(h.rh), 200)
+    prof = NumericProfile(ri, np.asarray(h.M(ri), float))
+    r_ref = prof.ri
+    M_ref = np.asarray(prof.M(r_ref), float)
+    sig2 = np.zeros_like(r_ref)
+    sc._ExpandedProfile(r_ref, M_ref, sig2, Q=1e-20, c2=0.)   # gentle: intact
+    Q_huge = 1e10 * cfg.G * prof.Mh / prof.rh                 # unbinds the halo
+    with pytest.raises(HeatingUnbindsError):
+        sc._ExpandedProfile(r_ref, M_ref, sig2, Q=Q_huge, c2=0.)
+
+
+def test_revirial_heating_unbinds_disrupts_gracefully(du24_setup):
+    """Strong heating on a cored subhalo unbinds the analytic profile per step
+    (_ExpandedProfile raises HeatingUnbindsError); evolve_heating_revirial catches
+    it, drives the bound mass to the floor, and terminates without a crash, with
+    the telemetry arrays still aligned to the mass track. Cored because a cusp
+    keeps perturb -> 0 in the core, so only the outer block ever unbinds."""
+    hNFW, rvals, _M_sub, xv0_20 = du24_setup
+    sat = NFW(1.0e9, 26.32 / 1.279)
+    rc = 0.5 * sat.rh                       # flatten the inner cusp into a core
+    rho0 = sat.M(rc) / (4. / 3. * np.pi * rc ** 3)
+    M_core = np.where(rvals < rc, 4. / 3. * np.pi * rvals ** 3 * rho0,
+                      np.asarray(sat.M(rvals), float))
+    sub = NumericProfile(rvals, M_core)
+    res = sc.evolve_heating_revirial(
+        hNFW, sub, xv0_20, tmax=12., step_frac=0.02, epsh=6., gamma=0.,
+        beta_h=1., alpha=1., t_dyn_mode='sub_lt', truncation='hard',
+        lt_choice='Tormen98')
+    m = res.m[np.isfinite(res.m)]
+    assert len(m) > 0
+    assert m[-1] <= cfg.Mres * (1. + 1e-9)          # disrupted to the floor
+    for arr in (res.clamp, res.expand_clamp, res.expand_clamp_worst_r):
+        assert arr.shape == res.m.shape             # telemetry stays aligned
+
+
 def _final_mass_ratio(setup, nstep, alpha=3.93):
     hNFW, rvals, M_sub, xv0_20 = setup
     res = sc.evolve_heating(

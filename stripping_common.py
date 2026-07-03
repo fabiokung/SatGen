@@ -14,9 +14,9 @@ import cosmo as co
 import evolve as ev
 from orbit import orbit
 from profiles import NFW, Dekel, Green, Vcirc, tdyn
-from subhalo_functions import (NumericProfile, _log_pchip, heat_profile,
-                               tidalTensor, truncate_kazantzidis,
-                               truncate_powerlaw)
+from subhalo_functions import (NumericProfile, HeatingUnbindsError, _expand_shells,
+                               _log_pchip, heat_profile, tidalTensor,
+                               truncate_kazantzidis, truncate_powerlaw)
 
 
 class OverstripError(ValueError):
@@ -79,14 +79,22 @@ class EvolutionResult:
     rmax0: float = 0.
     vmax0: float = 0.
     label: str = ''
-    # per-step shell-crossing clamp activity, aligned to t/m/lt (NaN on skipped
-    # steps; for the revirial engine only the apocentre re-virialization steps carry
-    # values). clamp is the shells clamped that step, clamp_worst the largest
-    # overshoot the clamp removed (%), clamp_worst_r its radius (kpc). None for
-    # non-heating evolvers. Bin by m (bound fraction), t, or r for clamp analysis.
+    # shell-crossing clamp activity from the re-virialization heat_profile
+    # reshape, aligned to t/m/lt: shells clamped (clamp), largest overshoot the
+    # clamp removed in % (clamp_worst), its radius in kpc (clamp_worst_r). For the
+    # revirial engine only the apocentre steps carry values (NaN elsewhere); for
+    # the uniform engine every heating step does. None for non-heating evolvers.
     clamp: Optional[np.ndarray] = None
     clamp_worst: Optional[np.ndarray] = None
     clamp_worst_r: Optional[np.ndarray] = None
+    # revirial engine only: the same telemetry from the per-step _ExpandedProfile
+    # expansion that locates l_t (a crude approximation -- heating alone, no tail,
+    # thrown away each step), kept separate from the careful apocentre reshape
+    # above so the two clamp regimes can be told apart. NaN on disruption/parked
+    # steps where no expansion is built.
+    expand_clamp: Optional[np.ndarray] = None
+    expand_clamp_worst: Optional[np.ndarray] = None
+    expand_clamp_worst_r: Optional[np.ndarray] = None
 
 
 def make_orbit(host, R0=1., z0=0., phi0=0., VR0=0., Vz0=0., eta=1.):
@@ -772,35 +780,33 @@ def evolve_heating(host, numProfile0, xv0, tmax=10., Nstep=10000,
 
 
 class _ExpandedProfile:
-    """Reference profile expanded analytically by the accumulated heating scalar
-    Q (Pullen+14 shell map, eq. 18, with the Du+24 2nd-order term), exposing only
-    M(r) and rh -- all ev.ltidal needs from the subhalo. No PCHIP/tail rebuild;
-    the full heat_profile + reshape happens once per apocentre.
+    """Reference profile expanded by the accumulated heating scalar Q (Du+24
+    eq.36 shell map, 1st + 2nd order), exposing only M(r) and rh -- all ev.ltidal
+    needs from the subhalo. No PCHIP/tail rebuild; the full reshape happens once
+    per apocentre.
 
-    Shell energy Delta_eps(r) = Q r^2 + c2 sqrt(Q r^2 sigma_r^2(r)); the shell at
-    reference radius r moves to r/(1 - perturb), perturb = 2 Delta_eps r / (G M),
-    conserving M(<r) per shell -- so {r_cur, M_ref} is the expanded M(<r) curve.
+    Uses the same _expand_shells map as the apocentre heat_profile, so the
+    per-step tidal radius sees this-orbit's partial expansion consistently: outer
+    shells whose injected energy exceeds their binding energy are unbound (a
+    contiguous outer block), not retained, and crossings are clamped identically.
+    Shell energy Delta_eps(r) = Q r^2 + c2 sqrt(Q r^2 sigma_r^2(r)).
+
+    Raises HeatingUnbindsError when the expansion leaves <=2 bound shells: the
+    accumulated heating disrupts the profile, so there is no tidal radius to find.
     """
     __slots__ = ('rh', '_r', '_M', '_mint')
 
-    def __init__(self, r_ref, M_ref, sig2_ref, Q, c2):
+    def __init__(self, r_ref, M_ref, sig2_ref, Q, c2, tally=None):
         de = Q * r_ref**2
         if c2:
             de = de + c2 * np.sqrt(np.maximum(de * sig2_ref, 0.))
-        perturb = np.zeros_like(r_ref)
-        pos = M_ref > 0.
-        # cap perturb < 1 (shell stays bound/finite); the monotone-accumulate
-        # below is the cheap shell-crossing guard (l_t sits in the low-perturb
-        # core, so this rarely binds there -- the full clamp is in heat_profile).
-        perturb[pos] = np.clip(2. * de[pos] * r_ref[pos] / (cfg.G * M_ref[pos]),
-                               None, 0.95)
-        x = np.maximum.accumulate(r_ref / (1. - perturb))
-        keep = np.ones(len(x), bool)
-        keep[1:] = np.diff(x) > 0.
-        self._r, self._M = x[keep], M_ref[keep]
-        self.rh = float(self._r[-1])
-        self._mint = (_log_pchip(self._r, self._M)
-                      or PchipInterpolator(self._r, self._M, extrapolate=False))
+        r_bound, M_bound = _expand_shells(r_ref, M_ref, de, tally=tally)
+        if len(r_bound) <= 2:
+            raise HeatingUnbindsError("heating unbinds the analytic profile")
+        self._r, self._M = r_bound, M_bound
+        self.rh = float(r_bound[-1])
+        self._mint = (_log_pchip(r_bound, M_bound)
+                      or PchipInterpolator(r_bound, M_bound, extrapolate=False))
 
     def M(self, r):
         return self._mint(r)
@@ -925,7 +931,8 @@ def evolve_heating_revirial(host, numProfile0, xv0, tmax=10.,
 
     t_list, r_list, m_list = [], [], []
     vmax_list, rmax_list, lt_list = [], [], []
-    clamp_list, cw_list, cwr_list = [], [], []   # shells, worst %, worst r (NaN off revir)
+    clamp_list, cw_list, cwr_list = [], [], []   # revir reshape: shells, worst %, worst r
+    ec_list, ecw_list, ecwr_list = [], [], []    # per-step _ExpandedProfile clamp
     cur_vmax, cur_rmax = ref.Vmax, ref.rmax
     t_last_revir = 0.
     dt_prev = np.inf
@@ -939,10 +946,16 @@ def evolve_heating_revirial(host, numProfile0, xv0, tmax=10.,
 
         t_orb = tdyn(potential, r)
         dt_min = max(dt_abs, floor_orbit_frac * t_orb)
+        # disrupted: the accumulated (or trial) heating unbinds the analytic
+        # profile -> no tidal radius; drive m to the floor and terminate.
+        disrupted = False
         if r > cfg.Rres and m > cfg.Mres:
-            exp_pred = _ExpandedProfile(r_ref, M_ref, sig2_ref, Q, c2)
-            T_strip_pred, _, _ = _t_strip(exp_pred, potential, o.xv,
-                                          lt_choice, t_dyn_mode, t_orb)
+            try:
+                exp_pred = _ExpandedProfile(r_ref, M_ref, sig2_ref, Q, c2)
+                T_strip_pred, _, _ = _t_strip(exp_pred, potential, o.xv,
+                                              lt_choice, t_dyn_mode, t_orb)
+            except HeatingUnbindsError:
+                disrupted, T_strip_pred = True, np.inf
         else:
             T_strip_pred = np.inf
         dt = min(step_frac * t_orb, step_frac * T_strip_pred / alpha,
@@ -953,6 +966,7 @@ def evolve_heating_revirial(host, numProfile0, xv0, tmax=10.,
         # accumulators unchanged rather than referencing unset trial vars
         Q_trial, tt_int_trial, tidalHR = Q, tt_int, hr_prev
         strip_number, lt_step, M_at_lt = 0., lt, 0.
+        expand_tally = {}
         t0, xv0_step = o.t, o.xv.copy()
         while True:
             o.t, o.xv = t0, xv0_step.copy()
@@ -971,13 +985,24 @@ def evolve_heating_revirial(host, numProfile0, xv0, tmax=10.,
             dQ = 0.5 * ((tidalHR if hr_prev is None else hr_prev) + tidalHR) * dt
             Q_trial = max(Q + dQ, 0.)
 
-            if m <= cfg.Mres:
+            if m <= cfg.Mres or disrupted:
                 strip_number, lt_step, M_at_lt, T_strip = 0., cfg.Rres, 0., np.inf
             else:
-                exp = _ExpandedProfile(r_ref, M_ref, sig2_ref, Q_trial, c2)
-                T_strip, lt_step, M_at_lt = _t_strip(
-                    exp, potential, xv, lt_choice, t_dyn_mode, t_orb)
-                strip_number = alpha * dt / T_strip
+                try:
+                    exp = _ExpandedProfile(r_ref, M_ref, sig2_ref, Q_trial, c2,
+                                           tally=(expand_tally := {}))
+                except HeatingUnbindsError:
+                    # the trial heating unbinds the profile; a smaller step lowers
+                    # Q_trial and may resolve it -- else the subhalo is disrupted.
+                    if dt > dt_min:
+                        dt = max(0.5 * dt, dt_min)
+                        continue
+                    disrupted = True
+                    strip_number, lt_step, M_at_lt, T_strip = 0., cfg.Rres, 0., np.inf
+                else:
+                    T_strip, lt_step, M_at_lt = _t_strip(
+                        exp, potential, xv, lt_choice, t_dyn_mode, t_orb)
+                    strip_number = alpha * dt / T_strip
             if strip_number > strip_number_max and dt > dt_min:
                 dt = max(0.5 * dt, dt_min)
                 continue
@@ -991,6 +1016,15 @@ def evolve_heating_revirial(host, numProfile0, xv0, tmax=10.,
         r = r_new
         Q, tt_int, hr_prev = Q_trial, tt_int_trial, tidalHR
 
+        if disrupted:
+            m = cfg.Mres
+            t_list.append(t); r_list.append(r_new); m_list.append(m)
+            vmax_list.append(cur_vmax); rmax_list.append(cur_rmax); lt_list.append(lt)
+            clamp_list.append(np.nan); cw_list.append(np.nan); cwr_list.append(np.nan)
+            ec_list.append(expand_tally.get('shells', np.nan))
+            ecw_list.append(expand_tally.get('worst_pct', np.nan))
+            ecwr_list.append(expand_tally.get('worst_r', np.nan))
+            break
         if r_new <= cfg.Rres:
             dt_prev = dt
             continue
@@ -1001,6 +1035,7 @@ def evolve_heating_revirial(host, numProfile0, xv0, tmax=10.,
             vmax_list.append(cur_vmax); rmax_list.append(cur_rmax)
             lt_list.append(lt)
             clamp_list.append(np.nan); cw_list.append(np.nan); cwr_list.append(np.nan)
+            ec_list.append(np.nan); ecw_list.append(np.nan); ecwr_list.append(np.nan)
             break
 
         if m > cfg.Mres:
@@ -1038,6 +1073,9 @@ def evolve_heating_revirial(host, numProfile0, xv0, tmax=10.,
         vmax_list.append(cur_vmax); rmax_list.append(cur_rmax); lt_list.append(lt)
         clamp_list.append(step_clamp[0]); cw_list.append(step_clamp[1])
         cwr_list.append(step_clamp[2])
+        ec_list.append(expand_tally.get('shells', np.nan))
+        ecw_list.append(expand_tally.get('worst_pct', np.nan))
+        ecwr_list.append(expand_tally.get('worst_r', np.nan))
         r_p2, r_p1 = r_p1, r_new
         dt_prev = dt
         nstep += 1
@@ -1066,6 +1104,8 @@ def evolve_heating_revirial(host, numProfile0, xv0, tmax=10.,
         rmax0=rmax0, vmax0=vmax0, label=label,
         clamp=np.asarray(clamp_list), clamp_worst=np.asarray(cw_list),
         clamp_worst_r=np.asarray(cwr_list),
+        expand_clamp=np.asarray(ec_list), expand_clamp_worst=np.asarray(ecw_list),
+        expand_clamp_worst_r=np.asarray(ecwr_list),
     )
 
 

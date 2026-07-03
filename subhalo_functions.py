@@ -369,6 +369,117 @@ class NumericProfile(object):
         return np.sqrt(integ/self.rho(r))
 
 
+def _clamp_monotone(ri, Menc, perturb, tally=None):
+    """Cap `perturb` so the eq.(36) final radii rf = ri / (1 - perturb) stay
+    ordered outward -- no shell crossing.
+
+    Shell i (radius ri, enclosed mass Menc) may not overtake its outer neighbour
+    i+1. Writing u = 1 - perturb (so rf = ri / u, and u <= 0 marks an unbound
+    shell), the no-crossing constraint rf[i] <= rf[i+1], tightened by a factor
+    (Menc_i / Menc_{i+1})^(-1/3) that keeps adjacent shells from crowding as they
+    expand, is the outer->inner recurrence
+
+        u[i] = max( u_raw[i],  a[i] * u[i+1] ),
+        a[i] = (ri_i / ri_{i+1}) * (Menc_i / Menc_{i+1})^(-1/3).
+
+    Because a[i] depends only on the (frozen) reference grid, not on u, the
+    recurrence has a closed form,
+
+        u[i] = max_{j >= i} (A[j] / A[i]) * u_raw[j],   A[i] = prod_{k<i} a[k],
+
+    i.e. a cumulative product A and a reverse running maximum -- the vectorized
+    equivalent of the serial loop, verified against a serial reference in the
+    tests. a[i] is set to 1 across any Menc <= 0 gap (inner spline undershoot);
+    this matches the serial loop's skip when the gaps are absent or contiguous at
+    the inner edge -- what every caller feeds, since Menc is a strictly-positive
+    log-PCHIP or an inner-only linear-fallback undershoot. A Menc <= 0 shell
+    sandwiched between positive ones would instead let the running max propagate
+    across it (the callers never produce that).
+
+    Returns the clamped `perturb`. If `tally` is given it is filled with the
+    clamp telemetry: 'shells' (count clamped), 'worst_pct' (largest overshoot
+    removed, %), 'worst_r' (its radius, kpc; NaN if none).
+    """
+    u_raw = 1. - perturb
+    link = (Menc[:-1] > 0.) & (Menc[1:] > 0.)
+    ratio = np.where(link, Menc[:-1] / np.where(link, Menc[1:], 1.), 1.)
+    a = np.where(link, (ri[:-1] / ri[1:]) * ratio**(-1. / 3.), 1.)
+    # A stays O(1) on a log grid (a[i] ~ 1); no under/overflow over ~10^3 shells.
+    A = np.concatenate([[1.], np.cumprod(a)])
+    w = A * u_raw
+    inc = np.maximum.accumulate(w[::-1])[::-1]   # inc[i] = max_{j>=i} w[j]
+    u = inc / A
+
+    if tally is not None:
+        # shell i is clamped iff an outer shell forces u[i] above u_raw[i], i.e.
+        # max_{j>i} w[j] > w[i]. Comparing in w-space (not u) avoids the
+        # A-division roundoff. Count only clamps that remove a non-negligible
+        # overshoot: shells sitting at the no-cross boundary to rounding
+        # precision (excess ~ 1e-12) are not real crossings, and whether they
+        # register is order-dependent -- the threshold makes the count meaningful.
+        outer = np.concatenate([inc[1:], [-np.inf]])
+        limit = 1. - u
+        with np.errstate(divide='ignore', invalid='ignore'):
+            excess = np.where(limit > 0., (1. - u_raw) / limit - 1., np.inf)
+        clamped = (outer > w) & (excess > 1e-10)
+        excess = np.where(clamped, excess, 0.)
+        n = int(clamped.sum())
+        tally['shells'] = n
+        tally['worst_pct'] = float(excess.max() * 100.) if n else 0.
+        tally['worst_r'] = float(ri[int(np.argmax(excess))]) if n else np.nan
+
+    return 1. - u
+
+
+def _expand_shells(ri, Menc, eps_vals, tally=None):
+    """Du+24 eq.(36) mass-shell expansion with the no-crossing clamp.
+
+    Each shell at reference radius ri, enclosing (conserved) mass Menc, is heated
+    by specific energy eps_vals and moves to its new equilibrium radius:
+
+        Delta_eps = G Menc / 2 * (1/ri - 1/rf)   =>   rf = ri / (1 - perturb),
+        perturb   = 2 Delta_eps ri / (G Menc).                            (eq.36)
+
+    perturb is the ratio of injected to binding energy. perturb >= 1 gives a
+    non-negative final specific energy Ef = G Menc / ri * (perturb - 1) >= 0 and
+    unbinds the shell (rf -> inf); such shells are dropped. The clamp keeps rf
+    ordered, so the unbound set is always a contiguous OUTER block -- an inner
+    shell can only unbind once every shell outside it has.
+
+    Returns (r_bound, M_bound): the sorted final radii of the surviving bound
+    shells and their cumulative enclosed mass. `tally`, if given, receives the
+    clamp telemetry (see _clamp_monotone).
+    """
+    ri = np.asarray(ri, float)
+    Menc = np.asarray(Menc, float)
+    eps_vals = np.broadcast_to(np.asarray(eps_vals, float), ri.shape)
+
+    perturb = np.zeros_like(ri)
+    pos = Menc > 0.
+    perturb[pos] = 2. * eps_vals[pos] * ri[pos] / (cfg.G * Menc[pos])
+    perturb = _clamp_monotone(ri, Menc, perturb, tally)
+
+    Ef = cfg.G * Menc / ri * (perturb - 1.)   # eq.(36) final specific energy
+    Mshell = np.empty_like(Menc)
+    Mshell[0] = Menc[0]
+    Mshell[1:] = np.diff(Menc)
+    bound = (Ef < 0.) & (Mshell > 0.)
+
+    with np.errstate(divide='ignore', invalid='ignore'):
+        rf = ri / (1. - perturb)   # inf/negative for unbound shells; dropped below
+    # sort by final radius: a no-op once the clamp has ordered rf, except across
+    # a Menc <= 0 gap where the clamp is skipped -- the sort recovers a
+    # self-consistent M(<r) there. cumsum in final-radius order, not Menc[bound],
+    # since those are cumulative masses at the *original* positions.
+    order = np.argsort(rf[bound])
+    r_bound = rf[bound][order]
+    M_bound = np.cumsum(Mshell[bound][order])
+    # collapse exact-duplicate radii, keeping the last (full cumulative mass)
+    keep = np.ones(len(r_bound), bool)
+    keep[:-1] = r_bound[:-1] != r_bound[1:]
+    return r_bound[keep], M_bound[keep]
+
+
 def heat_profile(profile: NumericProfile, eps, count_per_decade=100, tally=None):
     """
     Apply monotonic heating algorithm to a NumericProfile.
@@ -393,138 +504,29 @@ def heat_profile(profile: NumericProfile, eps, count_per_decade=100, tally=None)
         Heated profile
     """
 
-    G = cfg.G
-
-    rvir = profile.rh
-
-    # --------------------------------------------------
-    # Radial grid
-    # --------------------------------------------------
-    rmin = min(profile.ri)
-    rmax = 10.0 * rvir
-
-    decades = np.log10(rmax / rmin)
-    count_r = int(decades * count_per_decade + 1)
-
-    ri = np.logspace(np.log10(rmin), np.log10(rmax), count_r)
-
-    Menc = profile.M(ri)
-
-    # clamp telemetry (warning below)
-    clamp_count = 0
-    clamp_worst_excess = 0.0
-    clamp_worst_r = np.nan
-
-    # --------------------------------------------------
-    # Compute perturbation outer → inner
-    # --------------------------------------------------
-    # eps does spline lookups whose Python overhead is per-call, so evaluate it
-    # once on the whole grid. broadcast_to covers eps closures that return a
+    # Radial grid: the reference inner edge out to 10 rvir, so shells that
+    # expand outward stay on-grid. eps does per-call spline lookups, so evaluate
+    # it once on the whole grid; broadcast_to covers eps closures that return a
     # scalar for array input (e.g. a constant eps(r)=0).
+    rmin = min(profile.ri)
+    rmax = 10.0 * profile.rh
+    count_r = int(np.log10(rmax / rmin) * count_per_decade + 1)
+    ri = np.logspace(np.log10(rmin), np.log10(rmax), count_r)
+    Menc = np.asarray(profile.M(ri), dtype=float)
     eps_vals = np.broadcast_to(np.asarray(eps(ri), dtype=float), ri.shape)
-    # m <= 0 shells (spline undershoot at small r) carry no perturbation;
-    # masking the division keeps it off non-positive Menc.
-    perturb = np.zeros_like(ri)
-    pos = Menc > 0.
-    perturb[pos] = 2.0 * eps_vals[pos] * ri[pos] / (G * Menc[pos])
 
-    # Local shell-crossing clamp. r_f(r_i) <= r_f(r_{i+1}) gives a per-shell
-    # upper bound on xi (with an extra (M_i/M_{i+1})^(-1/3) factor that
-    # tightens the constraint to keep adjacent shells from crowding). The cap
-    # on shell i is built from the already-capped shell i+1 and branches on a
-    # min, so this is an inherently serial outer->inner scan. Skip when either
-    # Menc is non-positive (spline undershoot at small r); the
-    # (M_i/M_{i+1})^(-1/3) factor is undefined there, leaving perturb[i]
-    # unclamped.
-    # TODO(fabio): add the full Du+24 §IV.C shell-crossing handling. The clamp
-    # here is a local, shell-by-shell limit. Du+24 eqs. 41-44 do more: find
-    # the single radius r_crossing where dxi/dr = 0 (eq. 44) and xi is
-    # continuous (eq. 43), then for r < r_crossing replace eps(r) with
-    # xi(r_crossing) * G*M(r) / (2r) (eq. 42), making eps proportional to the
-    # gravitational potential inward of r_crossing. The clamp approximates
-    # this globally-flattened xi(r) with a chain of local inequalities; the
-    # two coincide for smooth-enough profiles but not in general (see Du+24
-    # Fig. 7 for the cored gamma=0 case).
-    for i in reversed(range(count_r - 1)):
-        if Menc[i] > 0. and Menc[i + 1] > 0.:
-            limit = (
-                1.0
-                - ri[i] / ri[i + 1]
-                * (Menc[i] / Menc[i + 1]) ** (-1.0 / 3.0)
-                * (1.0 - perturb[i + 1])
-            )
-            if perturb[i] > limit:
-                clamp_count += 1
-                excess = (perturb[i] / limit) - 1.0 if limit > 0 else np.inf
-                if excess > clamp_worst_excess:
-                    clamp_worst_excess = excess
-                    clamp_worst_r = ri[i]
-                perturb[i] = limit
-
-    if clamp_count > 0:
-        warnings.warn(
-            f"heat_profile clamped {clamp_count} shell(s) to the local "
-            f"monotonic limit; worst overshoot "
-            f"{clamp_worst_excess * 100.0:.2f}% at r={clamp_worst_r:.3e} kpc. "
-            f"Full Du+24 §IV.C r_crossing handling not yet implemented "
-            f"(TODO in heat_profile).",
-            ShellClampWarning,
-            stacklevel=2,
-        )
-
-    if tally is not None:
-        tally['shells'] = clamp_count
-        tally['worst_pct'] = clamp_worst_excess * 100.
-        tally['worst_r'] = clamp_worst_r
-
-    # --------------------------------------------------
-    # Final energies
-    # --------------------------------------------------
-    Ef = G * Menc / ri * (-1.0 + perturb)
-
-    # --------------------------------------------------
-    # Shell masses
-    # --------------------------------------------------
-    Mshell = np.zeros_like(Menc)
-    Mshell[0] = Menc[0]
-    Mshell[1:] = np.diff(Menc)
-
-    # --------------------------------------------------
-    # Bound shells
-    # --------------------------------------------------
-    bound = (Ef < 0) & (Mshell > 0)
-
-    rf = np.full_like(ri, np.inf)
-    rf[bound] = -G * Menc[bound] / Ef[bound]
-
-    # --------------------------------------------------
-    # If halo destroyed
-    # --------------------------------------------------
-    if np.count_nonzero(bound) <= 2:
+    _tally = {}
+    r_bound, M_bound = _expand_shells(ri, Menc, eps_vals, tally=_tally)
+    if len(r_bound) <= 2:
         raise HeatingUnbindsError("Heating unbinds the halo")
-
-    r_bound = rf[bound]
-    Mshell_bound = Mshell[bound]
-
-    # M(<r) at the post-expansion radii. The shell-crossing guard above
-    # rules out crossings on the bulk grid (Menc strictly positive), so
-    # this sort is a no-op in the common case. The guard is bypassed when
-    # Menc[i+1] <= 0 (spline undershoot at very small r), where the
-    # (Menc[i]/Menc[i+1])^(-1/3) factor is undefined; sort+cumsum recovers
-    # a self-consistent M(<r) in that fallback. Menc[bound][order] would
-    # be wrong here -- those values are cumulative masses at the *original*
-    # shell positions, not at the post-sort radii.
-    order = np.argsort(r_bound)
-    r_bound = r_bound[order]
-    M_bound = np.cumsum(Mshell_bound[order])
-
-    # collapse exact duplicates in r — keep the last index of each run so
-    # M_bound[k] retains the full cumulative mass at r_bound[k]. np.unique
-    # would return the first index and undercount when duplicates exist.
-    keep = np.ones(len(r_bound), dtype=bool)
-    keep[:-1] = r_bound[:-1] != r_bound[1:]
-    r_bound = r_bound[keep]
-    M_bound = M_bound[keep]
+    if _tally['shells'] > 0:
+        warnings.warn(
+            f"heat_profile clamped {_tally['shells']} shell(s) to the "
+            f"monotonic no-crossing limit; worst overshoot "
+            f"{_tally['worst_pct']:.2f}% at r={_tally['worst_r']:.3e} kpc.",
+            ShellClampWarning, stacklevel=2)
+    if tally is not None:
+        tally.update(_tally)
 
     # Rebin to a uniform log-spaced grid via log-log PCHIP. Shell expansion
     # produces irregular knot spacing in r_bound (large gaps near the outer
