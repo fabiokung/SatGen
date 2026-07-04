@@ -80,11 +80,13 @@ class EvolutionResult:
     vmax0: float = 0.
     label: str = ''
     # shell-crossing clamp activity from the re-virialization heat_profile
-    # reshape, aligned to t/m/lt: shells clamped (clamp), largest overshoot the
+    # reshape, aligned to t/m/lt: shells clamped (clamp), shells heated this step
+    # (clamp_total, the denominator for a clamp fraction), largest overshoot the
     # clamp removed in % (clamp_worst), its radius in kpc (clamp_worst_r). For the
     # revirial engine only the apocentre steps carry values (NaN elsewhere); for
     # the uniform engine every heating step does. None for non-heating evolvers.
     clamp: Optional[np.ndarray] = None
+    clamp_total: Optional[np.ndarray] = None
     clamp_worst: Optional[np.ndarray] = None
     clamp_worst_r: Optional[np.ndarray] = None
     # revirial engine only: the same telemetry from the per-step _ExpandedProfile
@@ -93,6 +95,7 @@ class EvolutionResult:
     # above so the two clamp regimes can be told apart. NaN on disruption/parked
     # steps where no expansion is built.
     expand_clamp: Optional[np.ndarray] = None
+    expand_clamp_total: Optional[np.ndarray] = None
     expand_clamp_worst: Optional[np.ndarray] = None
     expand_clamp_worst_r: Optional[np.ndarray] = None
 
@@ -671,6 +674,7 @@ def evolve_heating(host, numProfile0, xv0, tmax=10., Nstep=10000,
 
     heater = _HeatingStepper(numProfile, second_order, f2=f2, chi_v=chi_v)
     clamp_arr = np.full(Nstep, np.nan)
+    clamp_total_arr = np.full(Nstep, np.nan)
     clamp_worst_arr = np.full(Nstep, np.nan)
 
     for i, t in enumerate(timesteps):
@@ -689,6 +693,7 @@ def evolve_heating(host, numProfile0, xv0, tmax=10., Nstep=10000,
             rmax_arr[i] = numProfile.rmax
             lt_arr[i] = cfg.Rres
             clamp_arr[i] = 0.
+            clamp_total_arr[i] = 0.
             clamp_worst_arr[i] = 0.
             break
         o.integrate(t, potential, m if dynamical_friction else None)
@@ -705,6 +710,7 @@ def evolve_heating(host, numProfile0, xv0, tmax=10., Nstep=10000,
             rmax_arr[i] = numProfile.rmax
             lt_arr[i] = lt
             clamp_arr[i] = 0.
+            clamp_total_arr[i] = 0.
             clamp_worst_arr[i] = 0.
             break
         V = np.sqrt(xv[3]**2 + xv[4]**2 + xv[5]**2)
@@ -736,11 +742,13 @@ def evolve_heating(host, numProfile0, xv0, tmax=10., Nstep=10000,
         if m <= cfg.Mres:
             m, lt = cfg.Mres, cfg.Rres
             clamp_arr[i] = 0.
+            clamp_total_arr[i] = 0.
             clamp_worst_arr[i] = 0.
         else:
             tally = {}
             newProfile = heat_profile(numProfile, eps_r, tally=tally)
             clamp_arr[i] = tally['shells']
+            clamp_total_arr[i] = tally['total']
             clamp_worst_arr[i] = tally['worst_pct']
             numProfile, m, lt = _strip_and_truncate(
                 numProfile, newProfile, potential, xv, t_orb, dt, alpha,
@@ -775,7 +783,7 @@ def evolve_heating(host, numProfile0, xv0, tmax=10., Nstep=10000,
         t=t_arr, r=r_arr, m=m_arr, vmax=vmax_arr, rmax=rmax_arr, lt=lt_arr,
         r_grid=r_grids, rho_snapshots=rho_snaps, M_snapshots=M_snaps,
         snapshot_steps=track_steps, rmax0=rmax0, vmax0=vmax0, label=label,
-        clamp=clamp_arr, clamp_worst=clamp_worst_arr,
+        clamp=clamp_arr, clamp_total=clamp_total_arr, clamp_worst=clamp_worst_arr,
     )
 
 
@@ -932,7 +940,9 @@ def evolve_heating_revirial(host, numProfile0, xv0, tmax=10.,
     t_list, r_list, m_list = [], [], []
     vmax_list, rmax_list, lt_list = [], [], []
     clamp_list, cw_list, cwr_list = [], [], []   # revir reshape: shells, worst %, worst r
+    ct_list = []                                 # revir reshape: shells heated (denom)
     ec_list, ecw_list, ecwr_list = [], [], []    # per-step _ExpandedProfile clamp
+    ect_list = []                                # per-step: shells heated (denom)
     cur_vmax, cur_rmax = ref.Vmax, ref.rmax
     t_last_revir = 0.
     dt_prev = np.inf
@@ -1021,9 +1031,11 @@ def evolve_heating_revirial(host, numProfile0, xv0, tmax=10.,
             t_list.append(t); r_list.append(r_new); m_list.append(m)
             vmax_list.append(cur_vmax); rmax_list.append(cur_rmax); lt_list.append(lt)
             clamp_list.append(np.nan); cw_list.append(np.nan); cwr_list.append(np.nan)
+            ct_list.append(np.nan)
             ec_list.append(expand_tally.get('shells', np.nan))
             ecw_list.append(expand_tally.get('worst_pct', np.nan))
             ecwr_list.append(expand_tally.get('worst_r', np.nan))
+            ect_list.append(expand_tally.get('total', np.nan))
             break
         if r_new <= cfg.Rres:
             dt_prev = dt
@@ -1035,7 +1047,9 @@ def evolve_heating_revirial(host, numProfile0, xv0, tmax=10.,
             vmax_list.append(cur_vmax); rmax_list.append(cur_rmax)
             lt_list.append(lt)
             clamp_list.append(np.nan); cw_list.append(np.nan); cwr_list.append(np.nan)
+            ct_list.append(np.nan)
             ec_list.append(np.nan); ecw_list.append(np.nan); ecwr_list.append(np.nan)
+            ect_list.append(np.nan)
             break
 
         if m > cfg.Mres:
@@ -1054,6 +1068,7 @@ def evolve_heating_revirial(host, numProfile0, xv0, tmax=10.,
         # near-circular / distorted orbits (no clean apocentre) still settle: apply
         # the accumulated heating in one shell expansion and reshape to bound mass m.
         step_clamp = (np.nan, np.nan, np.nan)
+        step_total = np.nan
         apo = (r_p1 is not None and r_p2 is not None
                and r_p1 > r_p2 and r_p1 > r_new)
         if (apo or t - t_last_revir >= revir_fallback * t_orb) \
@@ -1062,6 +1077,7 @@ def evolve_heating_revirial(host, numProfile0, xv0, tmax=10.,
             ref, m, tally = _revirialize(ref, Q, c2, m, lt_join,
                                          truncation, tail_n, tail_xi)
             step_clamp = (tally['shells'], tally['worst_pct'], tally['worst_r'])
+            step_total = tally['total']
             r_ref, M_ref, sig2_ref = _reference_arrays(ref, c2)
             omega_p = ref.omega_p
             cur_vmax, cur_rmax = ref.Vmax, ref.rmax
@@ -1073,9 +1089,11 @@ def evolve_heating_revirial(host, numProfile0, xv0, tmax=10.,
         vmax_list.append(cur_vmax); rmax_list.append(cur_rmax); lt_list.append(lt)
         clamp_list.append(step_clamp[0]); cw_list.append(step_clamp[1])
         cwr_list.append(step_clamp[2])
+        ct_list.append(step_total)
         ec_list.append(expand_tally.get('shells', np.nan))
         ecw_list.append(expand_tally.get('worst_pct', np.nan))
         ecwr_list.append(expand_tally.get('worst_r', np.nan))
+        ect_list.append(expand_tally.get('total', np.nan))
         r_p2, r_p1 = r_p1, r_new
         dt_prev = dt
         nstep += 1
@@ -1094,6 +1112,7 @@ def evolve_heating_revirial(host, numProfile0, xv0, tmax=10.,
         m_list[-1], vmax_list[-1], rmax_list[-1] = m, ref.Vmax, ref.rmax
         clamp_list[-1], cw_list[-1], cwr_list[-1] = (
             tally['shells'], tally['worst_pct'], tally['worst_r'])
+        ct_list[-1] = tally['total']
 
     return EvolutionResult(
         t=np.asarray(t_list), r=np.asarray(r_list), m=np.asarray(m_list),
@@ -1102,9 +1121,10 @@ def evolve_heating_revirial(host, numProfile0, xv0, tmax=10.,
         r_grid=np.zeros((1, 1)), rho_snapshots=np.zeros((1, 1)),
         M_snapshots=np.zeros((1, 1)), snapshot_steps=np.asarray([]),
         rmax0=rmax0, vmax0=vmax0, label=label,
-        clamp=np.asarray(clamp_list), clamp_worst=np.asarray(cw_list),
-        clamp_worst_r=np.asarray(cwr_list),
-        expand_clamp=np.asarray(ec_list), expand_clamp_worst=np.asarray(ecw_list),
+        clamp=np.asarray(clamp_list), clamp_total=np.asarray(ct_list),
+        clamp_worst=np.asarray(cw_list), clamp_worst_r=np.asarray(cwr_list),
+        expand_clamp=np.asarray(ec_list), expand_clamp_total=np.asarray(ect_list),
+        expand_clamp_worst=np.asarray(ecw_list),
         expand_clamp_worst_r=np.asarray(ecwr_list),
     )
 

@@ -397,7 +397,8 @@ def _clamp_monotone(ri, Menc, perturb, tally=None):
     across it (the callers never produce that).
 
     Returns the clamped `perturb`. If `tally` is given it is filled with the
-    clamp telemetry: 'shells' (count clamped), 'worst_pct' (largest overshoot
+    clamp telemetry: 'shells' (count clamped), 'total' (shells heated this call,
+    the natural denominator for a clamp fraction), 'worst_pct' (largest overshoot
     removed, %), 'worst_r' (its radius, kpc; NaN if none).
     """
     u_raw = 1. - perturb
@@ -425,6 +426,7 @@ def _clamp_monotone(ri, Menc, perturb, tally=None):
         excess = np.where(clamped, excess, 0.)
         n = int(clamped.sum())
         tally['shells'] = n
+        tally['total'] = int(len(ri))
         tally['worst_pct'] = float(excess.max() * 100.) if n else 0.
         tally['worst_r'] = float(ri[int(np.argmax(excess))]) if n else np.nan
 

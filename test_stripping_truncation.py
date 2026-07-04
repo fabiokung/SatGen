@@ -140,12 +140,16 @@ def test_revirial_clamp_telemetry_populated(du24_setup):
     (res.clamp shells, clamp_worst %, clamp_worst_r radius), aligned to the mass
     track: finite on the apocentre re-virialization steps, NaN elsewhere."""
     res = _run(du24_setup, 'kazantzidis', second_order=True, engine='revirial')
-    for arr in (res.clamp, res.clamp_worst, res.clamp_worst_r):
+    for arr in (res.clamp, res.clamp_total, res.clamp_worst, res.clamp_worst_r):
         assert arr is not None and arr.shape == res.m.shape
     revir = np.isfinite(res.clamp)
     assert revir.sum() > 0                          # some re-virializations happened
     assert np.all(res.clamp[revir] >= 0.)           # shells clamped: a count
     assert np.nansum(res.clamp) > 0                 # kazantzidis tail clamps on 1/20
+    # shells heated is the fraction denominator: >= shells clamped, and > 0 wherever
+    # a reshape ran (the profile always heats its whole grid)
+    assert np.all(res.clamp_total[revir] >= res.clamp[revir])
+    assert np.all(res.clamp_total[revir] > 0.)
     fired = revir & (res.clamp > 0)                 # steps where a shell actually clamped
     assert np.all(np.isfinite(res.clamp_worst_r[fired]))
     assert np.all(res.clamp_worst_r[fired] > 0.)
@@ -159,13 +163,15 @@ def test_revirial_expand_clamp_discriminable_from_revir(du24_setup):
     On the cuspy NFW subhalo neither actually clamps -- perturb rises monotonically
     outward, so heating only unbinds a contiguous outer block."""
     res = _run(du24_setup, 'hard', engine='revirial')
-    for arr in (res.expand_clamp, res.expand_clamp_worst, res.expand_clamp_worst_r):
+    for arr in (res.expand_clamp, res.expand_clamp_total,
+                res.expand_clamp_worst, res.expand_clamp_worst_r):
         assert arr is not None and arr.shape == res.m.shape
     revir = np.isfinite(res.clamp)              # apocentre reshape steps
     expand = np.isfinite(res.expand_clamp)      # per-step expansion steps
     # the expansion runs far more often than the reshape (per step vs per orbit)
     assert expand.sum() > 5 * revir.sum()
     assert np.all(res.expand_clamp[expand] >= 0.)
+    assert np.all(res.expand_clamp_total[expand] >= res.expand_clamp[expand])
     # cuspy subhalo: no shell crossing anywhere, only outer-block unbinding
     assert np.nansum(res.clamp) == 0
     assert np.nansum(res.expand_clamp) == 0
