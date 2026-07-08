@@ -205,6 +205,42 @@ def dash_nfw_setup(cell, nr=200):
     return host, sat, rvals, sat.M(rvals), xv0, _radial_period(host, xv0)
 
 
+# Drakos+2020 (arXiv:2003.09452) idealized setup: NFW satellite (c=10, truncated
+# at r_vir=10 r_s) in a fixed NFW host (c_host=10) with the same mean density
+# within r_vir as the satellite, so r_vir,h/r_s = 10 (Mhost/Msat)^(1/3). Only the
+# mass ratio, c=10, and the orbit enter the (scale-free) dynamics, so we anchor an
+# arbitrary satellite mass and read the host mass off the ratio. Building both NFW
+# at the same Delta (SatGen default) reproduces the equal-density condition, so
+# r_vir,h/r_s comes out at Table 1's value independent of the cosmology. Satellite
+# units for the orbit: vunit = sqrt(G Msat/r_s), and the digitized clock is t/torb.
+DRAKOS_MV_SAT, DRAKOS_C = 1.0e9, 10.0
+
+
+def drakos_nfw_setup(row, msat=DRAKOS_MV_SAT, nr=200):
+    """NFW host + subhalo + orbit for one Drakos+2020 orbit (orbits.csv row).
+
+    row: a dict from etc/drakos20_nbody/orbits.csv (uses Mhost_over_Msat,
+    ra_over_rs, va_over_vunit, torb_over_tunit). The subhalo IC is the c=10 NFW
+    sharply truncated at r_vir (as in dash_nfw_setup -- ICICLE ICs remove unbound
+    particles, close to a lowered NFW rather than an outer exponential tail). The
+    orbit is set at apocentre: r = ra, v_r = 0, v_phi = va. Returns (host, sat,
+    rvals, M_sub, xv0, T_r); T_r is the radial period [Gyr] measured in the fixed
+    host potential (matches Table 1's torb/tunit to ~1%).
+    """
+    sat = NFW(msat, DRAKOS_C)
+    rs = sat.rh / DRAKOS_C
+    host = NFW(msat * row['Mhost_over_Msat'], DRAKOS_C)
+    rvals = np.logspace(np.log10(cfg.Rres), np.log10(sat.rh), nr)
+    vunit = np.sqrt(cfg.G * msat / rs)
+    tunit = np.sqrt(rs**3 / (cfg.G * msat))
+    xv0 = np.array([row['ra_over_rs'] * rs, 0., 0.,
+                    0., row['va_over_vunit'] * vunit, 0.])
+    # size the period-search window off the paper's torb so the very wide S5
+    # orbit (torb ~ 1800 tunit) still spans two pericentres.
+    tmax = 2.5 * row['torb_over_tunit'] * tunit
+    return host, sat, rvals, sat.M(rvals), xv0, _radial_period(host, xv0, tmax=tmax)
+
+
 def _vmax_rmax(profile):
     # root of 4*pi*r^3*rho(r) = M(r); more stable than minimize_scalar on
     # the DASH table which can have a very flat Vcirc peak
