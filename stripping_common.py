@@ -1150,12 +1150,26 @@ def evolve_heating_revirial(host, numProfile0, xv0, tmax=10.,
             tally['shells'], tally['worst_pct'], tally['worst_r'])
         ct_list[-1] = tally['total']
 
+    # Final equilibrium profile sampled onto a log grid over the bound extent.
+    # The per-dt loop tracks only scalars; the revirial cadence emits one profile
+    # snapshot -- the settled remnant rho(r)/M(r) for callers that inspect the
+    # profile (the calibration likelihood ignores these fields).
+    if np.isfinite(ref.rh) and ref.rh > cfg.Rres:
+        rg = np.logspace(np.log10(cfg.Rres), np.log10(ref.rh), 100)
+        r_grid = rg[None, :]
+        rho_grid = np.asarray(ref.rho(rg), float)[None, :]
+        M_grid = np.asarray(ref.M(rg), float)[None, :]
+        snap_steps = np.asarray([nstep])
+    else:
+        r_grid = rho_grid = M_grid = np.zeros((1, 1))
+        snap_steps = np.asarray([])
+
     return EvolutionResult(
         t=np.asarray(t_list), r=np.asarray(r_list), m=np.asarray(m_list),
         vmax=np.asarray(vmax_list), rmax=np.asarray(rmax_list),
         lt=np.asarray(lt_list),
-        r_grid=np.zeros((1, 1)), rho_snapshots=np.zeros((1, 1)),
-        M_snapshots=np.zeros((1, 1)), snapshot_steps=np.asarray([]),
+        r_grid=r_grid, rho_snapshots=rho_grid,
+        M_snapshots=M_grid, snapshot_steps=snap_steps,
         rmax0=rmax0, vmax0=vmax0, label=label,
         clamp=np.asarray(clamp_list), clamp_total=np.asarray(ct_list),
         clamp_worst=np.asarray(cw_list), clamp_worst_r=np.asarray(cwr_list),
