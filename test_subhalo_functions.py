@@ -421,7 +421,7 @@ class TestHeatProfile:
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter('always', ShellClampWarning)
             heated = heat_profile(p, eps, tally=tally)
-        assert set(tally) == {'shells', 'worst_pct', 'worst_r'}
+        assert set(tally) == {'shells', 'total', 'worst_pct', 'worst_r'}
         w = [x for x in caught if issubclass(x.category, ShellClampWarning)]
         if w:
             n = int(re.search(r'clamped (\d+) shell', str(w[0].message)).group(1))
