@@ -387,6 +387,50 @@ def test_revirial_fallback_revirializes_without_apocentre(du24_setup):
     assert _n_revir(with_fb) > 1
 
 
+def test_revirial_apo_only_at_apocentre_on_eccentric(du24_setup):
+    """The fallback is timed against the apocentre dynamical time t_dyn(r_apo), not
+    t_dyn(current r). The latter collapses toward pericentre and used to fire a
+    spurious second re-virialization mid-plunge each orbit. On the eccentric 1/20
+    orbit every in-loop re-virialization must now sit at an apocentre (r near the
+    orbital-radius maximum), not at the ~0.2 r_max mid-plunge point. The terminal
+    flush (the last recorded step) settles the remnant wherever the run ended and is
+    excluded from the apocentre check."""
+    res = _revir(du24_setup)
+    rmax_orb = res.r[np.isfinite(res.r)].max()
+    last = len(res.apo) - 1                        # the end-of-run flush step
+    mid_apo = np.where(res.apo)[0]
+    mid_apo = mid_apo[mid_apo != last]
+    assert mid_apo.size > 2
+    assert np.all(res.r[mid_apo] > 0.8 * rmax_orb)
+
+
+def test_revirial_apo_flag_marks_postrevir_steps(du24_setup):
+    """res.apo (bool) marks the re-virialization steps -- where Vmax/rmax step to the
+    post-reshape equilibrium. Vmax is carried (constant) between, so every Vmax change
+    coincides with an apo-flagged step, and the apo steps are few among many."""
+    res = _revir(du24_setup)
+    assert res.apo.dtype == bool
+    vchange = set((np.where(np.abs(np.diff(res.vmax)) > 0.)[0] + 1).tolist())
+    apo = set(np.where(res.apo)[0].tolist())
+    assert vchange.issubset(apo)                  # every structural update is a flagged apocentre
+    assert res.apo.sum() < len(res.apo) / 5       # frozen between (few apo among many steps)
+
+
+def test_revirial_disrupted_run_last_step_not_apo(du24_setup):
+    """A run that disrupts (m -> Mres under early_terminate) skips the terminal flush,
+    so its last recorded step is NOT force-marked apo -- the downstream apocentre
+    extraction then won't treat the floored final state as an equilibrium apocentre."""
+    hNFW, rvals, M_sub, xv0_20 = du24_setup
+    sub0 = NumericProfile(rvals, M_sub)
+    cfg.Mres = 0.3 * sub0.Mh              # high floor: the deep 1/20 disrupts
+    res = sc.evolve_heating_revirial(
+        hNFW, sub0, xv0_20, tmax=37., step_frac=0.02,
+        epsh=0.0741, gamma=0., beta_h=0.278, alpha=3.93, t_dyn_mode='sub_lt',
+        second_order=True, truncation='hard', early_terminate=True)
+    assert res.m[np.isfinite(res.m)][-1] <= cfg.Mres * (1. + 1e-9)   # ended at the floor
+    assert not bool(res.apo[-1])          # disrupted -> no flush -> last step not an apocentre
+
+
 def test_revirial_r_stop_parks(du24_setup):
     """r_stop halts the integration once the orbit dips inside it: the terminal
     record sits below r_stop with the bound mass preserved (not floored)."""

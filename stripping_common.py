@@ -1,5 +1,6 @@
 # shared evolution routines and plots for tidal stripping notebooks
 
+import os
 from dataclasses import dataclass
 from typing import Optional
 
@@ -79,6 +80,10 @@ class EvolutionResult:
     rmax0: float = 0.
     vmax0: float = 0.
     label: str = ''
+    # revirial engine: True where the step re-virialized the profile (once per
+    # apocentre), so m/vmax/rmax there are the post-reshape equilibrium; carried
+    # (stale) on the False steps in between. None for other evolvers.
+    apo: Optional[np.ndarray] = None
     # shell-crossing clamp activity from the re-virialization heat_profile
     # reshape, aligned to t/m/lt: shells clamped (clamp), shells heated this step
     # (clamp_total, the denominator for a clamp fraction), largest overshoot the
@@ -127,6 +132,19 @@ DU24_ETA = {'1/5': 0.404, '1/20': 0.131}            # circularity -> R_p/R_a
 # subhalo's rvir (eq.12) implies the same Delta, so both share it.
 DU24_DELTA = 3. * DU24_MV_HOST / (cfg.FourPi * 263.2**3
                                   * co.rhoc(0., cfg.h, cfg.Om, cfg.OL))
+
+
+def load_du24_nbody(orbit):
+    """Du+24 N-body mass-loss curve for orbit '1/5' or '1/20': (orbit_number,
+    M_bound/M0, sigma_rel), apocentre samples from etc/du24_nbody
+    (scripts/du24_nbody_reference.py). The clock is orbit number k = t/T_r (the
+    period-normalized axis the model is compared on), not Gyr. The 1/5 orbit is the
+    held-out generalization test (not in the calibration)."""
+    tag = orbit.replace('/', '_')
+    fn = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                      'etc', 'du24_nbody', f'mbound_t_{tag}.csv')
+    a = np.loadtxt(fn, delimiter=',', skiprows=3)
+    return a[:, 0], a[:, 1], a[:, 2]
 
 
 def du24_nfw_setup(nr=200):
@@ -975,12 +993,14 @@ def evolve_heating_revirial(host, numProfile0, xv0, tmax=10.,
 
     t_list, r_list, m_list = [], [], []
     vmax_list, rmax_list, lt_list = [], [], []
+    apo_list = []                                # True where the step re-virialized (apocentre)
     clamp_list, cw_list, cwr_list = [], [], []   # revir reshape: shells, worst %, worst r
     ct_list = []                                 # revir reshape: shells heated (denom)
     ec_list, ecw_list, ecwr_list = [], [], []    # per-step _ExpandedProfile clamp
     ect_list = []                                # per-step: shells heated (denom)
     cur_vmax, cur_rmax = ref.Vmax, ref.rmax
     t_last_revir = 0.
+    r_apo_ref = r          # running-max radius: the fallback's stable apocentre clock
     dt_prev = np.inf
     nstep = 0
     t = 0.
@@ -1060,12 +1080,14 @@ def evolve_heating_revirial(host, numProfile0, xv0, tmax=10.,
 
         t += dt
         r = r_new
+        r_apo_ref = max(r_apo_ref, r_new)
         Q, tt_int, hr_prev = Q_trial, tt_int_trial, tidalHR
 
         if disrupted:
             m = cfg.Mres
             t_list.append(t); r_list.append(r_new); m_list.append(m)
             vmax_list.append(cur_vmax); rmax_list.append(cur_rmax); lt_list.append(lt)
+            apo_list.append(False)
             clamp_list.append(np.nan); cw_list.append(np.nan); cwr_list.append(np.nan)
             ct_list.append(np.nan)
             ec_list.append(expand_tally.get('shells', np.nan))
@@ -1081,7 +1103,7 @@ def evolve_heating_revirial(host, numProfile0, xv0, tmax=10.,
             # mass preserved, not floored) and stop before plunging to the cusp.
             t_list.append(t); r_list.append(r_new); m_list.append(m)
             vmax_list.append(cur_vmax); rmax_list.append(cur_rmax)
-            lt_list.append(lt)
+            lt_list.append(lt); apo_list.append(False)
             clamp_list.append(np.nan); cw_list.append(np.nan); cwr_list.append(np.nan)
             ct_list.append(np.nan)
             ec_list.append(np.nan); ecw_list.append(np.nan); ecwr_list.append(np.nan)
@@ -1100,15 +1122,20 @@ def evolve_heating_revirial(host, numProfile0, xv0, tmax=10.,
             lt = lt_step
             lt_min = min(lt_min, lt)
 
-        # re-virialize at apocentre (r local max), with a host-orbit-time cap so
-        # near-circular / distorted orbits (no clean apocentre) still settle: apply
-        # the accumulated heating in one shell expansion and reshape to bound mass m.
+        # re-virialize at apocentre (r local max): apply the accumulated heating in
+        # one shell expansion and reshape to bound mass m. The fallback (for near-
+        # circular / distorted orbits with no clean apocentre) is timed against the
+        # apocentre dynamical time t_dyn(r_apo_ref), NOT t_dyn(current r) -- the
+        # latter collapses toward pericentre and would fire mid-orbit on an
+        # eccentric orbit that already has a well-defined apocentre.
         step_clamp = (np.nan, np.nan, np.nan)
         step_total = np.nan
         apo = (r_p1 is not None and r_p2 is not None
                and r_p1 > r_p2 and r_p1 > r_new)
-        if (apo or t - t_last_revir >= revir_fallback * t_orb) \
-                and Q > 0. and m > cfg.Mres:
+        did_revir = ((apo or t - t_last_revir >= revir_fallback
+                      * tdyn(potential, r_apo_ref))
+                     and Q > 0. and m > cfg.Mres)
+        if did_revir:
             lt_join = lt_min if np.isfinite(lt_min) else lt
             ref, m, tally = _revirialize(ref, Q, c2, m, lt_join,
                                          truncation, tail_n, tail_xi)
@@ -1123,6 +1150,7 @@ def evolve_heating_revirial(host, numProfile0, xv0, tmax=10.,
         # Vmax/rmax step-update at re-virialization; carry between (aligned to t).
         t_list.append(t); r_list.append(r_new); m_list.append(m)
         vmax_list.append(cur_vmax); rmax_list.append(cur_rmax); lt_list.append(lt)
+        apo_list.append(did_revir)
         clamp_list.append(step_clamp[0]); cw_list.append(step_clamp[1])
         cwr_list.append(step_clamp[2])
         ct_list.append(step_total)
@@ -1146,6 +1174,7 @@ def evolve_heating_revirial(host, numProfile0, xv0, tmax=10.,
         lt_join = lt_min if np.isfinite(lt_min) else lt
         ref, m, tally = _revirialize(ref, Q, c2, m, lt_join, truncation, tail_n, tail_xi)
         m_list[-1], vmax_list[-1], rmax_list[-1] = m, ref.Vmax, ref.rmax
+        apo_list[-1] = True   # the flushed final state is a re-virialized equilibrium
         clamp_list[-1], cw_list[-1], cwr_list[-1] = (
             tally['shells'], tally['worst_pct'], tally['worst_r'])
         ct_list[-1] = tally['total']
@@ -1171,6 +1200,7 @@ def evolve_heating_revirial(host, numProfile0, xv0, tmax=10.,
         r_grid=r_grid, rho_snapshots=rho_grid,
         M_snapshots=M_grid, snapshot_steps=snap_steps,
         rmax0=rmax0, vmax0=vmax0, label=label,
+        apo=np.asarray(apo_list, dtype=bool),
         clamp=np.asarray(clamp_list), clamp_total=np.asarray(ct_list),
         clamp_worst=np.asarray(cw_list), clamp_worst_r=np.asarray(cwr_list),
         expand_clamp=np.asarray(ec_list), expand_clamp_total=np.asarray(ect_list),
