@@ -44,7 +44,7 @@ absolute mass/overdensity are free when instantiating the halos; matching
   Columns: `sim, Mhost_over_Msat, Rvir_over_rs, ra_over_rs, rp_over_rs,
   va_over_vunit, torb_over_tunit, circularity, eta_rel, Rc_over_Rvir`.
   Sim 3 is the paper's "Fast" simulation, Sim 4 the "Slow" one. Orbits are
-  set at apocentre (`r = ra`, `v_r = 0`, `v_phi = va`). S9/S10 have mass ratio
+  set at apocenter (`r = ra`, `v_r = 0`, `v_phi = va`). S9/S10 have mass ratio
   10 (large satellite): the distant-tide approximation breaks and Drakos's own
   model fails there too — kept as stress tests.
 

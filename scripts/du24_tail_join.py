@@ -7,8 +7,8 @@ H = f_t/(1+(r/r_te)^delta) (Du+24 eq. 23), with the effective tidal radius
 r_te(x) fit to their simulations (eq. 30, Table II; gamma=1, delta=3 here).
 
 We build that evolved profile at a grid of bound fractions x, then compute the
-l_t of the same profile at the orbit's apocentre (Du+24 measure r_te at
-apocentres). xi = log10(r_te / l_t), plus log10(r_break / l_t) where r_break is
+l_t of the same profile at the orbit's apocenter (Du+24 measure r_te at
+apocenters). xi = log10(r_te / l_t), plus log10(r_break / l_t) where r_break is
 the slope=-5 radius, to match the DASH definition. Self-contained: no cache, no
 multiprocessing.
 

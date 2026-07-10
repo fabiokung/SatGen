@@ -12,8 +12,8 @@ import stripping_common as sc
 
 
 def eta_for_rp_ra(host, R0, rp_ra):
-    """Circularity eta = Vphi/Vcirc at apocentre R0 that yields an orbit with
-    pericentre/apocentre ratio rp_ra in `host`. Du+24's NFW (gamma=1) tidal
+    """Circularity eta = Vphi/Vcirc at apocenter R0 that yields an orbit with
+    pericentre/apocenter ratio rp_ra in `host`. Du+24's NFW (gamma=1) tidal
     tracks use rp/ra = 1/5 and 1/20 (their Fig. 1, lower-left panel)."""
     T_circ = 2. * np.pi * R0 / Vcirc(host, R0, 0.)
     t = np.linspace(0., 3. * T_circ, 6000)
@@ -31,8 +31,8 @@ def eta_for_rp_ra(host, R0, rp_ra):
 def evolve_one(params):
     """Evolve one (subhalo, host, orbit) configuration with the Benson+Du22
     calibration. params is a dict with M_sub, c_sub, M_host, c_host, and
-    optionally R0_frac (apocentre / r_vir,host) and Rp_Ra (pericentre /
-    apocentre ratio). The orbit defaults to Du+24's NFW gamma=1 case,
+    optionally R0_frac (apocenter / r_vir,host) and Rp_Ra (pericentre /
+    apocenter ratio). The orbit defaults to Du+24's NFW gamma=1 case,
     Rp/Ra = 1/20. Returns a dict with the inputs plus (R, V, m, t) arrays."""
     M_sub = params['M_sub']
     c_sub = params['c_sub']

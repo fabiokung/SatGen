@@ -81,14 +81,14 @@ class EvolutionResult:
     vmax0: float = 0.
     label: str = ''
     # revirial engine: True where the step re-virialized the profile (once per
-    # apocentre), so m/vmax/rmax there are the post-reshape equilibrium; carried
+    # apocenter), so m/vmax/rmax there are the post-reshape equilibrium; carried
     # (stale) on the False steps in between. None for other evolvers.
     apo: Optional[np.ndarray] = None
     # shell-crossing clamp activity from the re-virialization heat_profile
     # reshape, aligned to t/m/lt: shells clamped (clamp), shells heated this step
     # (clamp_total, the denominator for a clamp fraction), largest overshoot the
     # clamp removed in % (clamp_worst), its radius in kpc (clamp_worst_r). For the
-    # revirial engine only the apocentre steps carry values (NaN elsewhere); for
+    # revirial engine only the apocenter steps carry values (NaN elsewhere); for
     # the uniform engine every heating step does. None for non-heating evolvers.
     clamp: Optional[np.ndarray] = None
     clamp_total: Optional[np.ndarray] = None
@@ -96,7 +96,7 @@ class EvolutionResult:
     clamp_worst_r: Optional[np.ndarray] = None
     # revirial engine only: the same telemetry from the per-step _ExpandedProfile
     # expansion that locates l_t (a crude approximation -- heating alone, no tail,
-    # thrown away each step), kept separate from the careful apocentre reshape
+    # thrown away each step), kept separate from the careful apocenter reshape
     # above so the two clamp regimes can be told apart. NaN on disruption/parked
     # steps where no expansion is built.
     expand_clamp: Optional[np.ndarray] = None
@@ -136,7 +136,7 @@ DU24_DELTA = 3. * DU24_MV_HOST / (cfg.FourPi * 263.2**3
 
 def load_du24_nbody(orbit):
     """Du+24 N-body mass-loss curve for orbit '1/5' or '1/20': (orbit_number,
-    M_bound/M0, sigma_rel), apocentre samples from etc/du24_nbody
+    M_bound/M0, sigma_rel), apocenter samples from etc/du24_nbody
     (scripts/du24_nbody_reference.py). The clock is orbit number k = t/T_r (the
     period-normalized axis the model is compared on), not Gyr. The 1/5 orbit is the
     held-out generalization test (not in the calibration)."""
@@ -241,7 +241,7 @@ def drakos_nfw_setup(row, msat=DRAKOS_MV_SAT, nr=200):
     ra_over_rs, va_over_vunit, torb_over_tunit). The subhalo IC is the c=10 NFW
     sharply truncated at r_vir (as in dash_nfw_setup -- ICICLE ICs remove unbound
     particles, close to a lowered NFW rather than an outer exponential tail). The
-    orbit is set at apocentre: r = ra, v_r = 0, v_phi = va. Returns (host, sat,
+    orbit is set at apocenter: r = ra, v_r = 0, v_phi = va. Returns (host, sat,
     rvals, M_sub, xv0, T_r); T_r is the radial period [Gyr] measured in the fixed
     host potential (matches Table 1's torb/tunit to ~1%).
     """
@@ -845,9 +845,9 @@ class _ExpandedProfile:
     """Reference profile expanded by the accumulated heating scalar Q (Du+24
     eq.36 shell map, 1st + 2nd order), exposing only M(r) and rh -- all ev.ltidal
     needs from the subhalo. No PCHIP/tail rebuild; the full reshape happens once
-    per apocentre.
+    per apocenter.
 
-    Uses the same _expand_shells map as the apocentre heat_profile, so the
+    Uses the same _expand_shells map as the apocenter heat_profile, so the
     per-step tidal radius sees this-orbit's partial expansion consistently: outer
     shells whose injected energy exceeds their binding energy are unbound (a
     contiguous outer block), not retained, and crossings are clamped identically.
@@ -890,7 +890,7 @@ def _t_strip(profile, potential, xv, lt_choice, t_dyn_mode, t_orb):
 
 def _reference_arrays(prof, c2):
     """Frozen-reference grid (radii, enclosed mass, sigma_r^2) that the per-step
-    analytic expansion and the apocentre reshape read. sigma_r^2 is masked to zero
+    analytic expansion and the apocenter reshape read. sigma_r^2 is masked to zero
     beyond the half-mass edge and only built for the 2nd-order term (c2 != 0)."""
     r_ref = prof.ri
     M_ref = np.asarray(prof.M(r_ref), float)
@@ -942,7 +942,7 @@ def evolve_heating_revirial(host, numProfile0, xv0, tmax=10.,
         tidal-tensor cumulant; relax the bound mass m by King62 (eq.35), with lt
         computed on the ANALYTICALLY expanded profile (_ExpandedProfile) so the
         rate sees this-orbit's partial expansion without a heat_profile call.
-      - once per apocentre (re-virialization): apply the full shell expansion
+      - once per apocenter (re-virialization): apply the full shell expansion
         (heat_profile on the frozen reference with total accumulated Q, 1st+2nd
         order) and reshape to the current bound mass m (hard cut or tail),
         producing the ground-truth-comparable equilibrium. Reset Q, cumulant.
@@ -950,20 +950,20 @@ def evolve_heating_revirial(host, numProfile0, xv0, tmax=10.,
     Pullen+14 (eqs. 15-18) tracks the position-independent Q = E/x^2 with the shell
     radius x frozen (impulse approximation); the shell then expands once, using the
     energy at its initial radius. The shell response takes ~a dynamical time, so the
-    expansion is applied once per orbit (apocentre) rather than sub-stepped -- the
+    expansion is applied once per orbit (apocenter) rather than sub-stepped -- the
     heating-application count is then set by the orbit, not the timestep, so the
     bound-mass and structural tracks are dt-convergent.
 
     step_frac caps dt on both timescales: dt <= step_frac * min(t_orb, T_strip/alpha).
     The King62 T_strip collapses at pericentre, so the adaptive dt resolves the
     strip there (each step is cheap scalar work -- no heat_profile). revir_fallback
-    re-virializes if more than revir_fallback * t_orb elapses without an apocentre
+    re-virializes if more than revir_fallback * t_orb elapses without an apocenter
     (a near-circular / distorted orbit with no clean r maximum still settles).
 
-    Track points (Vmax, rmax) step-update at each apocentre -- where the profile is
+    Track points (Vmax, rmax) step-update at each apocenter -- where the profile is
     a re-virialized equilibrium, matching where Du+24 measure -- and carry between;
     t/r/m are recorded per accepted step. lt beyond the profile edge halts stripping.
-    truncation selects the apocentre reshape ('hard', 'kazantzidis', 'powerlaw');
+    truncation selects the apocenter reshape ('hard', 'kazantzidis', 'powerlaw');
     see evolve_heating for the shared per-step physics (heat_profile, _cumulant_step,
     the King62 rate, the truncation tails).
     """
@@ -988,19 +988,19 @@ def evolve_heating_revirial(host, numProfile0, xv0, tmax=10.,
     hr_prev = None
     lt_min = np.inf
     lt = cfg.Rres
-    r_p1 = r_p2 = None  # apocentre detector (r local max)
+    r_p1 = r_p2 = None  # apocenter detector (r local max)
     omega_p = ref.omega_p
 
     t_list, r_list, m_list = [], [], []
     vmax_list, rmax_list, lt_list = [], [], []
-    apo_list = []                                # True where the step re-virialized (apocentre)
+    apo_list = []                                # True where the step re-virialized (apocenter)
     clamp_list, cw_list, cwr_list = [], [], []   # revir reshape: shells, worst %, worst r
     ct_list = []                                 # revir reshape: shells heated (denom)
     ec_list, ecw_list, ecwr_list = [], [], []    # per-step _ExpandedProfile clamp
     ect_list = []                                # per-step: shells heated (denom)
     cur_vmax, cur_rmax = ref.Vmax, ref.rmax
     t_last_revir = 0.
-    r_apo_ref = r          # running-max radius: the fallback's stable apocentre clock
+    r_apo_ref = r          # running-max radius: the fallback's stable apocenter clock
     dt_prev = np.inf
     nstep = 0
     t = 0.
@@ -1122,12 +1122,12 @@ def evolve_heating_revirial(host, numProfile0, xv0, tmax=10.,
             lt = lt_step
             lt_min = min(lt_min, lt)
 
-        # re-virialize at apocentre (r local max): apply the accumulated heating in
+        # re-virialize at apocenter (r local max): apply the accumulated heating in
         # one shell expansion and reshape to bound mass m. The fallback (for near-
-        # circular / distorted orbits with no clean apocentre) is timed against the
-        # apocentre dynamical time t_dyn(r_apo_ref), NOT t_dyn(current r) -- the
+        # circular / distorted orbits with no clean apocenter) is timed against the
+        # apocenter dynamical time t_dyn(r_apo_ref), NOT t_dyn(current r) -- the
         # latter collapses toward pericentre and would fire mid-orbit on an
-        # eccentric orbit that already has a well-defined apocentre.
+        # eccentric orbit that already has a well-defined apocenter.
         step_clamp = (np.nan, np.nan, np.nan)
         step_total = np.nan
         apo = (r_p1 is not None and r_p2 is not None
@@ -1164,10 +1164,10 @@ def evolve_heating_revirial(host, numProfile0, xv0, tmax=10.,
         if early_terminate and m <= cfg.Mres:
             break
 
-    # Flush heating accumulated since the last apocentre into a final
+    # Flush heating accumulated since the last apocenter into a final
     # re-virialization, so the reported final (m, Vmax, rmax, profile) describe one
     # self-consistent equilibrium rather than a current m against a stale last-
-    # apocentre structure. If the run ends mid-orbit this is the equilibrium the
+    # apocenter structure. If the run ends mid-orbit this is the equilibrium the
     # subhalo relaxes toward (settling takes ~a dynamical time). Skipped once
     # disrupted (m at the floor) -- there is nothing to settle.
     if Q > 0. and m > cfg.Mres and t_list:

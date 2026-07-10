@@ -19,18 +19,18 @@ M_vir = 1e9, host M_vir = 1e12, subhalo concentration c ≈ 20.6.
 ## Derived CSVs
 
 Regenerate with `python scripts/du24_nbody_reference.py`. All are sampled at
-apocentres, where the subhalo is relaxed — V_max/R_max oscillate between peri
+apocenters, where the subhalo is relaxed — V_max/R_max oscillate between peri
 and apo, so the clean tidal-track relation and the mass-loss plateaus both live
-at the apocentres (Du+24 Fig. 12 / Fig. 10). Errors are the N-body's own
+at the apocenters (Du+24 Fig. 12 / Fig. 10). Errors are the N-body's own
 measurement uncertainties, propagated to the ratios.
 
 - `track_1_5.csv`, `track_1_20.csv` — V_max/V_max,0 and R_max/R_max,0 vs
   M_bound/M_bound,0. Columns: `x, V_over_V0, R_over_R0, sigma_V_rel, sigma_R_rel`.
-- `mbound_t_1_20.csv` — M_bound/M_bound,0 at apocentres, R_p/R_a = 1/20, vs
-  **orbit number** k = t/T_r (apocentre k is the k-th orbit). Columns:
+- `mbound_t_1_20.csv` — M_bound/M_bound,0 at apocenters, R_p/R_a = 1/20, vs
+  **orbit number** k = t/T_r (apocenter k is the k-th orbit). Columns:
   `orbit, mbound_over_m0, sigma_rel`. The period-normalized axis lets the model's
-  k-th apocentre be compared to the N-body's, immune to the SatGen-vs-N-body radial-
-  period offset and the N-body's orbital decay. The physical apocentre times in Gyr
+  k-th apocenter be compared to the N-body's, immune to the SatGen-vs-N-body radial-
+  period offset and the N-body's orbital decay. The physical apocenter times in Gyr
   live in the HDF5.
 - `mbound_t_1_5.csv` — same for R_p/R_a = 1/5. Held out of the calibration
   likelihood as a generalization test (`load_du24_test_observables`).

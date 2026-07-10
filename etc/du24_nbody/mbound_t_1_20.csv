@@ -1,4 +1,4 @@
-# Du+24 N-body gamma=1, R_p/R_a=1/20: M_bound at apocentres vs orbit number k = t/T_r
+# Du+24 N-body gamma=1, R_p/R_a=1/20: M_bound at apocenters vs orbit number k = t/T_r
 # sigma is the relative error on M_bound/M0
 # orbit,mbound_over_m0,sigma_rel
 0.0,1.000000e+00,4.151379e-04

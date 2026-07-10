@@ -42,7 +42,7 @@ def du24_setup():
 def _run(setup, truncation, second_order=False, engine='uniform'):
     """Run one short evolution on the 1/20 orbit through either engine. The uniform
     grid takes Nstep; the revirialization scheme takes step_frac (dt <= step_frac *
-    min(t_orb, T_strip/alpha)) and reshapes the profile once per apocentre."""
+    min(t_orb, T_strip/alpha)) and reshapes the profile once per apocenter."""
     hNFW, rvals, M_sub, xv0_20 = setup
     sub = NumericProfile(rvals, M_sub)
     if engine == 'revirial':
@@ -58,7 +58,7 @@ def _run(setup, truncation, second_order=False, engine='uniform'):
 
 # both engines evolve the same physics; the survival/track behaviour is asserted
 # against both. Thresholds bracket both engines' converged values -- the corrected
-# per-apocentre heating of the revirialization scheme strips a dense core somewhat
+# per-apocenter heating of the revirialization scheme strips a dense core somewhat
 # less deeply than the uniform grid, so a shared ratio bound is looser than either
 # engine alone (dt-robustness is pinned per-engine in the dedicated tests below).
 @pytest.mark.parametrize('engine', ['uniform', 'revirial'])
@@ -138,7 +138,7 @@ def test_clamp_track_aligned_to_evolution(du24_setup):
 def test_revirial_clamp_telemetry_populated(du24_setup):
     """evolve_heating_revirial records shell-clamp telemetry per re-virialization
     (res.clamp shells, clamp_worst %, clamp_worst_r radius), aligned to the mass
-    track: finite on the apocentre re-virialization steps, NaN elsewhere."""
+    track: finite on the apocenter re-virialization steps, NaN elsewhere."""
     res = _run(du24_setup, 'kazantzidis', second_order=True, engine='revirial')
     for arr in (res.clamp, res.clamp_total, res.clamp_worst, res.clamp_worst_r):
         assert arr is not None and arr.shape == res.m.shape
@@ -157,7 +157,7 @@ def test_revirial_clamp_telemetry_populated(du24_setup):
 
 def test_revirial_expand_clamp_discriminable_from_revir(du24_setup):
     """The per-step _ExpandedProfile clamp telemetry (expand_clamp*) is recorded
-    separately from the apocentre reshape telemetry (clamp*), so the two clamp
+    separately from the apocenter reshape telemetry (clamp*), so the two clamp
     regimes can be told apart: the reshape telemetry is finite only on the
     (few) re-virialization steps, the expansion telemetry on (almost) every step.
     On the cuspy NFW subhalo neither actually clamps -- perturb rises monotonically
@@ -166,7 +166,7 @@ def test_revirial_expand_clamp_discriminable_from_revir(du24_setup):
     for arr in (res.expand_clamp, res.expand_clamp_total,
                 res.expand_clamp_worst, res.expand_clamp_worst_r):
         assert arr is not None and arr.shape == res.m.shape
-    revir = np.isfinite(res.clamp)              # apocentre reshape steps
+    revir = np.isfinite(res.clamp)              # apocenter reshape steps
     expand = np.isfinite(res.expand_clamp)      # per-step expansion steps
     # the expansion runs far more often than the reshape (per step vs per orbit)
     assert expand.sum() > 5 * revir.sum()
@@ -331,29 +331,29 @@ def _revir(setup, **kw):
 
 def _n_revir(res):
     """Re-virialization count = step-updates of the (piecewise-constant between
-    apocentres) Vmax track."""
+    apocenters) Vmax track."""
     v = res.vmax[np.isfinite(res.vmax)]
     return int(np.sum(np.abs(np.diff(v)) > 0.))
 
 
-def test_revirial_apocentre_count_is_dt_independent(du24_setup):
-    """The re-virialization count is set by the orbit (one per apocentre), not by
+def test_revirial_apocenter_count_is_dt_independent(du24_setup):
+    """The re-virialization count is set by the orbit (one per apocenter), not by
     the timestep: refining step_frac leaves both the number of re-virializations and
     the final bound mass unchanged. This is what makes the heating dt-convergent --
     heat_profile is applied a fixed number of times regardless of dt."""
     coarse = _revir(du24_setup, step_frac=0.05)
     fine = _revir(du24_setup, step_frac=0.02)
     assert _n_revir(coarse) == _n_revir(fine)
-    assert _n_revir(coarse) > 5    # the 1/20 re-virializes at every apocentre
+    assert _n_revir(coarse) > 5    # the 1/20 re-virializes at every apocenter
     rc = coarse.m[np.isfinite(coarse.m)]
     rf = fine.m[np.isfinite(fine.m)]
     assert rc[-1] / rc[0] == pytest.approx(rf[-1] / rf[0], rel=0.05), \
         "final bound mass is dt-convergent (no plateau-then-jump)"
 
 
-def test_revirial_profile_frozen_between_apocentres(du24_setup):
+def test_revirial_profile_frozen_between_apocenters(du24_setup):
     """Between re-virializations the reference profile is held fixed: Vmax is
-    piecewise-constant, stepping only at apocentres. Many steps share each level."""
+    piecewise-constant, stepping only at apocenters. Many steps share each level."""
     res = _revir(du24_setup, step_frac=0.05)
     v = res.vmax[np.isfinite(res.vmax)]
     n_levels = len(np.unique(np.round(v, 8)))
@@ -361,14 +361,14 @@ def test_revirial_profile_frozen_between_apocentres(du24_setup):
     assert n_levels < len(v) / 5          # but far fewer than steps (frozen between)
 
 
-def test_revirial_fallback_revirializes_without_apocentre(du24_setup):
-    """Re-virialization normally fires at each apocentre (r local maximum). When the
+def test_revirial_fallback_revirializes_without_apocenter(du24_setup):
+    """Re-virialization normally fires at each apocenter (r local maximum). When the
     orbit has no local maximum over the integration -- a window shorter than half a
-    radial period (a monotone-ish plunge from apocentre, as here), a perfectly
+    radial period (a monotone-ish plunge from apocenter, as here), a perfectly
     circular orbit, or an orbit distorted by a future time-evolving host -- the
     revir_fallback timer re-virializes after revir_fallback * t_orb instead, so the
-    accumulated heating does not grow unbounded. The 1/20 starts at apocentre and
-    plunges, so a 1.5 Gyr window registers no apocentre: without the fallback the
+    accumulated heating does not grow unbounded. The 1/20 starts at apocenter and
+    plunges, so a 1.5 Gyr window registers no apocenter: without the fallback the
     only re-virialization is the terminal flush; with it, heating feeds back into the
     profile repeatedly during the plunge."""
     def run(fb):
@@ -380,21 +380,21 @@ def test_revirial_fallback_revirializes_without_apocentre(du24_setup):
             dynamical_friction=False)
     no_fb = run(1e9)
     with_fb = run(0.3)
-    # no apocentre in a sub-radial-period plunge: the only re-virialization is the
+    # no apocenter in a sub-radial-period plunge: the only re-virialization is the
     # end-of-evolution flush (one step-update of Vmax, at the final step)
     assert _n_revir(no_fb) == 1
     # the fallback re-virializes repeatedly mid-plunge, well before the end
     assert _n_revir(with_fb) > 1
 
 
-def test_revirial_apo_only_at_apocentre_on_eccentric(du24_setup):
-    """The fallback is timed against the apocentre dynamical time t_dyn(r_apo), not
+def test_revirial_apo_only_at_apocenter_on_eccentric(du24_setup):
+    """The fallback is timed against the apocenter dynamical time t_dyn(r_apo), not
     t_dyn(current r). The latter collapses toward pericentre and used to fire a
     spurious second re-virialization mid-plunge each orbit. On the eccentric 1/20
-    orbit every in-loop re-virialization must now sit at an apocentre (r near the
+    orbit every in-loop re-virialization must now sit at an apocenter (r near the
     orbital-radius maximum), not at the ~0.2 r_max mid-plunge point. The terminal
     flush (the last recorded step) settles the remnant wherever the run ended and is
-    excluded from the apocentre check."""
+    excluded from the apocenter check."""
     res = _revir(du24_setup)
     rmax_orb = res.r[np.isfinite(res.r)].max()
     last = len(res.apo) - 1                        # the end-of-run flush step
@@ -412,14 +412,14 @@ def test_revirial_apo_flag_marks_postrevir_steps(du24_setup):
     assert res.apo.dtype == bool
     vchange = set((np.where(np.abs(np.diff(res.vmax)) > 0.)[0] + 1).tolist())
     apo = set(np.where(res.apo)[0].tolist())
-    assert vchange.issubset(apo)                  # every structural update is a flagged apocentre
+    assert vchange.issubset(apo)                  # every structural update is a flagged apocenter
     assert res.apo.sum() < len(res.apo) / 5       # frozen between (few apo among many steps)
 
 
 def test_revirial_disrupted_run_last_step_not_apo(du24_setup):
     """A run that disrupts (m -> Mres under early_terminate) skips the terminal flush,
-    so its last recorded step is NOT force-marked apo -- the downstream apocentre
-    extraction then won't treat the floored final state as an equilibrium apocentre."""
+    so its last recorded step is NOT force-marked apo -- the downstream apocenter
+    extraction then won't treat the floored final state as an equilibrium apocenter."""
     hNFW, rvals, M_sub, xv0_20 = du24_setup
     sub0 = NumericProfile(rvals, M_sub)
     cfg.Mres = 0.3 * sub0.Mh              # high floor: the deep 1/20 disrupts
@@ -428,7 +428,7 @@ def test_revirial_disrupted_run_last_step_not_apo(du24_setup):
         epsh=0.0741, gamma=0., beta_h=0.278, alpha=3.93, t_dyn_mode='sub_lt',
         second_order=True, truncation='hard', early_terminate=True)
     assert res.m[np.isfinite(res.m)][-1] <= cfg.Mres * (1. + 1e-9)   # ended at the floor
-    assert not bool(res.apo[-1])          # disrupted -> no flush -> last step not an apocentre
+    assert not bool(res.apo[-1])          # disrupted -> no flush -> last step not an apocenter
 
 
 def test_revirial_r_stop_parks(du24_setup):
