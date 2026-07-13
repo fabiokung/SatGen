@@ -358,82 +358,125 @@ def evolve_satgen_dekel(host, sat, xv0, tmax=10., Nstep=10000, alpha=1.,
     )
 
 
-def evolve_satgen_green(host, ma, c2a, xv0, tmax=10., Nstep=10000,
+def _green_strip(s, potential, xv, dt, alpha):
+    """One exactly-integrated King62 tidal strip on a Green profile. Returns (m, lt).
+
+    Same closed form the heating engines use (evolve.msub takes a forward-Euler
+    step instead): over a step lt -- hence M(<lt) and t_dyn -- is fixed, so the
+    bound-mass excess m - M(<lt) relaxes as exp(-alpha dt / t_dyn) and asymptotes
+    to M(<lt) from above, never crossing it, so m stays >= M(<lt) for any dt.
+    t_dyn is the host dynamical time at the subhalo's position (GvdBJ21 eq.8,
+    matching evolve.msub). King62 is fixed: alpha_from_c2 is DASH-calibrated only
+    against the King62 lt (GvdBJ21 eq.9, centrifugal term included); a Tormen98 lt
+    would strip weaker and need its own alpha refit.
+    """
+    lt = float(ev.ltidal(s, potential, xv, 'King62'))  # type: ignore[arg-type]
+    if lt >= s.rh:
+        return s.Mh, lt
+    M_at_lt = min(float(s.M(lt)), float(s.Mh))
+    T_strip = tdyn(potential, xv[0], xv[2])
+    m = M_at_lt + (s.Mh - M_at_lt) * np.exp(-alpha * dt / T_strip)
+    return max(m, cfg.Mres), lt  # type: ignore[type-var]
+
+
+def evolve_satgen_green(host, ma, c2a, xv0, tmax=10.,
                         alpha='conc', Delta=200., z=0.,
+                        step_frac=0.01, dt_growth_max=3.0, floor_orbit_frac=1e-3,
+                        dt_abs_frac=1e-6, max_steps=200000,
                         n_snapshots=10, label='SatGen (Green / DASH track)'):
     """Green+21 DASH transfer-function evolution.
 
     alpha='conc' uses concentration-dependent stripping efficiency (ev.alpha_from_c2).
+    The tidal radius is King62 -- alpha_from_c2 is DASH-calibrated against that lt
+    definition (GvdBJ21 eq.9), so it is not a free choice here.
+
+    step_frac sets the adaptive timestep dt <= step_frac * min(t_orb, t_orb/alpha),
+    with t_orb the host dynamical time at the subhalo's position (the King62
+    stripping timescale here). dt grows by at most dt_growth_max per step and is
+    floored at max(dt_abs_frac*tmax, floor_orbit_frac*t_orb); max_steps caps the
+    loop. The default 0.01 matches the heating engines used in the calibration.
     """
     assert cfg.Mres is not None, "cfg.Mres must be set before calling evolve_satgen_green"
     potential = host
-    timesteps = np.linspace(0., tmax, Nstep + 1)[1:]
 
     s = Green(ma, c2a, Delta=Delta, z=z)
     vmax0, rmax0 = _vmax_rmax(s)
+    al = ev.alpha_from_c2(host.ch, s.ch) if alpha == 'conc' else float(alpha)
 
     snap_npts = 100
-    track_steps = np.round(np.linspace(0, Nstep - 1, n_snapshots)).astype(int)
-
-    # NaN-init: unwritten slots (early-continue when r <= cfg.Rres) and
-    # rmax slots without an interior crossing stay NaN; plotters mask via
-    # np.isfinite. Using zeros would conflate "skipped" with "value of 0".
-    t_arr = np.full(Nstep, np.nan)
-    r_arr = np.full(Nstep, np.nan)
-    m_arr = np.full(Nstep, np.nan)
-    vmax_arr = np.full(Nstep, np.nan)
-    rmax_arr = np.full(Nstep, np.nan)
-    lt_arr = np.full(Nstep, np.nan)
+    snap_times = np.linspace(0., tmax, n_snapshots)
+    snap_ptr = 0
     r_grids = np.zeros((n_snapshots, snap_npts))
     rho_snaps = np.zeros((n_snapshots, snap_npts))
     M_snaps = np.zeros((n_snapshots, snap_npts))
+    snap_steps = np.zeros(n_snapshots, dtype=int)
+
+    t_list, r_list, m_list = [], [], []
+    vmax_list, rmax_list, lt_list = [], [], []
 
     o = orbit(xv0)
     r = np.sqrt(xv0[0]**2 + xv0[2]**2)
     m = ma
     lt = cfg.Rres
-    tprevious = 0.
+    dt_abs = dt_abs_frac * tmax
+    dt_prev = np.inf
+    t = 0.
+    nstep = 0
 
-    for i, t in enumerate(timesteps):
-        dt = t - tprevious
-        if r > cfg.Rres:
-            o.integrate(t, potential, m)
-            xv = o.xv
-        else:
-            tprevious = t
+    while t < tmax - dt_abs:
+        if nstep >= max_steps:
+            raise PericentreUnresolvedError(
+                f"exceeded max_steps={max_steps} at t={t:.3f}/{tmax} Gyr")
+
+        t_orb = tdyn(potential, r)
+        dt_min = max(dt_abs, floor_orbit_frac * t_orb)
+        dt = min(step_frac * t_orb, step_frac * t_orb / al,
+                 dt_growth_max * dt_prev, tmax - t)
+        dt = max(dt, dt_min)
+        t += dt
+        dt_prev = dt
+
+        if r <= cfg.Rres:
             continue
-        r = np.sqrt(xv[0]**2 + xv[2]**2)
+        o.integrate(t, potential, m)
+        r = np.sqrt(o.xv[0]**2 + o.xv[2]**2)
 
         if m <= cfg.Mres:
             m, lt = cfg.Mres, cfg.Rres
         else:
-            al = ev.alpha_from_c2(host.ch, s.ch) if alpha == 'conc' else float(alpha)
-            m, lt = ev.msub(s, potential, xv, dt, choice='King62', alpha=al)
-            m = max(m, cfg.Mres)
+            m, lt = _green_strip(s, potential, o.xv, dt, al)
             s.update_mass(m)
 
         vm, rm = _vmax_rmax(s)
+        t_list.append(t); r_list.append(r); m_list.append(m)
+        vmax_list.append(vm); rmax_list.append(rm); lt_list.append(lt)
+        nstep += 1
 
-        t_arr[i] = t
-        r_arr[i] = r
-        m_arr[i] = m
-        vmax_arr[i] = vm
-        rmax_arr[i] = rm
-        lt_arr[i] = lt
-
-        slot = np.searchsorted(track_steps, i)
-        if slot < n_snapshots and track_steps[slot] == i:
+        # snapshot when the accepted time crosses each evenly-spaced threshold
+        while snap_ptr < n_snapshots and t >= snap_times[snap_ptr]:
             rg = np.logspace(np.log10(cfg.Rres), np.log10(s.rh), snap_npts)
-            r_grids[slot] = rg
-            rho_snaps[slot] = s.rho(rg)
-            M_snaps[slot] = s.M(rg)
+            r_grids[snap_ptr] = rg
+            rho_snaps[snap_ptr] = s.rho(rg)
+            M_snaps[snap_ptr] = s.M(rg)
+            snap_steps[snap_ptr] = nstep - 1
+            snap_ptr += 1
 
-        tprevious = t
+    # the loop halts just short of tmax, so the final snap_times[-1]==tmax threshold
+    # never fires; fill any trailing slots with the final settled profile.
+    while snap_ptr < n_snapshots and t_list:
+        rg = np.logspace(np.log10(cfg.Rres), np.log10(s.rh), snap_npts)
+        r_grids[snap_ptr] = rg
+        rho_snaps[snap_ptr] = s.rho(rg)
+        M_snaps[snap_ptr] = s.M(rg)
+        snap_steps[snap_ptr] = nstep - 1
+        snap_ptr += 1
 
     return EvolutionResult(
-        t=t_arr, r=r_arr, m=m_arr, vmax=vmax_arr, rmax=rmax_arr, lt=lt_arr,
+        t=np.asarray(t_list), r=np.asarray(r_list), m=np.asarray(m_list),
+        vmax=np.asarray(vmax_list), rmax=np.asarray(rmax_list),
+        lt=np.asarray(lt_list),
         r_grid=r_grids, rho_snapshots=rho_snaps, M_snapshots=M_snaps,
-        snapshot_steps=track_steps, rmax0=rmax0, vmax0=vmax0, label=label,
+        snapshot_steps=snap_steps, rmax0=rmax0, vmax0=vmax0, label=label,
     )
 
 

@@ -704,3 +704,25 @@ def test_heating_stepper_trapezoidal_is_second_order():
     assert et1 < 0.1 * er1              # trapezoid much closer at same N
     assert 3.5 < et1 / et2 < 4.5        # O(dt^2)
     assert 1.7 < er1 / er2 < 2.3        # rectangle only O(dt)
+
+
+def _green_final(setup, step_frac):
+    """Final bound fraction and adaptive step count from the Green/DASH engine on
+    the 1/20 orbit at the given step_frac."""
+    hNFW, _rvals, _M_sub, xv0_20 = setup
+    res = sc.evolve_satgen_green(hNFW, 1.0e9, 26.32 / 1.279, xv0_20, tmax=12.,
+                                 alpha='conc', step_frac=step_frac)
+    m = res.m[np.isfinite(res.m)]
+    return m[-1] / 1.0e9, len(res.t)
+
+
+def test_green_adaptive_step_frac_convergence(du24_setup):
+    """Refining step_frac leaves the deep-stripping bound mass unchanged: the King62
+    strip is integrated exactly (exp relaxation toward M(<lt)), so it is dt-robust --
+    a forward-Euler step would drift with dt. The finer run also takes more steps."""
+    coarse, n_coarse = _green_final(du24_setup, step_frac=0.04)
+    fine, n_fine = _green_final(du24_setup, step_frac=0.005)
+    assert coarse == pytest.approx(fine, rel=0.03), \
+        f"step_frac refinement must converge: {coarse:.4f} vs {fine:.4f}"
+    assert n_fine > n_coarse                      # finer step_frac -> more steps
+    assert fine < 0.1, "the 1/20 orbit strips deeply, not frozen near unity"

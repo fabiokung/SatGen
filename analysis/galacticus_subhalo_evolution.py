@@ -175,7 +175,7 @@ def run_node(G, nid, params, nstep=None, nstep_cap=120000, n_snapshots=40):
         nstep = min(_nstep_for(host, xv0, tmax), nstep_cap)
 
     green = sc.evolve_satgen_green(
-        host, ic['Mvir'], ic['c_sub'], xv0, tmax=tmax, Nstep=nstep,
+        host, ic['Mvir'], ic['c_sub'], xv0, tmax=tmax,
         alpha='conc', n_snapshots=n_snapshots, label='SatGen Green/DASH')
 
     rvals = np.logspace(np.log10(cfg.Rres), np.log10(ic['sub'].rh), 200)
