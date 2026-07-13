@@ -1,16 +1,17 @@
 """Compare SatGen stripping prescriptions to a Galacticus full-evolution run.
 
 The Galacticus run carries M_bound as a scalar ledger: the subhalo NFW (Mvir, rs)
-is frozen at infall and only the bound mass evolves (no tidal heating in this
-output). So m_bound(t) and orbital r(t) are the direct Galacticus truth; there is
-no vmax/rmax track. A reference track is derived by mapping the bound-mass history
-through the Penarrubia+2010 tidal-track relation.
+is frozen at infall and only the bound mass evolves (King62/Zentner+2005 tidal
+stripping, no tidal heating). So m_bound(t) and orbital r(t) are the direct
+Galacticus truth; there is no vmax/rmax track. A reference track is derived by
+mapping the bound-mass history through the Penarrubia+2010 tidal-track relation.
 
 Per representative subhalo we hold the host static at the subhalo's infall-redshift
 host values (Mvir, rs) and evolve from infall to z=0 under:
   green -- Green+19 DASH transfer function (evolve_satgen_green, alpha='conc')
-  hard  -- Du+24 shell heating + hard tidal-radius truncation (evolve_heating,
-           truncation='hard', second_order=True, lt='Tormen98').
+  hard  -- Du+24 shell heating + hard tidal-radius truncation on the apocenter
+           re-virialization engine (evolve_heating_revirial, truncation='hard',
+           second order, lt='Tormen98'), at a fixed calibrated parameter set.
 
 Units: Galacticus positions Mpc, velocities km/s -> SatGen kpc, kpc/Gyr.
 Cosmic time comes straight from the snapshot outputTime attribute (Gyr); infall
@@ -39,7 +40,8 @@ _FIELDS = ['nodeIndex', 'nodeIsIsolated', 'basicMass', 'satelliteBoundMass',
            'darkMatterProfileScale', 'darkMatterOnlyRadiusVirial',
            'basicTimeLastIsolated',
            'positionOrbitalX', 'positionOrbitalY', 'positionOrbitalZ',
-           'velocityOrbitalX', 'velocityOrbitalY', 'velocityOrbitalZ']
+           'velocityOrbitalX', 'velocityOrbitalY', 'velocityOrbitalZ',
+           'satellitePositionX', 'satellitePositionY', 'satellitePositionZ']
 
 
 class Galacticus:
@@ -77,8 +79,14 @@ class Galacticus:
         return None
 
     def node_track(self, nid, satellite_only=True):
-        """Time series for node nid: t[Gyr], z, m_bound, m_basic, r[kpc]."""
-        t, z, mb, mv, r = [], [], [], [], []
+        """Time series for node nid: t[Gyr], z, m_bound, m_basic, r[kpc], rvir_host[kpc].
+
+        r is the satellite-frame distance (satellitePosition), which stays continuous
+        across host-node switches -- positionOrbital re-references to the immediate host
+        and jumps when a progenitor merges up the tree (identical to positionOrbital for
+        clean infallers). rvir_host is the current host's virial radius, for r/r_vir.
+        """
+        t, z, mb, mv, r, rvh = [], [], [], [], [], []
         for si, (tt, zz) in enumerate(zip(self.t, self.z)):
             s = self.snaps[si]
             pos = np.where(s['nodeIndex'] == nid)[0]
@@ -90,11 +98,14 @@ class Galacticus:
             t.append(tt); z.append(zz)
             mb.append(float(s['satelliteBoundMass'][j]))
             mv.append(float(s['basicMass'][j]))
-            rr = np.sqrt(sum(float(s['positionOrbital%s' % a][j])**2 for a in 'XYZ'))
+            rr = np.sqrt(sum(float(s['satellitePosition%s' % a][j])**2 for a in 'XYZ'))
             r.append(rr * 1e3)
+            iso = s['nodeIsIsolated']
+            hi = int(np.argmax(np.where(iso == 1, s['basicMass'], -1.)))
+            rvh.append(float(s['darkMatterOnlyRadiusVirial'][hi]) * 1e3)
         o = np.argsort(t)  # ascending time
         return {k: np.asarray(v)[o] for k, v in
-                dict(t=t, z=z, m_bound=mb, m_basic=mv, r=r).items()}
+                dict(t=t, z=z, m_bound=mb, m_basic=mv, r=r, rvir_host=rvh).items()}
 
 
 def _nfw_from_data(Mvir, rs, rvir, z):
@@ -146,46 +157,30 @@ def infall_ics(G, nid):
                 xv0=xv0, r0=float(np.hypot(R, zc)), rvir_host=host.rh)
 
 
-def _nstep_for(host, xv0, tmax, dt_target=0.0015, peri_safety=0.3):
-    """Steps so the King62 rate is resolved (dt ~ dt_target Gyr, matching the
-    DASH-validation runs) while staying under the stability ceiling
-    dt < peri_safety * t_dyn at the orbit's pericentre."""
-    from orbit import orbit
-    from profiles import tdyn
-    o = orbit(xv0.copy())
-    ts = np.linspace(0., min(tmax, 6.), 4000)
-    o.integrate(ts, host)
-    r = np.sqrt(o.xvArray[:, 0]**2 + o.xvArray[:, 2]**2)
-    rmin = max(float(r.min()), cfg.Rres)
-    dt = min(dt_target, peri_safety * tdyn(host, rmin))
-    return int(np.ceil(tmax / dt))
-
-
-def run_node(G, nid, params, nstep=None, nstep_cap=120000, n_snapshots=40):
+def run_node(G, nid, params, n_snapshots=40, step_frac=0.01):
     """Evolve node nid under green + hard-truncation; return the two
     EvolutionResults, the Galacticus reference track, and the ICs.
 
     params: hard-truncation heating params (eps_h, gamma_h, alpha_s, beta_h, f_2)
-    of the joint Du+24 + DASH hard_yc0 calibration (truncation='hard',
-    lt='Tormen98').
+    for the second-order shell heating with a hard tidal-radius truncation
+    (lt='Tormen98'). Both engines are step_frac-adaptive; dynamical friction is on
+    so the orbit is comparable to Galacticus'.
     """
     ic = infall_ics(G, nid)
     host, xv0, tmax = ic['host'], ic['xv0'], ic['tmax']
-    if nstep is None:
-        nstep = min(_nstep_for(host, xv0, tmax), nstep_cap)
 
     green = sc.evolve_satgen_green(
-        host, ic['Mvir'], ic['c_sub'], xv0, tmax=tmax,
+        host, ic['Mvir'], ic['c_sub'], xv0, tmax=tmax, step_frac=step_frac,
         alpha='conc', n_snapshots=n_snapshots, label='SatGen Green/DASH')
 
     rvals = np.logspace(np.log10(cfg.Rres), np.log10(ic['sub'].rh), 200)
-    hard = sc.evolve_heating(
+    hard = sc.evolve_heating_revirial(
         host, NumericProfile(rvals, ic['sub'].M(rvals)), xv0,
-        tmax=tmax, Nstep=nstep, truncation='hard', second_order=True,
+        tmax=tmax, step_frac=step_frac, truncation='hard', second_order=True,
         t_dyn_mode='sub_lt', chi_v=CHI_V, lt_choice='Tormen98',
         epsh=params['eps_h'], gamma=params['gamma_h'], alpha=params['alpha_s'],
         beta_h=params['beta_h'], f2=params['f_2'], early_terminate=True,
-        n_snapshots=n_snapshots, label='SatGen Du+24 hard (yc0)')
+        label='SatGen Du+24 hard')
 
     gal = G.node_track(nid)
     gal['t_rel'] = gal['t'] - ic['t_infall']
@@ -202,9 +197,12 @@ def run_node(G, nid, params, nstep=None, nstep_cap=120000, n_snapshots=40):
     # infall)
     gal['t_orb'] = np.concatenate([[0.], gal['t_rel']])
     gal['r_orb'] = np.concatenate([[ic['r0']], gal['r']])
+    # host virial radius along the orbit (anchored at the infall-host rvir), for the
+    # r/r_vir panel: it grows z_inf -> 0, mostly virial pseudo-evolution (rho_crit drop)
+    gal['rvir_orb'] = np.concatenate([[ic['rvir_host']], gal['rvir_host']])
     # Galacticus' own bound-mass -> (rmax,vmax) map (Penarrubia2010 tidal track)
     gal['track_R'], gal['track_V'] = penarrubia2010_track(gal['m_anchor'])
-    return dict(nid=nid, ic=ic, green=green, hard=hard, gal=gal, nstep=nstep)
+    return dict(nid=nid, ic=ic, green=green, hard=hard, gal=gal)
 
 
 def du24_nfw_track(x, mu_V=0.6175, eta_V=0.2895, mu_R=0.5529, eta_R=0.4675):
@@ -247,9 +245,9 @@ def penarrubia2010_track(x, mu_V=0.40, eta_V=0.30, mu_R=-0.30, eta_R=0.40):
     NFW-on-NFW N-body.
 
     NB: this dataset does NOT enable that profile -- it uses a plain (frozen) NFW
-    with the bound mass evolved only as a decoupled scalar (van den Bosch+05 rate).
-    So this is how Galacticus *would* place its bound-mass history on the track,
-    not structure it actually output here."""
+    with the bound mass evolved only as a decoupled scalar (King62/Zentner+2005 tidal
+    stripping). So this is how Galacticus *would* place its bound-mass history on the
+    track, not structure it actually output here."""
     V = 2.0**mu_V * x**eta_V / (1.0 + x)**mu_V
     R = 2.0**mu_R * x**eta_R / (1.0 + x)**mu_R
     return R, V
