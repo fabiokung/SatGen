@@ -80,6 +80,10 @@ class EvolutionResult:
     rmax0: float = 0.
     vmax0: float = 0.
     label: str = ''
+    # per-step 6D orbital state, cylindrical [R, phi, z, VR, Vphi, Vz] (kpc, rad,
+    # kpc/Gyr), shape (nsteps, 6), aligned to t/r/m. Recorded by
+    # evolve_heating_revirial; None for evolvers that don't track it.
+    xv: Optional[np.ndarray] = None
     # revirial engine: True where the step re-virialized the profile (once per
     # apocenter), so m/vmax/rmax there are the post-reshape equilibrium; carried
     # (stale) on the False steps in between. None for other evolvers.
@@ -1034,7 +1038,7 @@ def evolve_heating_revirial(host, numProfile0, xv0, tmax=10.,
     r_p1 = r_p2 = None  # apocenter detector (r local max)
     omega_p = ref.omega_p
 
-    t_list, r_list, m_list = [], [], []
+    t_list, r_list, m_list, xv_list = [], [], [], []
     vmax_list, rmax_list, lt_list = [], [], []
     apo_list = []                                # True where the step re-virialized (apocenter)
     clamp_list, cw_list, cwr_list = [], [], []   # revir reshape: shells, worst %, worst r
@@ -1123,12 +1127,13 @@ def evolve_heating_revirial(host, numProfile0, xv0, tmax=10.,
 
         t += dt
         r = r_new
+        xv_step = xv.copy()  # full 6D cylindrical state at the accepted step
         r_apo_ref = max(r_apo_ref, r_new)
         Q, tt_int, hr_prev = Q_trial, tt_int_trial, tidalHR
 
         if disrupted:
             m = cfg.Mres
-            t_list.append(t); r_list.append(r_new); m_list.append(m)
+            t_list.append(t); r_list.append(r_new); m_list.append(m); xv_list.append(xv_step)
             vmax_list.append(cur_vmax); rmax_list.append(cur_rmax); lt_list.append(lt)
             apo_list.append(False)
             clamp_list.append(np.nan); cw_list.append(np.nan); cwr_list.append(np.nan)
@@ -1144,7 +1149,7 @@ def evolve_heating_revirial(host, numProfile0, xv0, tmax=10.,
         if r_stop is not None and r_new < r_stop:
             # parked at the decay/stall radius: record the terminal state (bound
             # mass preserved, not floored) and stop before plunging to the cusp.
-            t_list.append(t); r_list.append(r_new); m_list.append(m)
+            t_list.append(t); r_list.append(r_new); m_list.append(m); xv_list.append(xv_step)
             vmax_list.append(cur_vmax); rmax_list.append(cur_rmax)
             lt_list.append(lt); apo_list.append(False)
             clamp_list.append(np.nan); cw_list.append(np.nan); cwr_list.append(np.nan)
@@ -1191,7 +1196,7 @@ def evolve_heating_revirial(host, numProfile0, xv0, tmax=10.,
             t_last_revir = t
 
         # Vmax/rmax step-update at re-virialization; carry between (aligned to t).
-        t_list.append(t); r_list.append(r_new); m_list.append(m)
+        t_list.append(t); r_list.append(r_new); m_list.append(m); xv_list.append(xv_step)
         vmax_list.append(cur_vmax); rmax_list.append(cur_rmax); lt_list.append(lt)
         apo_list.append(did_revir)
         clamp_list.append(step_clamp[0]); cw_list.append(step_clamp[1])
@@ -1243,6 +1248,7 @@ def evolve_heating_revirial(host, numProfile0, xv0, tmax=10.,
         r_grid=r_grid, rho_snapshots=rho_grid,
         M_snapshots=M_grid, snapshot_steps=snap_steps,
         rmax0=rmax0, vmax0=vmax0, label=label,
+        xv=np.asarray(xv_list).reshape(-1, 6),
         apo=np.asarray(apo_list, dtype=bool),
         clamp=np.asarray(clamp_list), clamp_total=np.asarray(ct_list),
         clamp_worst=np.asarray(cw_list), clamp_worst_r=np.asarray(cwr_list),
