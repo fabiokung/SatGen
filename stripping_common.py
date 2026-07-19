@@ -35,7 +35,13 @@ class PericentreUnresolvedError(OverstripError):
     pericentre cannot be resolved within the step budget -- the orbit is out of
     the resolvable regime. Subclasses OverstripError so an `except OverstripError`
     handler catches both; the distinct type separates an unresolvable orbit from
-    the coarse-dt OverstripError."""
+    the coarse-dt OverstripError.
+
+    dens_hist/t_last carry the residence histogram accumulated up to the raise (and
+    the last accepted step time), so a caller can keep the pre-disruption residence
+    instead of discarding it. Default None/0 when no residence grid was requested."""
+    dens_hist: Optional[np.ndarray] = None
+    t_last: float = 0.
 
 
 # Ceiling on the per-step stripping number cfl = alpha*dt/T_strip. The name is by
@@ -107,6 +113,28 @@ class EvolutionResult:
     expand_clamp_total: Optional[np.ndarray] = None
     expand_clamp_worst: Optional[np.ndarray] = None
     expand_clamp_worst_r: Optional[np.ndarray] = None
+    # dt-weighted bound-mass residence histogram on the caller's (radial, time)
+    # grid: dens_hist[i, j] = sum over accepted steps in time bin j with orbital
+    # radius in radial bin i of m_bound * dt [Msun Gyr]. The exact time-averaged
+    # clump mass density is sum_j dens_hist[:, j] / (dt_j * shell_volume), with
+    # pericentre passages resolved at the integrator's native cadence (no snapshot
+    # under-sampling). The first/last radial bins are catch-alls (residence inside
+    # redges[0] / beyond redges[-1]), so the total conserves int m dt. Present only
+    # when dens_redges/dens_tedges are passed. The post-parking tail (a parked clump
+    # held at r_stop) is the caller's to add.
+    dens_hist: Optional[np.ndarray] = None
+
+
+def _dens_accumulate(hist, redges, tedges, r, m, tmid, dt):
+    """Add m*dt into the (radial, time) residence histogram: radial bin holding
+    orbital radius r, time bin holding the step midpoint tmid. Both indices are
+    clamped to the grid, so the first/last radial bins are catch-alls for residence
+    inside redges[0] / beyond redges[-1] -- nothing is dropped, total residence
+    equals the integral of m dt (the end bins' shell volume is fictional, so the
+    density reconstruction ignores them)."""
+    i = min(max(int(np.searchsorted(redges, r)) - 1, 0), hist.shape[0] - 1)
+    j = min(max(int(np.searchsorted(tedges, tmid)) - 1, 0), hist.shape[1] - 1)
+    hist[i, j] += m * dt
 
 
 def make_orbit(host, R0=1., z0=0., phi0=0., VR0=0., Vz0=0., eta=1.):
@@ -980,7 +1008,8 @@ def evolve_heating_revirial(host, numProfile0, xv0, tmax=10.,
                             t_dyn_mode='sub_lt', truncation='hard',
                             tail_n=5., tail_xi=0., lt_choice='King62',
                             label=None, early_terminate=False,
-                            dynamical_friction=True, r_stop=None):
+                            dynamical_friction=True, r_stop=None,
+                            dens_redges=None, dens_tedges=None):
     """Re-virialization-cadence forward model (Pullen+14/Du+24, impulse).
 
     Heating and stripping run on their physical cadences:
@@ -1052,10 +1081,22 @@ def evolve_heating_revirial(host, numProfile0, xv0, tmax=10.,
     nstep = 0
     t = 0.
 
+    # dt-weighted residence histogram (optional): caller supplies the radial and
+    # time bin edges, so the grid is chosen for the ensemble's orbits, not fixed here.
+    dens_on = dens_redges is not None and dens_tedges is not None
+    if dens_on:
+        dens_redges = np.asarray(dens_redges, float)
+        dens_tedges = np.asarray(dens_tedges, float)
+        dens_hist = np.zeros((len(dens_redges) - 1, len(dens_tedges) - 1))
+    else:
+        dens_hist = None
+
     while t < tmax - dt_abs:
         if nstep >= max_steps:
-            raise PericentreUnresolvedError(
+            err = PericentreUnresolvedError(
                 f"exceeded max_steps={max_steps} at t={t:.3f}/{tmax} Gyr")
+            err.dens_hist, err.t_last = dens_hist, t
+            raise err
 
         t_orb = tdyn(potential, r)
         dt_min = max(dt_abs, floor_orbit_frac * t_orb)
@@ -1120,9 +1161,11 @@ def evolve_heating_revirial(host, numProfile0, xv0, tmax=10.,
                 dt = max(0.5 * dt, dt_min)
                 continue
             if strip_number > strip_number_max:
-                raise PericentreUnresolvedError(
+                err = PericentreUnresolvedError(
                     f"strip number={strip_number:.1f} > {strip_number_max} at "
                     f"dt_min={dt_min:.2e} Gyr, t={t:.3f} Gyr; unresolvable")
+                err.dens_hist, err.t_last = dens_hist, t
+                raise err
             break
 
         t += dt
@@ -1130,6 +1173,11 @@ def evolve_heating_revirial(host, numProfile0, xv0, tmax=10.,
         xv_step = xv.copy()  # full 6D cylindrical state at the accepted step
         r_apo_ref = max(r_apo_ref, r_new)
         Q, tt_int, hr_prev = Q_trial, tt_int_trial, tidalHR
+        # residence: m is the mass carried through this step (King62 strips below);
+        # deposit it at the accepted orbital radius, all step outcomes included.
+        if dens_on:
+            _dens_accumulate(dens_hist, dens_redges, dens_tedges, r_new, m,
+                             t - 0.5 * dt, dt)
 
         if disrupted:
             m = cfg.Mres
@@ -1255,6 +1303,7 @@ def evolve_heating_revirial(host, numProfile0, xv0, tmax=10.,
         expand_clamp=np.asarray(ec_list), expand_clamp_total=np.asarray(ect_list),
         expand_clamp_worst=np.asarray(ecw_list),
         expand_clamp_worst_r=np.asarray(ecwr_list),
+        dens_hist=dens_hist,
     )
 
 

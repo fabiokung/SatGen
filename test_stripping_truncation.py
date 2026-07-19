@@ -61,6 +61,39 @@ def _run(setup, truncation, second_order=False, engine='uniform'):
 # per-apocenter heating of the revirialization scheme strips a dense core somewhat
 # less deeply than the uniform grid, so a shared ratio bound is looser than either
 # engine alone (dt-robustness is pinned per-engine in the dedicated tests below).
+def test_dens_hist_conserves_residence_and_localizes(du24_setup):
+    """The dt-weighted residence histogram matches the bound-mass time integral,
+    sits only at radii the track visits, and doesn't perturb the evolution."""
+    hNFW, rvals, M_sub, xv0_20 = du24_setup
+    sub = NumericProfile(rvals, M_sub)
+    redges = np.logspace(-4, np.log10(500.), 60)
+    tedges = np.linspace(0., 12., 6)                     # 5 time chunks
+    res = sc.evolve_heating_revirial(
+        hNFW, sub, xv0_20, tmax=12., step_frac=0.02, epsh=0.0741, gamma=0.,
+        beta_h=0.278, alpha=3.93, t_dyn_mode='sub_lt', truncation='hard',
+        dens_redges=redges, dens_tedges=tedges)
+    bare = sc.evolve_heating_revirial(
+        hNFW, NumericProfile(rvals, M_sub), xv0_20, tmax=12., step_frac=0.02,
+        epsh=0.0741, gamma=0., beta_h=0.278, alpha=3.93, t_dyn_mode='sub_lt',
+        truncation='hard')
+
+    H = res.dens_hist
+    assert H is not None and H.shape == (len(redges) - 1, len(tedges) - 1)
+    assert (H >= 0.).all()
+    # the accumulator must not change the evolution
+    assert np.array_equal(res.t, bare.t) and np.array_equal(res.m, bare.m)
+    assert np.array_equal(res.r, bare.r)
+    # total residence = int m dt over the run (pre-strip m per fine step); compare
+    # to the trapezoid of the recorded bound-mass track (from t=0, m=Mh)
+    t_ref = np.concatenate([[0.], res.t])
+    m_ref = np.concatenate([[float(sub.Mh)], res.m])
+    assert H.sum() == pytest.approx(np.trapezoid(m_ref, t_ref), rel=0.05)
+    # every occupied radial bin is one the recorded orbit actually passed through
+    visited = np.zeros(len(redges) - 1, bool)
+    visited[np.clip(np.searchsorted(redges, res.r) - 1, 0, len(redges) - 2)] = True
+    assert np.all(~(H.sum(1) > 0) | visited)
+
+
 @pytest.mark.parametrize('engine', ['uniform', 'revirial'])
 def test_hard_cut_survives_on_radial_orbit(du24_setup, engine):
     """A dense NFW subhalo on the radial orbit strips to a bound remnant, not to the
