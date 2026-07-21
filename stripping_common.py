@@ -1,6 +1,7 @@
 # shared evolution routines and plots for tidal stripping notebooks
 
 import os
+import time
 from dataclasses import dataclass
 from typing import Optional
 
@@ -40,10 +41,15 @@ class PericentreUnresolvedError(OverstripError):
     dens_hist/t_last/r_last carry the residence histogram accumulated up to the raise
     (and the last accepted step time and orbital radius), so a caller can keep the
     pre-disruption residence and hold the orbit at where it stalled instead of discarding
-    it. Default None/0 when no residence grid was requested."""
+    it. r_lo/r_hi are the min/max orbital radius over the circuit breaker's recent
+    not-stripping streak -- the settled orbit's radial span -- so an analysis can
+    reconstruct a max_steps orbit's stable pericentre..apocentre range and backfill the
+    residence bins it did not reach. Default None/0 when unset."""
     dens_hist: Optional[np.ndarray] = None
     t_last: float = 0.
     r_last: float = 0.
+    r_lo: float = 0.
+    r_hi: float = 0.
 
 
 # Ceiling on the per-step stripping number cfl = alpha*dt/T_strip. The name is by
@@ -125,6 +131,13 @@ class EvolutionResult:
     # when dens_redges/dens_tedges are passed. The post-parking tail (a parked clump
     # held at r_stop) is the caller's to add.
     dens_hist: Optional[np.ndarray] = None
+    # True when the circuit breaker stopped the run early: the orbit was tight (small
+    # t_dyn) and the bound mass had stopped changing for freeze_orbits consecutive orbits,
+    # so continuing would spend many steps re-deriving the same settled, non-stripping
+    # state. The final (t, r, m, profile) is that settled state; the caller holds it for
+    # the remaining time. Lets callers tell a circuit-breaker freeze apart from a run that
+    # completed at tmax or disrupted. Only the revirial engine sets it.
+    frozen: bool = False
 
 
 def _dens_accumulate(hist, redges, tedges, r, m, tmid, dt):
@@ -1011,7 +1024,10 @@ def evolve_heating_revirial(host, numProfile0, xv0, tmax=10.,
                             tail_n=5., tail_xi=0., lt_choice='King62',
                             label=None, early_terminate=False,
                             dynamical_friction=True, r_stop=None,
-                            dens_redges=None, dens_tedges=None):
+                            dens_redges=None, dens_tedges=None,
+                            freeze_strip=None, freeze_orbits=20,
+                            freeze_tdyn=None, freeze_walltime=None,
+                            freeze_rspan=0.5, log_every=None):
     """Re-virialization-cadence forward model (Pullen+14/Du+24, impulse).
 
     Heating and stripping run on their physical cadences:
@@ -1044,6 +1060,29 @@ def evolve_heating_revirial(host, numProfile0, xv0, tmax=10.,
     truncation selects the apocenter reshape ('hard', 'kazantzidis', 'powerlaw');
     see evolve_heating for the shared per-step physics (heat_profile, _cumulant_step,
     the King62 rate, the truncation tails).
+
+    Circuit breaker (off unless freeze_strip is set): a clump that has settled onto a tight
+    orbit and stopped stripping keeps re-deriving the same state for hundreds of orbits at
+    small dt -- expensive, no new physics. The bound-mass check runs once per
+    re-virialization (~once per orbit): freeze_orbits *consecutive* re-virializations must
+    each shed less than freeze_strip of the mass (any orbit that sheds more resets the
+    count). The orbital radius must ALSO stay settled -- its min/max over the streak within
+    a freeze_rspan fractional band -- which excludes both a still-decaying orbit and a
+    radial one whose deep pericentre passages still deposit real central residence (those
+    keep being integrated even with DF off and no stripping there). Once the streak is met,
+    the radius is settled, AND the orbit is tight (outer-radius t_dyn below freeze_tdyn) OR
+    the wall-clock elapsed since this call began exceeds freeze_walltime seconds, the run
+    stops with res.frozen=True at that settled state. The wall-clock is a
+    hardware-robust backstop for expensive orbits the t_dyn test misses; it times the whole
+    call (not just the settled phase) but only trips together with the mass streak, so it
+    never fires on a still-stripping clump. Because the frozen state is static, *when* it
+    freezes barely changes it; the caller holds it for the remaining time. Off by default
+    (freeze_strip=None), so existing callers -- and any DF-free run, whose orbits never
+    settle -- are unaffected.
+
+    log_every (seconds, off by default) prints a periodic heartbeat of the orbital state
+    (t, r, m, nstep, wall) so a run that stalls on a tight orbit can be diagnosed from the
+    log after the fact.
     """
     if label is None:
         label = ('1st+2nd order heating (revirial)' if second_order
@@ -1083,6 +1122,17 @@ def evolve_heating_revirial(host, numProfile0, xv0, tmax=10.,
     nstep = 0
     t = 0.
 
+    # circuit breaker: freeze a tight, no-longer-stripping orbit. cb_streak counts
+    # consecutive re-virializations (~orbits) whose fractional mass loss stayed below
+    # freeze_strip; when it reaches freeze_orbits and the orbit is tight (t_dyn at the
+    # apocenter below freeze_tdyn) or the wall-clock budget is spent, the loop breaks and
+    # the settled state is returned frozen. Off unless freeze_strip is set.
+    cb_on = freeze_strip is not None
+    cb_streak, cb_m_ref = 0, None
+    r_lo = r_hi = r        # min / max orbital radius over the current not-stripping streak
+    frozen = False
+    t_wall0 = t_log = time.time()   # call start; last heartbeat
+
     # dt-weighted residence histogram (optional): caller supplies the radial and
     # time bin edges, so the grid is chosen for the ensemble's orbits, not fixed here.
     dens_on = dens_redges is not None and dens_tedges is not None
@@ -1098,7 +1148,19 @@ def evolve_heating_revirial(host, numProfile0, xv0, tmax=10.,
             err = PericentreUnresolvedError(
                 f"exceeded max_steps={max_steps} at t={t:.3f}/{tmax} Gyr")
             err.dens_hist, err.t_last, err.r_last = dens_hist, t, r
+            err.r_lo, err.r_hi = r_lo, r_hi          # settled span, for residence backfill
             raise err
+
+        # periodic heartbeat (off unless log_every set): a breadcrumb of the orbital state
+        # so a run that stalls -- grinding a tight orbit -- can be diagnosed from the log
+        # after the fact. Checked ~every 1000 steps to keep time() off the hot path.
+        if log_every is not None and (nstep & 1023) == 0:
+            now = time.time()
+            if now - t_log >= log_every:
+                print(f"[evolve_heating_revirial] {label}: t={t:.3f}/{tmax:.1f} Gyr "
+                      f"r={r:.4g} kpc m={m:.4g} nstep={nstep} wall={now - t_wall0:.0f}s",
+                      flush=True)
+                t_log = now
 
         t_orb = tdyn(potential, r)
         dt_min = max(dt_abs, floor_orbit_frac * t_orb)
@@ -1174,6 +1236,8 @@ def evolve_heating_revirial(host, numProfile0, xv0, tmax=10.,
         r = r_new
         xv_step = xv.copy()  # full 6D cylindrical state at the accepted step
         r_apo_ref = max(r_apo_ref, r_new)
+        if cb_on:
+            r_lo, r_hi = min(r_lo, r_new), max(r_hi, r_new)   # radial span over the streak
         Q, tt_int, hr_prev = Q_trial, tt_int_trial, tidalHR
         # residence: m is the mass carried through this step (King62 strips below);
         # deposit it at the accepted orbital radius, all step outcomes included.
@@ -1244,6 +1308,29 @@ def evolve_heating_revirial(host, numProfile0, xv0, tmax=10.,
             cur_vmax, cur_rmax = ref.Vmax, ref.rmax
             Q, tt_int, hr_prev, lt_min = 0., np.zeros((3, 3)), None, np.inf
             t_last_revir = t
+            if cb_on:
+                # freeze only a genuinely settled clump. Count consecutive orbits that shed
+                # less than freeze_strip of their bound mass; a stripping orbit resets the
+                # streak. Not-stripping is not enough: the orbit radius must also stay within
+                # a freeze_rspan fractional band (min/max over the streak). That rejects a
+                # still-decaying orbit (span across orbits) and -- the case that matters -- a
+                # radial orbit whose deep pericentre passages sample small radii (span within
+                # an orbit): those rare passages are real central residence and must keep being
+                # integrated even though DF is off there (clamped log) and no mass strips.
+                # Freeze when the streak is long, the radius settled, and the orbit is tight
+                # (t_dyn at the outer radius below freeze_tdyn) or the wall-clock budget spent.
+                loss = 0. if cb_m_ref is None else (cb_m_ref - m) / cb_m_ref
+                if loss < freeze_strip:
+                    cb_streak += 1
+                else:
+                    cb_streak, r_lo, r_hi = 0, r_new, r_new       # reset streak + radial span
+                cb_m_ref = m
+                settled = (r_hi - r_lo) <= freeze_rspan * r_hi
+                tight = freeze_tdyn is not None and tdyn(potential, r_hi) < freeze_tdyn
+                slow = (freeze_walltime is not None
+                        and time.time() - t_wall0 > freeze_walltime)
+                if cb_streak >= freeze_orbits and settled and (tight or slow):
+                    frozen = True
 
         # Vmax/rmax step-update at re-virialization; carry between (aligned to t).
         t_list.append(t); r_list.append(r_new); m_list.append(m); xv_list.append(xv_step)
@@ -1260,6 +1347,8 @@ def evolve_heating_revirial(host, numProfile0, xv0, tmax=10.,
         dt_prev = dt
         nstep += 1
         if early_terminate and m <= cfg.Mres:
+            break
+        if frozen:            # circuit breaker: settled + no longer stripping
             break
 
     # Flush heating accumulated since the last apocenter into a final
@@ -1306,6 +1395,7 @@ def evolve_heating_revirial(host, numProfile0, xv0, tmax=10.,
         expand_clamp_worst=np.asarray(ecw_list),
         expand_clamp_worst_r=np.asarray(ecwr_list),
         dens_hist=dens_hist,
+        frozen=frozen,
     )
 
 

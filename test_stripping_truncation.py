@@ -307,6 +307,83 @@ def test_r_stop_parks_and_early_terminates(du24_setup):
     assert not np.isfinite(res.r[fin.sum()])   # slots past the break stay NaN
 
 
+def _cb_run(du24_setup, **cb):
+    """One revirialization evolution on the du24 radial orbit with circuit-breaker kwargs.
+    The lenient-floor tests pass freeze_strip near 1 so ordinary stripping never resets the
+    streak, isolating the freeze mechanism from the (separate) not-stripping condition. This
+    orbit is radial, so freeze_rspan defaults to 1.0 here -- disabling the settled-radius gate
+    so the other criteria can be tested in isolation; the radial-span gate has its own test."""
+    hNFW, rvals, M_sub, xv0_20 = du24_setup
+    cb.setdefault('freeze_rspan', 1.0)
+    return sc.evolve_heating_revirial(
+        hNFW, NumericProfile(rvals, M_sub), xv0_20, tmax=12., step_frac=0.02,
+        epsh=0.0741, gamma=0., beta_h=0.278, alpha=3.93, t_dyn_mode='sub_lt',
+        truncation='hard', **cb)
+
+
+def test_circuit_breaker_radial_orbit_not_frozen(du24_setup):
+    """A radial orbit (deep pericentre passages) must NOT freeze even with the mass stable and
+    the orbit tight: its wide min/max radial span fails the settled test, so it keeps
+    integrating to register the rare central passages. Only a permissive freeze_rspan (>= its
+    span) lets it freeze."""
+    radial = _cb_run(du24_setup, freeze_strip=0.99, freeze_orbits=2, freeze_tdyn=1e9,
+                     freeze_rspan=0.3)
+    assert radial.frozen is False
+    loose_span = _cb_run(du24_setup, freeze_strip=0.99, freeze_orbits=2, freeze_tdyn=1e9,
+                         freeze_rspan=1.0)
+    assert loose_span.frozen is True
+
+
+def test_circuit_breaker_off_by_default(du24_setup):
+    """Without freeze_strip the run is never frozen -- existing behaviour unchanged."""
+    assert _cb_run(du24_setup).frozen is False
+
+
+def test_circuit_breaker_freezes_settled_orbit(du24_setup):
+    """A lenient strip floor never resets the streak, and a large freeze_tdyn makes every
+    orbit count as tight, so the breaker fires after freeze_orbits re-virializations and
+    stops the run well before tmax."""
+    full = _cb_run(du24_setup)
+    frz = _cb_run(du24_setup, freeze_strip=0.99, freeze_orbits=2, freeze_tdyn=1e9)
+    assert frz.frozen is True
+    assert frz.t[-1] < full.t[-1]                       # stopped early
+    assert len(frz.t) < len(full.t)                     # fewer steps
+    assert int(np.count_nonzero(frz.apo)) >= 2          # froze after >= freeze_orbits revirs
+
+
+def test_circuit_breaker_strip_resets_streak(du24_setup):
+    """A strict strip floor on a stripping orbit keeps resetting the streak, so the run
+    evolves far longer than the lenient floor that freezes at freeze_orbits."""
+    lenient = _cb_run(du24_setup, freeze_strip=0.99, freeze_orbits=2, freeze_tdyn=1e9)
+    strict = _cb_run(du24_setup, freeze_strip=1e-9, freeze_orbits=2, freeze_tdyn=1e9)
+    assert lenient.frozen is True
+    assert strict.t[-1] > lenient.t[-1]
+
+
+def test_circuit_breaker_tight_gate(du24_setup):
+    """The mass streak alone does not freeze -- the orbit must be tight (apocenter t_dyn <
+    freeze_tdyn). A tiny freeze_tdyn (never tight, no wall-clock backstop) does not freeze;
+    a large one does."""
+    loose = _cb_run(du24_setup, freeze_strip=0.99, freeze_orbits=2, freeze_tdyn=1e-9)
+    tight = _cb_run(du24_setup, freeze_strip=0.99, freeze_orbits=2, freeze_tdyn=1e9)
+    assert loose.frozen is False
+    assert tight.frozen is True
+
+
+def test_circuit_breaker_walltime_backstop(du24_setup):
+    """With no tight test, the wall-clock backstop still freezes once the mass streak is
+    met: any elapsed time exceeds a zero-second budget."""
+    res = _cb_run(du24_setup, freeze_strip=0.99, freeze_orbits=2,
+                  freeze_tdyn=None, freeze_walltime=0.)
+    assert res.frozen is True
+
+
+def test_circuit_breaker_needs_freeze_orbits(du24_setup):
+    """Requiring more consecutive settled orbits than the run completes never freezes."""
+    res = _cb_run(du24_setup, freeze_strip=0.99, freeze_orbits=100000, freeze_tdyn=1e9)
+    assert res.frozen is False
+
+
 def test_dynamical_friction_disabled_by_none():
     """orbit.integrate with m omitted (None) disables dynamical friction: a
     heavy satellite on a circular orbit holds its radius, while the same orbit
