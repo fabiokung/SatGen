@@ -37,11 +37,13 @@ class PericentreUnresolvedError(OverstripError):
     handler catches both; the distinct type separates an unresolvable orbit from
     the coarse-dt OverstripError.
 
-    dens_hist/t_last carry the residence histogram accumulated up to the raise (and
-    the last accepted step time), so a caller can keep the pre-disruption residence
-    instead of discarding it. Default None/0 when no residence grid was requested."""
+    dens_hist/t_last/r_last carry the residence histogram accumulated up to the raise
+    (and the last accepted step time and orbital radius), so a caller can keep the
+    pre-disruption residence and hold the orbit at where it stalled instead of discarding
+    it. Default None/0 when no residence grid was requested."""
     dens_hist: Optional[np.ndarray] = None
     t_last: float = 0.
+    r_last: float = 0.
 
 
 # Ceiling on the per-step stripping number cfl = alpha*dt/T_strip. The name is by
@@ -1095,7 +1097,7 @@ def evolve_heating_revirial(host, numProfile0, xv0, tmax=10.,
         if nstep >= max_steps:
             err = PericentreUnresolvedError(
                 f"exceeded max_steps={max_steps} at t={t:.3f}/{tmax} Gyr")
-            err.dens_hist, err.t_last = dens_hist, t
+            err.dens_hist, err.t_last, err.r_last = dens_hist, t, r
             raise err
 
         t_orb = tdyn(potential, r)
@@ -1164,7 +1166,7 @@ def evolve_heating_revirial(host, numProfile0, xv0, tmax=10.,
                 err = PericentreUnresolvedError(
                     f"strip number={strip_number:.1f} > {strip_number_max} at "
                     f"dt_min={dt_min:.2e} Gyr, t={t:.3f} Gyr; unresolvable")
-                err.dens_hist, err.t_last = dens_hist, t
+                err.dens_hist, err.t_last, err.r_last = dens_hist, t, r
                 raise err
             break
 

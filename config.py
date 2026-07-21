@@ -62,7 +62,9 @@ Rres = 0.001 # [kpc] spatial resolution (Over-written in SubEvo)
 lnL_pref = 0.75 # multiplier for Coulomb logarithm (fiducial 0.75)
 # NOTE: The lnL_pref default is 0.75, calibrated in Green+20
 # A typical default would be lnL_pref = 1.0
-lnL_type = 0 # indicates using log(Mh/Ms) (instantaneous)
+lnL_type = 0 # 0: log(Mh/Ms) [host total mass, constant in r]; 5: log(M_host(<r)/m)
+# [local Chandrasekhar, reverses below the stall]; 6: max(log(M_host(<r)/m), 0)
+# [local, clamped at the stall so DF vanishes rather than reversing]
 evo_mode = 'arbres' # or 'withering'
 
 # NOTE: Some of the above parameters are used in TreeGen_Sub and SubEvo

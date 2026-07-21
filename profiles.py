@@ -3434,6 +3434,11 @@ def fDF(potential,xv,m):
                 lnL = 3.
             elif(cfg.lnL_type == 5):
                 lnL = np.log(p.M(R, z) / m)
+            elif(cfg.lnL_type == 6):
+                # local Coulomb log clamped at zero: DF vanishes (does not reverse
+                # into anti-friction) at the stall radius M_host(<r)=m, so the orbit
+                # self-limits there instead of being flung out below it.
+                lnL = max(np.log(p.M(R, z) / m), 0.)
             VrelR = VR
             Vrelphi = Vphi
             Vrelz = Vz
