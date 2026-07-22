@@ -2,7 +2,7 @@
 # other imports
 import warnings
 from functools import cached_property
-from typing import cast
+from typing import cast, Optional
 
 import numpy as np
 from scipy.integrate import quad
@@ -28,7 +28,19 @@ class HeatingUnbindsError(RuntimeError):
     """Tidal heating leaves <=2 bound shells -- the halo is destroyed in one
     step. A genuine boundary at extreme heating parameters, not a code bug;
     callers exploring parameter space (e.g. MCMC) catch it as an infeasible
-    point rather than crashing."""
+    point rather than crashing.
+
+    A re-virialization caller may attach the residence and terminal orbital
+    state before re-raising (dens_hist/t_last/r_last/m_last, r_lo/r_hi over the
+    circuit breaker's recent streak), so the evolution up to the unbinding is
+    not lost -- mirrors PericentreUnresolvedError. Default None/0 when unset."""
+    dens_hist: Optional[np.ndarray] = None
+    dens_hist_k: Optional[np.ndarray] = None
+    t_last: float = 0.
+    r_last: float = 0.
+    m_last: float = 0.
+    r_lo: float = 0.
+    r_hi: float = 0.
 
 
 # heat_profile clamps on most ODE steps (~30k/run), so the warning is silenced

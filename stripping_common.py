@@ -1324,8 +1324,18 @@ def evolve_heating_revirial(host, numProfile0, xv0, tmax=10.,
                      and Q > 0. and m > cfg.Mres)
         if did_revir:
             lt_join = lt_min if np.isfinite(lt_min) else lt
-            ref, m, tally = _revirialize(ref, Q, c2, m, lt_join,
-                                         truncation, tail_n, tail_xi)
+            try:
+                ref, m, tally = _revirialize(ref, Q, c2, m, lt_join,
+                                             truncation, tail_n, tail_xi)
+            except HeatingUnbindsError as err:
+                # the accumulated heating unbinds the profile at re-virialization. Carry the
+                # residence and terminal orbital state so a caller can record the evolution up
+                # to here and classify the outcome, as PericentreUnresolvedError does; the
+                # engine still raises (the profile has no tidal radius past this point).
+                err.dens_hist, err.t_last, err.r_last, err.m_last = dens_hist, t, r, m
+                err.dens_hist_k = dens_hist_k
+                err.r_lo, err.r_hi = r_lo, r_hi
+                raise
             step_clamp = (tally['shells'], tally['worst_pct'], tally['worst_r'])
             step_total = tally['total']
             r_ref, M_ref, sig2_ref = _reference_arrays(ref, c2)
