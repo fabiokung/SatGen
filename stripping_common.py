@@ -46,6 +46,7 @@ class PericentreUnresolvedError(OverstripError):
     reconstruct a max_steps orbit's stable pericentre..apocentre range and backfill the
     residence bins it did not reach. Default None/0 when unset."""
     dens_hist: Optional[np.ndarray] = None
+    dens_hist_k: Optional[np.ndarray] = None
     t_last: float = 0.
     r_last: float = 0.
     r_lo: float = 0.
@@ -131,6 +132,14 @@ class EvolutionResult:
     # when dens_redges/dens_tedges are passed. The post-parking tail (a parked clump
     # held at r_stop) is the caller's to add.
     dens_hist: Optional[np.ndarray] = None
+    # kernel-weighted companions to dens_hist, shape (n_kernels, n_rbin, n_tbin):
+    # dens_hist_k[k] accumulates w_k(r, v) * m * dt with v the orbital speed at the
+    # accepted step, for each caller-supplied kernel in dens_kernels. Lets the heating
+    # integral use the population average of the actual per-encounter rate (e.g.
+    # w = 1/sqrt(v^2 + sigma_*^2) for two-body heating ~ rho/v_rel) instead of
+    # assuming clumps at r move at the local isotropic dispersion -- deep plungers
+    # cross the stars well above it. Present only when dens_kernels is passed.
+    dens_hist_k: Optional[np.ndarray] = None
     # True when the circuit breaker stopped the run early: the orbit was tight (small
     # t_dyn) and the bound mass had stopped changing for freeze_orbits consecutive orbits,
     # so continuing would spend many steps re-deriving the same settled, non-stripping
@@ -140,16 +149,22 @@ class EvolutionResult:
     frozen: bool = False
 
 
-def _dens_accumulate(hist, redges, tedges, r, m, tmid, dt):
+def _dens_accumulate(hist, redges, tedges, r, m, tmid, dt,
+                     hist_k=None, kernels=None, v=None):
     """Add m*dt into the (radial, time) residence histogram: radial bin holding
     orbital radius r, time bin holding the step midpoint tmid. Both indices are
     clamped to the grid, so the first/last radial bins are catch-alls for residence
     inside redges[0] / beyond redges[-1] -- nothing is dropped, total residence
     equals the integral of m dt (the end bins' shell volume is fictional, so the
-    density reconstruction ignores them)."""
+    density reconstruction ignores them). When kernel histograms are passed,
+    hist_k[k] additionally accumulates kernels[k](r, v) * m * dt into the same bin
+    (v the orbital speed at the step)."""
     i = min(max(int(np.searchsorted(redges, r)) - 1, 0), hist.shape[0] - 1)
     j = min(max(int(np.searchsorted(tedges, tmid)) - 1, 0), hist.shape[1] - 1)
     hist[i, j] += m * dt
+    if hist_k is not None and kernels is not None:
+        for k, ker in enumerate(kernels):
+            hist_k[k, i, j] += ker(r, v) * m * dt
 
 
 def make_orbit(host, R0=1., z0=0., phi0=0., VR0=0., Vz0=0., eta=1.):
@@ -1024,7 +1039,7 @@ def evolve_heating_revirial(host, numProfile0, xv0, tmax=10.,
                             tail_n=5., tail_xi=0., lt_choice='King62',
                             label=None, early_terminate=False,
                             dynamical_friction=True, r_stop=None,
-                            dens_redges=None, dens_tedges=None,
+                            dens_redges=None, dens_tedges=None, dens_kernels=None,
                             freeze_strip=None, freeze_orbits=20,
                             freeze_tdyn=None, freeze_walltime=None,
                             freeze_rspan=0.5, log_every=None):
@@ -1135,19 +1150,25 @@ def evolve_heating_revirial(host, numProfile0, xv0, tmax=10.,
 
     # dt-weighted residence histogram (optional): caller supplies the radial and
     # time bin edges, so the grid is chosen for the ensemble's orbits, not fixed here.
+    # dens_kernels adds one kernel-weighted companion histogram per callable w(r, v)
+    # (see EvolutionResult.dens_hist_k); the stellar physics stays with the caller.
     dens_on = dens_redges is not None and dens_tedges is not None
     if dens_on:
         dens_redges = np.asarray(dens_redges, float)
         dens_tedges = np.asarray(dens_tedges, float)
         dens_hist = np.zeros((len(dens_redges) - 1, len(dens_tedges) - 1))
+        dens_hist_k = (np.zeros((len(dens_kernels),) + dens_hist.shape)
+                       if dens_kernels else None)
     else:
         dens_hist = None
+        dens_hist_k = None
 
     while t < tmax - dt_abs:
         if nstep >= max_steps:
             err = PericentreUnresolvedError(
                 f"exceeded max_steps={max_steps} at t={t:.3f}/{tmax} Gyr")
             err.dens_hist, err.t_last, err.r_last = dens_hist, t, r
+            err.dens_hist_k = dens_hist_k
             err.r_lo, err.r_hi = r_lo, r_hi          # settled span, for residence backfill
             raise err
 
@@ -1229,6 +1250,7 @@ def evolve_heating_revirial(host, numProfile0, xv0, tmax=10.,
                     f"strip number={strip_number:.1f} > {strip_number_max} at "
                     f"dt_min={dt_min:.2e} Gyr, t={t:.3f} Gyr; unresolvable")
                 err.dens_hist, err.t_last, err.r_last = dens_hist, t, r
+                err.dens_hist_k = dens_hist_k
                 raise err
             break
 
@@ -1242,8 +1264,11 @@ def evolve_heating_revirial(host, numProfile0, xv0, tmax=10.,
         # residence: m is the mass carried through this step (King62 strips below);
         # deposit it at the accepted orbital radius, all step outcomes included.
         if dens_on:
+            v_step = (np.sqrt(xv_step[3]**2 + xv_step[4]**2 + xv_step[5]**2)
+                      if dens_hist_k is not None else None)
             _dens_accumulate(dens_hist, dens_redges, dens_tedges, r_new, m,
-                             t - 0.5 * dt, dt)
+                             t - 0.5 * dt, dt,
+                             hist_k=dens_hist_k, kernels=dens_kernels, v=v_step)
 
         if disrupted:
             m = cfg.Mres
@@ -1395,6 +1420,7 @@ def evolve_heating_revirial(host, numProfile0, xv0, tmax=10.,
         expand_clamp_worst=np.asarray(ecw_list),
         expand_clamp_worst_r=np.asarray(ecwr_list),
         dens_hist=dens_hist,
+        dens_hist_k=dens_hist_k,
         frozen=frozen,
     )
 

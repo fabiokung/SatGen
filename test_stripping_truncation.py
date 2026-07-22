@@ -94,6 +94,34 @@ def test_dens_hist_conserves_residence_and_localizes(du24_setup):
     assert np.all(~(H.sum(1) > 0) | visited)
 
 
+def test_dens_kernels_weighted_residence(du24_setup):
+    """dens_kernels adds one kernel-weighted histogram per callable w(r, v): the unit
+    kernel reproduces dens_hist bin-for-bin, a speed kernel occupies the same bins with
+    the dt-weighted speed average, and the accumulators don't perturb the evolution."""
+    hNFW, rvals, M_sub, xv0_20 = du24_setup
+    redges = np.logspace(-4, np.log10(500.), 60)
+    tedges = np.linspace(0., 12., 6)
+    kw = dict(tmax=12., step_frac=0.02, epsh=0.0741, gamma=0., beta_h=0.278,
+              alpha=3.93, t_dyn_mode='sub_lt', truncation='hard',
+              dens_redges=redges, dens_tedges=tedges)
+    res = sc.evolve_heating_revirial(
+        hNFW, NumericProfile(rvals, M_sub), xv0_20,
+        dens_kernels=[lambda r, v: 1., lambda r, v: v], **kw)
+    bare = sc.evolve_heating_revirial(hNFW, NumericProfile(rvals, M_sub), xv0_20, **kw)
+
+    Hk = res.dens_hist_k
+    assert Hk is not None and Hk.shape == (2, len(redges) - 1, len(tedges) - 1)
+    assert np.array_equal(Hk[0], res.dens_hist)          # unit kernel == dens_hist
+    assert (Hk[1] >= 0.).all()
+    assert np.array_equal((Hk[1] > 0), (res.dens_hist > 0))
+    # ratio = dt m-weighted mean orbital speed; bounded by the central escape speed
+    vbar = Hk[1].sum() / res.dens_hist.sum()
+    assert 0. < vbar < np.sqrt(-2. * hNFW.Phi(redges[0]))
+    # the kernel accumulators must not change the evolution
+    assert np.array_equal(res.t, bare.t) and np.array_equal(res.m, bare.m)
+    assert bare.dens_hist_k is None
+
+
 @pytest.mark.parametrize('engine', ['uniform', 'revirial'])
 def test_hard_cut_survives_on_radial_orbit(du24_setup, engine):
     """A dense NFW subhalo on the radial orbit strips to a bound remnant, not to the
