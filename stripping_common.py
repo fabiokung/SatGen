@@ -1108,12 +1108,10 @@ def evolve_heating_revirial(host, numProfile0, xv0, tmax=10.,
     ~1e5 more steps. Below the floor everything the remnant can still deposit anywhere
     is bounded by freeze_mfrac * m0 * (tmax - t), so no orbit-shape gate is needed and
     the held (r, m) is the physical continuation at that bound: res.frozen and
-    res.frozen_mfloor are both set, and callers should extend the residence with a
-    complete held tail (not treat it as a bracketed freeze). With the floor on, no
-    run ever grinds to cfg.Mres -- a disruption-bound clump ends floor-frozen instead
-    of 'stripped' -- so leave it off wherever fate or mass-function statistics
-    matter; it exists for residence-table production, where observables are
-    m-weighted and the sub-floor tail is negligible by construction.
+    res.frozen_mfloor are both set. With the floor on, no run ever grinds to
+    cfg.Mres -- a disruption-bound subhalo ends floor-frozen instead of reaching
+    the mass floor -- so leave it off wherever disruption or mass-function
+    statistics matter.
 
     log_every (seconds, off by default) prints a periodic heartbeat of the orbital state
     (t, r, m, nstep, wall) so a run that stalls on a tight orbit can be diagnosed from the
@@ -1188,6 +1186,7 @@ def evolve_heating_revirial(host, numProfile0, xv0, tmax=10.,
             err = PericentreUnresolvedError(
                 f"exceeded max_steps={max_steps} at t={t:.3f}/{tmax} Gyr")
             err.dens_hist, err.t_last, err.r_last = dens_hist, t, r
+            err.m_last = m
             err.dens_hist_k = dens_hist_k
             err.r_lo, err.r_hi = r_lo, r_hi          # settled span, for residence backfill
             raise err
@@ -1270,6 +1269,7 @@ def evolve_heating_revirial(host, numProfile0, xv0, tmax=10.,
                     f"strip number={strip_number:.1f} > {strip_number_max} at "
                     f"dt_min={dt_min:.2e} Gyr, t={t:.3f} Gyr; unresolvable")
                 err.dens_hist, err.t_last, err.r_last = dens_hist, t, r
+                err.m_last = m
                 err.dens_hist_k = dens_hist_k
                 raise err
             break

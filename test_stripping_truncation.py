@@ -607,12 +607,15 @@ def test_revirial_raises_pericentre_unresolved_over_budget(du24_setup):
     OverstripError, so an `except OverstripError` handler catches it while the
     distinct type flags an unresolvable orbit."""
     hNFW, rvals, M_sub, xv0_20 = du24_setup
-    with pytest.raises(sc.OverstripError):
+    with pytest.raises(sc.OverstripError) as ei:
         sc.evolve_heating_revirial(
             hNFW, NumericProfile(rvals, M_sub), xv0_20, tmax=12., step_frac=0.02,
             max_steps=50, epsh=0.0741, gamma=0., beta_h=0.278, alpha=3.93,
             t_dyn_mode='sub_lt', second_order=True, truncation='hard')
     assert issubclass(sc.PericentreUnresolvedError, sc.OverstripError)
+    # the raise carries the terminal bound mass alongside dens_hist/t_last/r_last
+    m_last = ei.value.m_last
+    assert np.isfinite(m_last) and cfg.Mres < m_last <= NumericProfile(rvals, M_sub).Mh
 
 
 def test_revirial_disruption_terminates_without_revirializing(du24_setup):
