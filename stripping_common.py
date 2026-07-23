@@ -147,6 +147,12 @@ class EvolutionResult:
     # the remaining time. Lets callers tell a circuit-breaker freeze apart from a run that
     # completed at tmax or disrupted. Only the revirial engine sets it.
     frozen: bool = False
+    # True when the freeze was the relative-mass-floor criterion (freeze_mfrac): the
+    # bound mass fell below freeze_mfrac of its initial value, so the still-stripping
+    # remnant's remaining deposit anywhere is bounded by freeze_mfrac * m0 * (tmax - t)
+    # -- negligible by construction. Unlike a plain breaker freeze, the held (r, m)
+    # tail is the physical continuation at that bound, not a bracketed approximation.
+    frozen_mfloor: bool = False
 
 
 def _dens_accumulate(hist, redges, tedges, r, m, tmid, dt,
@@ -1042,7 +1048,7 @@ def evolve_heating_revirial(host, numProfile0, xv0, tmax=10.,
                             dens_redges=None, dens_tedges=None, dens_kernels=None,
                             freeze_strip=None, freeze_orbits=20,
                             freeze_tdyn=None, freeze_walltime=None,
-                            freeze_rspan=0.5, log_every=None):
+                            freeze_rspan=0.5, freeze_mfrac=None, log_every=None):
     """Re-virialization-cadence forward model (Pullen+14/Du+24, impulse).
 
     Heating and stripping run on their physical cadences:
@@ -1095,6 +1101,20 @@ def evolve_heating_revirial(host, numProfile0, xv0, tmax=10.,
     (freeze_strip=None), so existing callers -- and any DF-free run, whose orbits never
     settle -- are unaffected.
 
+    freeze_mfrac (off by default, independent of the breaker) freezes at a
+    re-virialization once m < freeze_mfrac * m(t=0). A dense remnant keeps ~its initial
+    mean density as it strips, so its internal dynamical time -- and with it the heating
+    dt -- never grows, and the grind from a negligible bound mass down to Mres costs
+    ~1e5 more steps. Below the floor everything the remnant can still deposit anywhere
+    is bounded by freeze_mfrac * m0 * (tmax - t), so no orbit-shape gate is needed and
+    the held (r, m) is the physical continuation at that bound: res.frozen and
+    res.frozen_mfloor are both set, and callers should extend the residence with a
+    complete held tail (not treat it as a bracketed freeze). With the floor on, no
+    run ever grinds to cfg.Mres -- a disruption-bound clump ends floor-frozen instead
+    of 'stripped' -- so leave it off wherever fate or mass-function statistics
+    matter; it exists for residence-table production, where observables are
+    m-weighted and the sub-floor tail is negligible by construction.
+
     log_every (seconds, off by default) prints a periodic heartbeat of the orbital state
     (t, r, m, nstep, wall) so a run that stalls on a tight orbit can be diagnosed from the
     log after the fact.
@@ -1114,7 +1134,7 @@ def evolve_heating_revirial(host, numProfile0, xv0, tmax=10.,
 
     o = orbit(xv0)
     r = np.sqrt(xv0[0]**2 + xv0[2]**2)
-    m = ref.Mh
+    m = m0 = ref.Mh
     Q = 0.
     tt_int = np.zeros((3, 3))
     hr_prev = None
@@ -1145,7 +1165,7 @@ def evolve_heating_revirial(host, numProfile0, xv0, tmax=10.,
     cb_on = freeze_strip is not None
     cb_streak, cb_m_ref = 0, None
     r_lo = r_hi = r        # min / max orbital radius over the current not-stripping streak
-    frozen = False
+    frozen = frozen_mfloor = False
     t_wall0 = t_log = time.time()   # call start; last heartbeat
 
     # dt-weighted residence histogram (optional): caller supplies the radial and
@@ -1343,6 +1363,11 @@ def evolve_heating_revirial(host, numProfile0, xv0, tmax=10.,
             cur_vmax, cur_rmax = ref.Vmax, ref.rmax
             Q, tt_int, hr_prev, lt_min = 0., np.zeros((3, 3)), None, np.inf
             t_last_revir = t
+            # relative-mass-floor freeze: below the floor the remnant's remaining
+            # deposit anywhere is bounded by freeze_mfrac * m0 * (tmax - t), so no
+            # orbit-shape gate is needed (see the docstring).
+            if freeze_mfrac is not None and m < freeze_mfrac * m0:
+                frozen = frozen_mfloor = True
             if cb_on:
                 # freeze only a genuinely settled clump. Count consecutive orbits that shed
                 # less than freeze_strip of their bound mass; a stripping orbit resets the
@@ -1432,6 +1457,7 @@ def evolve_heating_revirial(host, numProfile0, xv0, tmax=10.,
         dens_hist=dens_hist,
         dens_hist_k=dens_hist_k,
         frozen=frozen,
+        frozen_mfloor=frozen_mfloor,
     )
 
 

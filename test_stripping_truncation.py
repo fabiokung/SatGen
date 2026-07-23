@@ -412,6 +412,22 @@ def test_circuit_breaker_needs_freeze_orbits(du24_setup):
     assert res.frozen is False
 
 
+def test_mass_floor_freeze(du24_setup):
+    """freeze_mfrac freezes a still-stripping run once m falls below the floor -- no
+    not-stripping streak needed, independent of the breaker -- and frozen_mfloor tells
+    it apart from a plain breaker freeze."""
+    hNFW, rvals, M_sub, xv0_20 = du24_setup
+    m0 = M_sub[-1]
+    full = _cb_run(du24_setup)
+    frz = _cb_run(du24_setup, freeze_mfrac=0.5)
+    assert frz.frozen is True and frz.frozen_mfloor is True
+    assert frz.m[-1] < 0.5 * m0
+    assert frz.t[-1] < full.t[-1]                       # stopped early
+    plain = _cb_run(du24_setup, freeze_strip=0.99, freeze_orbits=2, freeze_tdyn=1e9)
+    assert plain.frozen is True and plain.frozen_mfloor is False
+    assert full.frozen_mfloor is False
+
+
 def test_dynamical_friction_disabled_by_none():
     """orbit.integrate with m omitted (None) disables dynamical friction: a
     heavy satellite on a circular orbit holds its radius, while the same orbit
