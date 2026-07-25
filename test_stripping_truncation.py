@@ -883,3 +883,28 @@ def test_green_adaptive_step_frac_convergence(du24_setup):
         f"step_frac refinement must converge: {coarse:.4f} vs {fine:.4f}"
     assert n_fine > n_coarse                      # finer step_frac -> more steps
     assert fine < 0.1, "the 1/20 orbit strips deeply, not frozen near unity"
+
+
+def test_df_sink_time_clamped_log():
+    """Circular-adiabatic DF sink time under the clamped local Coulomb log
+    (lnL_type 6): finite and mass-monotonic when the whole path lies above the
+    stall radius M_host(<r) = m, infinite when the path crosses it (the drag
+    vanishes there and the orbit cannot pass), infinite for a degenerate path."""
+    from scipy.optimize import brentq
+    saved = cfg.lnL_type, cfg.lnL_pref
+    cfg.lnL_type, cfg.lnL_pref = 6, 1.0
+    try:
+        h = NFW(1e9, 11.68)
+        m = 1e5
+        r_st = brentq(lambda r: h.M(r) - m, 1e-6, 10.)
+        r_st10 = brentq(lambda r: h.M(r) - 10. * m, 1e-6, 10.)
+        # path above both stall radii: finite, and the heavier mass sinks faster
+        t = sc.df_sink_time(h, m, 10. * r_st10, 2. * r_st10)
+        assert np.isfinite(t) and t > 0.
+        t_heavy = sc.df_sink_time(h, 10. * m, 10. * r_st10, 2. * r_st10)
+        assert t_heavy < t
+        # path crossing the stall: the drag vanishes there, the orbit cannot pass
+        assert sc.df_sink_time(h, m, 10. * r_st, 0.5 * r_st) == np.inf
+        assert sc.df_sink_time(h, m, r_st, r_st) == np.inf
+    finally:
+        cfg.lnL_type, cfg.lnL_pref = saved
