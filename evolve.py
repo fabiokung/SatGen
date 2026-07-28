@@ -237,6 +237,11 @@ def alpha_from_c2(c2p, c2s):
     Compute the best stripping efficiency prefactor, alpha, as a function of
     the instantaneous host- and initial subhalo concentrations.
 
+    This is Green, van den Bosch & Jiang (2021) eq. (11), calibrated on DASH
+    with the King62 tidal radius and the instantaneous host dynamical time
+    t_dyn(r) = sqrt(3 pi / 16 G rhobar_h(r)) -- not the orbital period. A
+    Tormen98 tidal radius would need its own refit.
+
     Syntax:
     
         alpha_from_c2(c2p, cs2)
@@ -256,10 +261,6 @@ def alpha_from_c2(c2p, c2s):
         Green and van den Bosch (2019) density profile model takes
         into account the evolution of the density profile of the subhalo
         given the INITIAL NFW profile.
-
-    TODO:
-    
-        Update this based on the final DASH calibration.
     """
     return 0.55 * ((c2s/c2p) / 2.)**(-1./3.)
 
