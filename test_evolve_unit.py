@@ -210,6 +210,11 @@ class TestLtidal:
         # (not guaranteed for all parameter choices, but for our fixture it should hold)
         assert lt < dekel_sat.rh * 2.0  # soft bound: tidal radius is sub-virial
 
+    def test_invalid_choice_exits(self, dekel_sat, nfw_host, xv_inside):
+        """An unknown tidal-radius type must reach the sys.exit, not a NameError."""
+        with pytest.raises(SystemExit):
+            ev.ltidal(dekel_sat, nfw_host, xv_inside, choice='nonsense')
+
     def test_composite_potential(self, dekel_sat, xv_inside):
         """Should work with a list of profiles as host potential."""
         from profiles import MN
