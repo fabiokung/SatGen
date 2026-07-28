@@ -8,16 +8,22 @@
 
 The full cluster-scale pipeline (TreeGen + SatEvo at log M ≈ 14) can take hours. Use the tiers below to keep iteration fast.
 
-### Tier 1 — Unit tests (~5 sec)
+### Tier 1 — Unit tests (~3 min for the full suite)
 
-No tree files needed. Tests `evolve.py` functions directly.
+No tree files needed.
 
 ```bash
-source .venv/bin/activate
-python -m pytest test_evolve_unit.py -v
+python -m pytest --ignore=test_evolve.py    # whole suite, 240 tests
+python -m pytest test_evolve_unit.py -v     # just evolve.py
 ```
 
-Covers: `g_P10`, `g_EPW18`, `ltidal`, `msub`, `Dekel2`.
+`test_evolve.py` is the Tier-3 plotting script below, not a pytest module — it imports a
+Qt backend, so a bare `pytest` fails at collection. Always ignore it.
+
+`test_evolve_unit.py` covers `g_P10`, `g_EPW18`, `ltidal`, `msub`, `Dekel2`. The rest of
+the suite covers the truncations and the heating/stripping engines
+(`test_stripping.py`, `test_stripping_truncation.py`, `test_subhalo_functions.py`,
+`test_dash_setup.py`).
 
 ### Tier 2 — Integration test, MW-scale trees (~5–10 min total)
 
