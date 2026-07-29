@@ -154,9 +154,20 @@ class EvolutionResult:
     # tail is the physical continuation at that bound, not a bracketed approximation.
     frozen_mfloor: bool = False
     # True when the freeze came from the wall-clock backstop (freeze_walltime)
-    # rather than a certified settled state -- a cost guardrail, so downstream
+    # rather than a settled state that passed the sink-time criterion -- a cost
+    # guardrail, so downstream
     # analyses can bracket these holds instead of trusting them.
     frozen_wall: bool = False
+    # The state the sink-time criterion was evaluated on, NaN when the run did not
+    # freeze. freeze_r_lo is the minimum orbital radius over the settled streak (the
+    # radius the sink time is measured from); freeze_t_sink is the sink time it found,
+    # set only when that criterion is what froze the orbit, and +inf when the clamped
+    # Coulomb log leaves no drag. Neither is recoverable from the reported final state:
+    # the test runs before the closing re-virialization flush, and r_lo is a streak
+    # minimum rather than the last radius. Recorded so an analysis can re-derive the
+    # criterion at other (eta, safety) without re-evolving.
+    freeze_r_lo: float = np.nan
+    freeze_t_sink: float = np.nan
 
 
 def _dens_accumulate(hist, redges, tedges, r, m, tmid, dt,
@@ -1064,7 +1075,7 @@ def df_sink_time(potential, m, r_from, r_to, n_grid=128):
 def _freeze_event_radius(profile, potential, m, r_lo, r_stop, lt_choice, eta,
                          n_scan=32):
     """Largest host radius at or below r_lo where the settled clump would leave
-    its certified-quiet regime: the tidal radius (circular orbit, current
+    its quiet regime: the tidal radius (circular orbit, current
     profile) drops below eta times the bound extent -- stripping resumes -- or
     the r_stop halt would fire. None when no such radius exists (nothing below
     the current orbit can change the clump's state)."""
@@ -1098,7 +1109,7 @@ def evolve_heating_revirial(host, numProfile0, xv0, tmax=10.,
                             freeze_strip=None, freeze_orbits=20,
                             freeze_tdyn=None, freeze_walltime=None,
                             freeze_rspan=0.5, freeze_mfrac=None,
-                            freeze_cert=None, log_every=None):
+                            freeze_tsink=None, log_every=None):
     """Re-virialization-cadence forward model (Pullen+14/Du+24, impulse).
 
     Heating and stripping run on their physical cadences:
@@ -1151,14 +1162,14 @@ def evolve_heating_revirial(host, numProfile0, xv0, tmax=10.,
     (freeze_strip=None), so existing callers -- and any DF-free run, whose orbits never
     settle -- are unaffected.
 
-    freeze_cert (optional dict, e.g. {'eta': 1.2, 'safety': 2.}) gates the tight-orbit
-    freeze on a forward-looking certificate: the streak certifies past quiescence, not
-    the future, and with DF on a quiet settled orbit can still decay into the stripping
-    regime later. The certificate computes the adiabatic DF sink time from the streak's
+    freeze_tsink (optional dict, e.g. {'eta': 1.2, 'safety': 2.}) gates the tight-orbit
+    freeze on a forward-looking sink-time criterion: the streak shows past quiescence,
+    not the future, and with DF on a quiet settled orbit can still decay into the
+    stripping regime later. The criterion computes the adiabatic DF sink time from the streak's
     inner radius down to the nearest regime-changing radius -- where the circular-orbit
     tidal radius falls below eta times the bound extent, or the r_stop halt -- and
     freezes only when it exceeds safety * (tmax - t) (df_sink_time diverges at the
-    Coulomb-log stall, so an orbit at its DF floor certifies immediately). Evaluated
+    Coulomb-log stall, so an orbit at its DF floor passes immediately). Evaluated
     only when the streak criteria would already have frozen, and memoized between
     failures, so it never runs on the hot path. The wall-clock backstop still freezes
     unconditionally but is flagged res.frozen_wall for downstream bracketing.
@@ -1224,7 +1235,8 @@ def evolve_heating_revirial(host, numProfile0, xv0, tmax=10.,
     # the settled state is returned frozen. Off unless freeze_strip is set.
     cb_on = freeze_strip is not None
     cb_streak, cb_m_ref = 0, None
-    cb_cert_next = -np.inf   # next time the sink-time certificate is worth evaluating
+    cb_tsink_next = -np.inf  # next time the sink-time criterion is worth evaluating
+    cb_t_sink = np.nan       # sink time of a passing criterion, for the result record
     r_lo = r_hi = r        # min / max orbital radius over the current not-stripping streak
     frozen = frozen_mfloor = frozen_wall = False
     t_wall0 = t_log = time.time()   # call start; last heartbeat
@@ -1454,33 +1466,34 @@ def evolve_heating_revirial(host, numProfile0, xv0, tmax=10.,
                         and time.time() - t_wall0 > freeze_walltime)
                 if cb_streak >= freeze_orbits and settled:
                     if tight:
-                        # the streak certifies past quiescence only; with DF on,
+                        # the streak shows past quiescence only; with DF on,
                         # a settled orbit can still decay into the stripping
                         # regime later (accelerating friction inward). The
-                        # sink-time certificate freezes only when the orbit
+                        # sink-time criterion freezes only when the orbit
                         # cannot reach a regime-changing radius (stripping
                         # margin or the r_stop halt) within a safety factor of
                         # the remaining time. Evaluated only here -- when the
                         # streak criteria would already have frozen -- and
-                        # memoized: a failed certificate cannot pass before
+                        # memoized: a failed test cannot pass before
                         # T_rem shrinks below t_sink/safety.
-                        if freeze_cert is None or not dynamical_friction:
+                        if freeze_tsink is None or not dynamical_friction:
                             frozen = True
-                        elif t >= cb_cert_next:
+                        elif t >= cb_tsink_next:
                             r_ev = _freeze_event_radius(
                                 ref, potential, m, r_lo, r_stop, lt_choice,
-                                freeze_cert.get('eta', 1.2))
+                                freeze_tsink.get('eta', 1.2))
                             t_sink = (np.inf if r_ev is None
                                       else 0. if r_ev >= r_lo
                                       else df_sink_time(potential, m, r_lo, r_ev))
-                            safety = freeze_cert.get('safety', 2.)
+                            safety = freeze_tsink.get('safety', 2.)
                             if t_sink > safety * (tmax - t):
                                 frozen = True
+                                cb_t_sink = t_sink
                             else:
                                 # earliest time it could pass with unchanged
                                 # state; re-check at least every 0.5 Gyr (mass
                                 # loss weakens the drag and lengthens t_sink)
-                                cb_cert_next = min(tmax - t_sink / safety,
+                                cb_tsink_next = min(tmax - t_sink / safety,
                                                    t + 0.5)
                     if not frozen and slow:
                         frozen = frozen_wall = True
@@ -1552,6 +1565,10 @@ def evolve_heating_revirial(host, numProfile0, xv0, tmax=10.,
         frozen=frozen,
         frozen_wall=frozen_wall,
         frozen_mfloor=frozen_mfloor,
+        # a freeze breaks the loop on the spot, so r_lo here is still the streak
+        # minimum the criterion measured the sink time from
+        freeze_r_lo=(r_lo if frozen else np.nan),
+        freeze_t_sink=cb_t_sink,
     )
 
 

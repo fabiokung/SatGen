@@ -406,6 +406,47 @@ def test_circuit_breaker_walltime_backstop(du24_setup):
     assert res.frozen is True
 
 
+def test_freeze_records_streak_minimum_radius(du24_setup):
+    """A freeze records the settled streak's minimum radius, which is what the sink-time
+    criterion measures from -- not the reported final radius, and not recoverable from
+    it: the closing re-virialization flush runs after the freeze decision. A run that
+    never freezes records NaN."""
+    frz = _cb_run(du24_setup, freeze_strip=0.99, freeze_orbits=2, freeze_tdyn=1e9)
+    assert frz.frozen is True
+    assert np.isfinite(frz.freeze_r_lo) and frz.freeze_r_lo > 0.
+    assert frz.freeze_r_lo <= frz.r[-1]
+    # this orbit is radial, so the streak minimum sits well inside the final radius --
+    # the case where reading r[-1] back would misplace the sink-time test
+    assert frz.freeze_r_lo < 0.9 * frz.r[-1]
+
+    never = _cb_run(du24_setup, freeze_strip=0.99, freeze_orbits=100000, freeze_tdyn=1e9)
+    assert never.frozen is False
+    assert np.isnan(never.freeze_r_lo)
+    assert np.isnan(never.freeze_t_sink)
+
+
+def test_freeze_t_sink_only_from_the_sink_criterion(du24_setup):
+    """freeze_t_sink carries a sink time only when the sink-time criterion is what
+    passed. The wall-clock backstop and an unguarded breaker freeze leave it NaN, so a
+    downstream scan can tell the two kinds of hold apart without re-deriving anything."""
+    plain = _cb_run(du24_setup, freeze_strip=0.99, freeze_orbits=2, freeze_tdyn=1e9)
+    assert plain.frozen is True
+    assert np.isnan(plain.freeze_t_sink)
+
+    wall = _cb_run(du24_setup, freeze_strip=0.99, freeze_orbits=2, freeze_tdyn=None,
+                   freeze_walltime=0., freeze_tsink=dict(eta=1.2, safety=2.))
+    assert wall.frozen_wall is True
+    assert np.isnan(wall.freeze_t_sink)
+
+    gated = _cb_run(du24_setup, freeze_strip=0.99, freeze_orbits=2, freeze_tdyn=1e9,
+                    freeze_tsink=dict(eta=1.2, safety=2.))
+    assert gated.frozen is True and gated.frozen_wall is False
+    # t_sink exceeded safety * remaining time: a finite time here, +inf when the clamped
+    # Coulomb log leaves no drag at all
+    assert gated.freeze_t_sink > 0.
+    assert gated.freeze_t_sink > 2. * (12. - gated.t[-1])
+
+
 def test_circuit_breaker_needs_freeze_orbits(du24_setup):
     """Requiring more consecutive settled orbits than the run completes never freezes."""
     res = _cb_run(du24_setup, freeze_strip=0.99, freeze_orbits=100000, freeze_tdyn=1e9)
