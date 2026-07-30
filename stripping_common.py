@@ -1565,9 +1565,11 @@ def evolve_heating_revirial(host, numProfile0, xv0, tmax=10.,
         frozen=frozen,
         frozen_wall=frozen_wall,
         frozen_mfloor=frozen_mfloor,
-        # a freeze breaks the loop on the spot, so r_lo here is still the streak
-        # minimum the criterion measured the sink time from
-        freeze_r_lo=(r_lo if frozen else np.nan),
+        # a breaker freeze breaks the loop on the spot, so r_lo here is still the streak
+        # minimum the sink-time criterion measured from. The mass-floor freeze evaluates
+        # no streak -- and with the breaker off r_lo is never updated at all -- so it has
+        # no such radius to report.
+        freeze_r_lo=(r_lo if frozen and not frozen_mfloor else np.nan),
         freeze_t_sink=cb_t_sink,
     )
 

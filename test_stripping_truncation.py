@@ -453,6 +453,19 @@ def test_circuit_breaker_needs_freeze_orbits(du24_setup):
     assert res.frozen is False
 
 
+def test_mass_floor_freeze_reports_no_streak_radius(du24_setup):
+    """The mass-floor freeze evaluates no settled streak, so it has no streak-minimum
+    radius: reporting the running r_lo there would hand back the launch radius."""
+    hNFW, rvals, M_sub, xv0_20 = du24_setup
+    m0 = M_sub[-1]
+    res = sc.evolve_heating_revirial(
+        hNFW, NumericProfile(rvals, M_sub), xv0_20, tmax=12., step_frac=0.02,
+        epsh=0.0741, gamma=0., beta_h=0.278, alpha=3.93, t_dyn_mode='sub_lt',
+        truncation='hard', freeze_mfrac=0.5)
+    assert res.frozen_mfloor is True
+    assert np.isnan(res.freeze_r_lo) and np.isnan(res.freeze_t_sink)
+
+
 def test_mass_floor_freeze(du24_setup):
     """freeze_mfrac freezes a still-stripping run once m falls below the floor -- no
     not-stripping streak needed, independent of the breaker -- and frozen_mfloor tells
@@ -949,3 +962,13 @@ def test_df_sink_time_clamped_log():
         assert sc.df_sink_time(h, m, r_st, r_st) == np.inf
     finally:
         cfg.lnL_type, cfg.lnL_pref = saved
+
+
+def test_wall_backstop_does_not_borrow_a_refused_sink_time(du24_setup):
+    """The wall-clock backstop runs after the sink-time block, so a freeze that the
+    criterion REFUSED and the wall then forced must still report no sink time. An eta
+    and safety this large refuse every orbit, isolating that path."""
+    res = _cb_run(du24_setup, freeze_strip=0.99, freeze_orbits=2, freeze_tdyn=1e9,
+                  freeze_walltime=0., freeze_tsink=dict(eta=1e6, safety=1e9))
+    assert res.frozen is True and res.frozen_wall is True
+    assert np.isnan(res.freeze_t_sink)
