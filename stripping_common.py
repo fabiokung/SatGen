@@ -153,10 +153,10 @@ class EvolutionResult:
     # -- negligible by construction. Unlike a plain breaker freeze, the held (r, m)
     # tail is the physical continuation at that bound, not a bracketed approximation.
     frozen_mfloor: bool = False
-    # True when the freeze came from the wall-clock backstop (freeze_walltime)
-    # rather than a settled state that passed the sink-time criterion -- a cost
-    # guardrail, so downstream
-    # analyses can bracket these holds instead of trusting them.
+    # True when the freeze came from the wall-clock backstop (freeze_walltime) rather
+    # than a settled state that passed the sink-time criterion. The held tail then
+    # carries no evidence that the orbit had stopped evolving, only that the budget ran
+    # out.
     frozen_wall: bool = False
     # The state the sink-time criterion was evaluated on, NaN when the run did not
     # freeze. freeze_r_lo is the minimum orbital radius over the settled streak (the
@@ -168,6 +168,11 @@ class EvolutionResult:
     # criterion at other (eta, safety) without re-evolving.
     freeze_r_lo: float = np.nan
     freeze_t_sink: float = np.nan
+    # The quiet-regime half of the same criterion, at r_lo: the tidal radius there and
+    # the eta * (bound extent) it is compared against. Both are measured on the
+    # re-virialized reference profile, not on the reported final state.
+    freeze_lt_lo: float = np.nan
+    freeze_eta_rout: float = np.nan
 
 
 def _dens_accumulate(hist, redges, tedges, r, m, tmid, dt,
@@ -1073,12 +1078,15 @@ def df_sink_time(potential, m, r_from, r_to, n_grid=128):
 
 
 def _freeze_event_radius(profile, potential, m, r_lo, r_stop, lt_choice, eta,
-                         n_scan=32):
+                         n_scan=32, tally=None):
     """Largest host radius at or below r_lo where the settled clump would leave
     its quiet regime: the tidal radius (circular orbit, current
     profile) drops below eta times the bound extent -- stripping resumes -- or
     the r_stop halt would fire. None when no such radius exists (nothing below
-    the current orbit can change the clump's state)."""
+    the current orbit can change the clump's state).
+
+    tally, when given, records the regime test at r_lo: lt there and the eta * r_out
+    it is compared against."""
     r_out = float(profile.rh)
     r_min = max(1e-3 * r_lo, r_stop if r_stop is not None else 0.)
     r_ev = r_stop
@@ -1088,6 +1096,8 @@ def _freeze_event_radius(profile, potential, m, r_lo, r_stop, lt_choice, eta,
             r = rg[i]
             xv = np.array([r, 0., 0., 0., float(Vcirc(potential, r)), 0.])
             lt = float(ev.ltidal(profile, potential, xv, lt_choice))
+            if tally is not None and i == n_scan - 1:
+                tally['lt_lo'], tally['eta_rout'] = lt, eta * r_out
             if lt < eta * r_out:
                 r_ev = r if r_ev is None else max(r_ev, r)
                 break
@@ -1236,7 +1246,8 @@ def evolve_heating_revirial(host, numProfile0, xv0, tmax=10.,
     cb_on = freeze_strip is not None
     cb_streak, cb_m_ref = 0, None
     cb_tsink_next = -np.inf  # next time the sink-time criterion is worth evaluating
-    cb_t_sink = np.nan       # sink time of a passing criterion, for the result record
+    cb_t_sink = np.nan  # sink time of the criterion that passed
+    cb_lt_lo = cb_eta_rout = np.nan   # the regime test the same criterion saw
     r_lo = r_hi = r        # min / max orbital radius over the current not-stripping streak
     frozen = frozen_mfloor = frozen_wall = False
     t_wall0 = t_log = time.time()   # call start; last heartbeat
@@ -1479,9 +1490,10 @@ def evolve_heating_revirial(host, numProfile0, xv0, tmax=10.,
                         if freeze_tsink is None or not dynamical_friction:
                             frozen = True
                         elif t >= cb_tsink_next:
+                            regime = {}
                             r_ev = _freeze_event_radius(
                                 ref, potential, m, r_lo, r_stop, lt_choice,
-                                freeze_tsink.get('eta', 1.2))
+                                freeze_tsink.get('eta', 1.2), tally=regime)
                             t_sink = (np.inf if r_ev is None
                                       else 0. if r_ev >= r_lo
                                       else df_sink_time(potential, m, r_lo, r_ev))
@@ -1489,6 +1501,8 @@ def evolve_heating_revirial(host, numProfile0, xv0, tmax=10.,
                             if t_sink > safety * (tmax - t):
                                 frozen = True
                                 cb_t_sink = t_sink
+                                cb_lt_lo = regime.get('lt_lo', np.nan)
+                                cb_eta_rout = regime.get('eta_rout', np.nan)
                             else:
                                 # earliest time it could pass with unchanged
                                 # state; re-check at least every 0.5 Gyr (mass
@@ -1571,6 +1585,8 @@ def evolve_heating_revirial(host, numProfile0, xv0, tmax=10.,
         # no such radius to report.
         freeze_r_lo=(r_lo if frozen and not frozen_mfloor else np.nan),
         freeze_t_sink=cb_t_sink,
+        freeze_lt_lo=cb_lt_lo,
+        freeze_eta_rout=cb_eta_rout,
     )
 
 

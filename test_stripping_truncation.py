@@ -972,3 +972,21 @@ def test_wall_backstop_does_not_borrow_a_refused_sink_time(du24_setup):
                   freeze_walltime=0., freeze_tsink=dict(eta=1e6, safety=1e9))
     assert res.frozen is True and res.frozen_wall is True
     assert np.isnan(res.freeze_t_sink)
+
+
+def test_freeze_records_the_regime_test_it_ran(du24_setup):
+    """The sink-time criterion tests two things: that the clump cannot sink to the event
+    radius, and that it is inside its quiet regime where it sits. freeze_lt_lo and
+    freeze_eta_rout record the second, measured on the re-virialized reference profile.
+    Only that criterion sets them, like freeze_t_sink."""
+    gated = _cb_run(du24_setup, freeze_strip=0.99, freeze_orbits=2, freeze_tdyn=1e9,
+                    freeze_tsink=dict(eta=1.2, safety=2.))
+    assert gated.frozen is True
+    assert np.isfinite(gated.freeze_lt_lo) and gated.freeze_lt_lo > 0.
+    assert np.isfinite(gated.freeze_eta_rout) and gated.freeze_eta_rout > 0.
+    # it froze, so it was in regime at r_lo: lt >= eta * bound extent
+    assert gated.freeze_lt_lo >= gated.freeze_eta_rout
+
+    plain = _cb_run(du24_setup, freeze_strip=0.99, freeze_orbits=2, freeze_tdyn=1e9)
+    assert plain.frozen is True
+    assert np.isnan(plain.freeze_lt_lo) and np.isnan(plain.freeze_eta_rout)
