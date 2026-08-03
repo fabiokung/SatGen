@@ -1,136 +1,100 @@
 # SatGen: Testing & Validation
 
-> Living document — update as new checks are added or reference values are refined.
+Living document — update as checks are added or reference values refined.
 
----
+The full cluster-scale pipeline (TreeGen + SatEvo at log M ~ 14) takes hours. The three
+tiers below keep iteration fast.
 
-## Fast dev/test cycle
-
-The full cluster-scale pipeline (TreeGen + SatEvo at log M ≈ 14) can take hours. Use the tiers below to keep iteration fast.
-
-### Tier 1 — Unit tests (~3 min for the full suite)
-
-No tree files needed.
+## Tier 1 — unit tests (~3 min, no tree files)
 
 ```bash
 python -m pytest --ignore=test_evolve.py    # whole suite, 240 tests
 python -m pytest test_evolve_unit.py -v     # just evolve.py
 ```
 
-`test_evolve.py` is the Tier-3 plotting script below, not a pytest module — it imports a
-Qt backend, so a bare `pytest` fails at collection. Always ignore it.
+`test_evolve.py` is the Tier-3 plotting script below, not a pytest module — it imports
+a Qt backend, so a bare `pytest` fails at collection. Always ignore it.
 
 `test_evolve_unit.py` covers `g_P10`, `g_EPW18`, `ltidal`, `msub`, `Dekel2`. The rest of
 the suite covers the truncations and the heating/stripping engines
 (`test_stripping.py`, `test_stripping_truncation.py`, `test_subhalo_functions.py`,
 `test_dash_setup.py`).
 
-### Tier 2 — Integration test, MW-scale trees (~5–10 min total)
-
-Generate the test fixture once (only needed when tree format changes):
-
-```bash
-source .venv/bin/activate
-python TreeGen.py --ntree 4 --lgM0_lo 12.0 --lgM0_hi 12.1 --outdir test_data
-```
-
-This writes `test_data/tree{0..3}_lgM12.0?.npz`. Run SatEvo on all 4 (~5 min):
+## Tier 2 — integration, MW-scale trees (~5-10 min)
 
 ```bash
 python SatEvo.py --datadir test_data/ --outdir test_data/sat_out/
-```
-
-Then validate output:
-
-```bash
 python scripts/check_output.py test_data/sat_out/tree*_lgM12.*.npz
 ```
 
-### Tier 3 — Single-satellite tidal track plot (~10 sec)
+Fixtures `test_data/tree{0..3}_lgM12.0?.npz` are committed; regenerate only when the
+tree format changes:
 
 ```bash
-python test_evolve.py          # existing script, requires display / Qt5Agg
+python TreeGen.py --ntree 4 --lgM0_lo 12.0 --lgM0_hi 12.1 --outdir test_data
 ```
 
-For headless environments, save plots to file (edit `mpl.use('Agg')` at top of script).
+## Tier 3 — single-satellite tidal track (~10 sec)
 
----
+```bash
+python test_evolve.py    # requires display / Qt5Agg; edit mpl.use('Agg') for headless
+```
 
 ## Validation suite
 
-Run all diagnostics on any SatEvo output file:
+Runs on any SatEvo output:
 
 ```bash
-source .venv/bin/activate
-python scripts/check_output.py     <sat_output.npz> [...]   # self-consistency (one or more files)
-python scripts/plot_tidal_tracks.py                          # compare to paper fits
-python scripts/plot_shmf.py        <sat_output.npz> [...]   # SHMF power law
-python scripts/plot_size_mass.py   <sat_output.npz> [...]   # size-mass relation
+python scripts/check_output.py    <sat_output.npz> [...]   # self-consistency
+python scripts/plot_tidal_tracks.py                        # compare to paper fits
+python scripts/plot_shmf.py       <sat_output.npz> [...]   # SHMF power law
+python scripts/plot_size_mass.py  <sat_output.npz> [...]   # size-mass relation
 ```
-
----
-
-## Check descriptions and pass criteria
 
 ### check_output.py — self-consistency
 
 | Check | Pass criterion |
 |-------|---------------|
 | No negative masses | All `mass[order>0] > 0` |
-| Monotonic mass loss post-infall | `mass[id,iz] ≤ mass[id,iz+1]` for all evolved branches |
-| Subhalo mass fraction | `fsub = Σm_sub(m>1e-4 M_host) / M_host ∈ [0.01, 0.20]` for MW-scale host |
-| No surviving satellites above host mass | `max(mass_sub) < mass_host` at every snapshot |
-| StellarMass ≤ DarkMatterMass | `StellarMass[id,iz] ≤ mass[id,iz]` everywhere |
+| Monotonic mass loss post-infall | `mass[id,iz] <= mass[id,iz+1]` on all evolved branches |
+| Subhalo mass fraction | `fsub = sum m_sub(m>1e-4 M_host) / M_host` in [0.01, 0.20] for a MW host |
+| No satellite above host mass | `max(mass_sub) < mass_host` at every snapshot |
+| StellarMass <= DarkMatterMass | `StellarMass[id,iz] <= mass[id,iz]` everywhere |
 
 ### plot_tidal_tracks.py — calibration against N-body fits
 
-Plots `g_P10` and `g_EPW18` as functions of bound mass fraction and overlays the reference values from the original papers.
+`g_P10` and `g_EPW18` vs bound mass fraction, overlaid on the original papers'
+reference values (Penarrubia+10 Fig. 5 for NFW alpha=1 and cuspy alpha=1.5;
+Errani, Penarrubia & Walker 2018 Fig. 3).
 
-**Pass:** Implementation curves within ±10% of paper values across the full range x ∈ [10⁻³, 1].
-
-References:
-- Penarrubia+10, Fig 5 — `g_P10` for NFW (α=1) and cuspy (α=1.5)
-- Errani, Penarrubia & Walker 2018, Fig 3 — `g_EPW18`
+**Pass:** within +/-10% of paper values across x in [1e-3, 1].
 
 ### plot_shmf.py — subhalo mass function
 
-Plots `dN/d ln(m/M_host)` at z=0 for all surviving subhalos. Fits a power law.
+`dN/d ln(m/M_host)` at z=0 over surviving subhalos, power-law fit.
 
-**Pass:** Slope ∈ [−2.0, −1.8] over at least 2 decades in mass ratio above the resolution limit.
-
-References: Springel+08 (Aquarius), Garrison-Kimmel+14 (ELVIS)
+**Pass:** slope in [-2.0, -1.8] over at least 2 decades in mass ratio above the
+resolution limit. References: Springel+08 (Aquarius), Garrison-Kimmel+14 (ELVIS).
 
 ### plot_size_mass.py — size-mass relation
 
-Plots `R_eff` vs `M_star` at z=0 for all satellites with `M_star > 0`.
+`R_eff` vs `M_star` at z=0 for satellites with `M_star > 0`.
 
-**Pass:** Median relation within ±0.5 dex of McConnachie+12 observed Local Group dwarfs across `M_star ∈ [10⁵, 10¹⁰] M_sun`.
+**Pass:** median relation within +/-0.5 dex of McConnachie+12 (VizieR J/AJ/144/4) over
+`M_star` in [1e5, 1e10] M_sun.
 
-**Known limitation at low masses:** The Jiang+19 size formula (`R_eff = 0.02 (c/10)^-0.7 R_vir`, eq. 6) overestimates sizes by ~0.5–1 dex for ultra-faint dwarfs (log M_star < 7). It was calibrated for log M_halo ≳ 11 and is not expected to match MC12 ultra-faints. Additionally, the low-M_star objects in SatEvo output are stripped remnants of larger halos whose R_eff was set at infall (~0.2–0.5 kpc) and barely decreases during stripping (EPW18 tidal puffing), making the comparison with intrinsically-small observed dwarfs structurally unfair at the low-mass end.
+**Known limitation at low masses.** The Jiang+19 size formula
+(`R_eff = 0.02 (c/10)^-0.7 R_vir`, eq. 6) overestimates sizes by ~0.5-1 dex for
+ultra-faint dwarfs (log M_star < 7); it was calibrated for log M_halo >~ 11. The
+low-M_star objects in SatEvo output are also stripped remnants of larger halos whose
+R_eff was set at infall (~0.2-0.5 kpc) and barely decreases during stripping (EPW18
+tidal puffing), so the comparison against intrinsically-small observed dwarfs is
+structurally unfair at that end.
 
-Reference: McConnachie+12, VizieR catalog J/AJ/144/4
-
----
-
-## Additional validation (requires larger runs)
-
-These require the full cluster-scale output and are run manually:
+## Additional validation (requires cluster-scale runs, done manually)
 
 | Check | Reference | Criterion |
 |-------|-----------|-----------|
 | Radial distribution of subhalos | Springel+08 Fig 7 | `n_sub(r)` flatter than DM inside `r_vir/4` |
-| Satellite luminosity function | McConnachie+12 + Drlica-Wagner+20 | N(M_V < −8) ~ 10–50 within 300 kpc for MW host (completeness-corrected) |
-| V_max function | Klypin+11, Garrison-Kimmel+14 | `N(>V_max) ∝ V_max^{−3}` approximately |
-
----
-
-## Reference data sources
-
-| Dataset | Location | Use |
-|---------|----------|-----|
-| Penarrubia+10 tidal tracks | Table 1 / Fig 5 of paper | Verify `g_P10` in evolve.py |
-| Errani+18 tidal tracks | Fig 3 of paper | Verify `g_EPW18` in evolve.py |
-| McConnachie+12 | VizieR J/AJ/144/4 | Size-mass, luminosity function |
-| Aquarius (Springel+08) | VizieR / paper tables | SHMF slope, radial distribution |
-| ELVIS (Garrison-Kimmel+14) | arXiv:1310.6746 supplemental | SHMF, V_max function |
-| Drlica-Wagner+20 (DES Y3) | arXiv:1912.03302 | Completeness-corrected satellite LF |
+| Satellite luminosity function | McConnachie+12 + Drlica-Wagner+20 (arXiv:1912.03302) | N(M_V < -8) ~ 10-50 within 300 kpc, completeness-corrected |
+| V_max function | Klypin+11, Garrison-Kimmel+14 (arXiv:1310.6746) | `N(>V_max)` ~ `V_max^-3` |
