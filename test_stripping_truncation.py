@@ -398,11 +398,11 @@ def test_circuit_breaker_tight_gate(du24_setup):
     assert tight.frozen is True
 
 
-def test_circuit_breaker_walltime_backstop(du24_setup):
-    """With no tight test, the wall-clock backstop still freezes once the mass streak is
-    met: any elapsed time exceeds a zero-second budget."""
+def test_circuit_breaker_step_budget_backstop(du24_setup):
+    """With no tight test, the step-count backstop still freezes once the mass streak is
+    met: any accepted step exceeds a zero-step budget."""
     res = _cb_run(du24_setup, freeze_strip=0.99, freeze_orbits=2,
-                  freeze_tdyn=None, freeze_walltime=0.)
+                  freeze_tdyn=None, freeze_nstep=0)
     assert res.frozen is True
 
 
@@ -427,20 +427,20 @@ def test_freeze_records_streak_minimum_radius(du24_setup):
 
 def test_freeze_t_sink_only_from_the_sink_criterion(du24_setup):
     """freeze_t_sink carries a sink time only when the sink-time criterion is what
-    passed. The wall-clock backstop and an unguarded breaker freeze leave it NaN, so a
+    passed. The step-budget backstop and an unguarded breaker freeze leave it NaN, so a
     downstream scan can tell the two kinds of hold apart without re-deriving anything."""
     plain = _cb_run(du24_setup, freeze_strip=0.99, freeze_orbits=2, freeze_tdyn=1e9)
     assert plain.frozen is True
     assert np.isnan(plain.freeze_t_sink)
 
-    wall = _cb_run(du24_setup, freeze_strip=0.99, freeze_orbits=2, freeze_tdyn=None,
-                   freeze_walltime=0., freeze_tsink=dict(eta=1.2, safety=2.))
-    assert wall.frozen_wall is True
-    assert np.isnan(wall.freeze_t_sink)
+    budget = _cb_run(du24_setup, freeze_strip=0.99, freeze_orbits=2, freeze_tdyn=None,
+                     freeze_nstep=0, freeze_tsink=dict(eta=1.2, safety=2.))
+    assert budget.frozen_budget is True
+    assert np.isnan(budget.freeze_t_sink)
 
     gated = _cb_run(du24_setup, freeze_strip=0.99, freeze_orbits=2, freeze_tdyn=1e9,
                     freeze_tsink=dict(eta=1.2, safety=2.))
-    assert gated.frozen is True and gated.frozen_wall is False
+    assert gated.frozen is True and gated.frozen_budget is False
     # t_sink exceeded safety * remaining time: a finite time here, +inf when the clamped
     # Coulomb log leaves no drag at all
     assert gated.freeze_t_sink > 0.
@@ -964,13 +964,13 @@ def test_df_sink_time_clamped_log():
         cfg.lnL_type, cfg.lnL_pref = saved
 
 
-def test_wall_backstop_does_not_borrow_a_refused_sink_time(du24_setup):
-    """The wall-clock backstop runs after the sink-time block, so a freeze that the
-    criterion REFUSED and the wall then forced must still report no sink time. An eta
+def test_budget_backstop_does_not_borrow_a_refused_sink_time(du24_setup):
+    """The step-budget backstop runs after the sink-time block, so a freeze that the
+    criterion REFUSED and the budget then forced must still report no sink time. An eta
     and safety this large refuse every orbit, isolating that path."""
     res = _cb_run(du24_setup, freeze_strip=0.99, freeze_orbits=2, freeze_tdyn=1e9,
-                  freeze_walltime=0., freeze_tsink=dict(eta=1e6, safety=1e9))
-    assert res.frozen is True and res.frozen_wall is True
+                  freeze_nstep=0, freeze_tsink=dict(eta=1e6, safety=1e9))
+    assert res.frozen is True and res.frozen_budget is True
     assert np.isnan(res.freeze_t_sink)
 
 

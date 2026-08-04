@@ -153,11 +153,13 @@ class EvolutionResult:
     # -- negligible by construction. Unlike a plain breaker freeze, the held (r, m)
     # tail is the physical continuation at that bound, not a bracketed approximation.
     frozen_mfloor: bool = False
-    # True when the freeze came from the wall-clock backstop (freeze_walltime) rather
+    # True when the freeze came from the step-count backstop (freeze_nstep) rather
     # than a settled state that passed the sink-time criterion. The held tail then
     # carries no evidence that the orbit had stopped evolving, only that the budget ran
-    # out.
-    frozen_wall: bool = False
+    # out. A step budget rather than a wall-clock one so the freeze -- and with it the
+    # residence histogram -- is reproducible: a wall-clock freeze lands at an
+    # execution-speed-dependent orbital phase, so nominally identical runs diverge.
+    frozen_budget: bool = False
     # The state the sink-time criterion was evaluated on, NaN when the run did not
     # freeze. freeze_r_lo is the minimum orbital radius over the settled streak (the
     # radius the sink time is measured from); freeze_t_sink is the sink time it found,
@@ -1117,7 +1119,7 @@ def evolve_heating_revirial(host, numProfile0, xv0, tmax=10.,
                             dynamical_friction=True, r_stop=None,
                             dens_redges=None, dens_tedges=None, dens_kernels=None,
                             freeze_strip=None, freeze_orbits=20,
-                            freeze_tdyn=None, freeze_walltime=None,
+                            freeze_tdyn=None, freeze_nstep=None,
                             freeze_rspan=0.5, freeze_mfrac=None,
                             freeze_tsink=None, log_every=None):
     """Re-virialization-cadence forward model (Pullen+14/Du+24, impulse).
@@ -1163,11 +1165,13 @@ def evolve_heating_revirial(host, numProfile0, xv0, tmax=10.,
     radial one whose deep pericentre passages still deposit real central residence (those
     keep being integrated even with DF off and no stripping there). Once the streak is met,
     the radius is settled, AND the orbit is tight (outer-radius t_dyn below freeze_tdyn) OR
-    the wall-clock elapsed since this call began exceeds freeze_walltime seconds, the run
-    stops with res.frozen=True at that settled state. The wall-clock is a
-    hardware-robust backstop for expensive orbits the t_dyn test misses; it times the whole
-    call (not just the settled phase) but only trips together with the mass streak, so it
-    never fires on a still-stripping clump. Because the frozen state is static, *when* it
+    this subhalo has taken more than freeze_nstep accepted steps, the run stops with
+    res.frozen=True at that settled state. The step budget is a backstop for expensive
+    orbits the t_dyn test misses; it counts the whole run (not just the settled phase) but
+    only trips together with the mass streak, so it never fires on a still-stripping clump.
+    Steps rather than wall-clock so the freeze is reproducible -- a wall-clock backstop
+    lands at an execution-speed-dependent orbital phase, which makes dens_hist differ
+    between runs of the same configuration on different hardware. Because the frozen state is static, *when* it
     freezes barely changes it; the caller holds it for the remaining time. Off by default
     (freeze_strip=None), so existing callers -- and any DF-free run, whose orbits never
     settle -- are unaffected.
@@ -1181,8 +1185,8 @@ def evolve_heating_revirial(host, numProfile0, xv0, tmax=10.,
     freezes only when it exceeds safety * (tmax - t) (df_sink_time diverges at the
     Coulomb-log stall, so an orbit at its DF floor passes immediately). Evaluated
     only when the streak criteria would already have frozen, and memoized between
-    failures, so it never runs on the hot path. The wall-clock backstop still freezes
-    unconditionally but is flagged res.frozen_wall for downstream bracketing.
+    failures, so it never runs on the hot path. The step-budget backstop still freezes
+    unconditionally but is flagged res.frozen_budget for downstream bracketing.
 
     freeze_mfrac (off by default, independent of the breaker) freezes at a
     re-virialization once m < freeze_mfrac * m(t=0). A dense remnant keeps ~its initial
@@ -1200,140 +1204,200 @@ def evolve_heating_revirial(host, numProfile0, xv0, tmax=10.,
     (t, r, m, nstep, wall) so a run that stalls on a tight orbit can be diagnosed from the
     log after the fact.
     """
-    if label is None:
-        label = ('1st+2nd order heating (revirial)' if second_order
-                 else '1st order heating (revirial)')
-    assert cfg.Mres is not None, "cfg.Mres must be set before calling"
-    assert truncation in ('hard', 'kazantzidis', 'powerlaw'), truncation
-    potential = host
-    dt_abs = dt_abs_frac * tmax
-    c2 = np.sqrt(2.) * f2 * (1. + chi_v) if second_order else 0.
+    run = _SubhaloRun(host, numProfile0, xv0, tmax, step_frac, dt_growth_max,
+                      strip_number_max, floor_orbit_frac, dt_abs_frac, max_steps,
+                      revir_fallback, epsh, gamma, alpha, beta_h, second_order,
+                      f2, chi_v, t_dyn_mode, truncation, tail_n, tail_xi,
+                      lt_choice, label, early_terminate, dynamical_friction,
+                      r_stop, dens_redges, dens_tedges, dens_kernels,
+                      freeze_strip, freeze_orbits, freeze_tdyn, freeze_nstep,
+                      freeze_rspan, freeze_mfrac, freeze_tsink, log_every)
+    while run.t < run.tmax - run.dt_abs:
+        if not run.step():
+            break
+    return run.finish()
 
-    ref = numProfile0
-    r_ref, M_ref, sig2_ref = _reference_arrays(ref, c2)
-    rmax0, vmax0 = ref.rmax, ref.Vmax
 
-    o = orbit(xv0)
-    r = np.sqrt(xv0[0]**2 + xv0[2]**2)
-    m = m0 = ref.Mh
-    Q = 0.
-    tt_int = np.zeros((3, 3))
-    hr_prev = None
-    lt_min = np.inf
-    lt = cfg.Rres
-    r_p1 = r_p2 = None  # apocenter detector (r local max)
-    omega_p = ref.omega_p
+class _SubhaloRun:
+    """One subhalo's evolution state under the re-virialization engine, split out
+    of evolve_heating_revirial so a population driver can interleave many subhalos
+    on their own timesteps: `step()` advances this subhalo by one accepted step and
+    reads nothing about the others, `finish()` assembles the EvolutionResult.
 
-    t_list, r_list, m_list, xv_list = [], [], [], []
-    vmax_list, rmax_list, lt_list = [], [], []
-    apo_list = []                                # True where the step re-virialized (apocenter)
-    clamp_list, cw_list, cwr_list = [], [], []   # revir reshape: shells, worst %, worst r
-    ct_list = []                                 # revir reshape: shells heated (denom)
-    ec_list, ecw_list, ecwr_list = [], [], []    # per-step _ExpandedProfile clamp
-    ect_list = []                                # per-step: shells heated (denom)
-    cur_vmax, cur_rmax = ref.Vmax, ref.rmax
-    t_last_revir = 0.
-    r_apo_ref = r          # running-max radius: the fallback's stable apocenter clock
-    dt_prev = np.inf
-    nstep = 0
-    t = 0.
+    Holds everything the loop reads or writes -- the orbit, the frozen reference
+    profile and its arrays, the heating ledger (Q, the tidal-tensor cumulant), the
+    circuit-breaker streak, and the per-step output lists. See
+    evolve_heating_revirial for the physics; nothing here changes it.
+    """
 
-    # circuit breaker: freeze a tight, no-longer-stripping orbit. cb_streak counts
-    # consecutive re-virializations (~orbits) whose fractional mass loss stayed below
-    # freeze_strip; when it reaches freeze_orbits and the orbit is tight (t_dyn at the
-    # apocenter below freeze_tdyn) or the wall-clock budget is spent, the loop breaks and
-    # the settled state is returned frozen. Off unless freeze_strip is set.
-    cb_on = freeze_strip is not None
-    cb_streak, cb_m_ref = 0, None
-    cb_tsink_next = -np.inf  # next time the sink-time criterion is worth evaluating
-    cb_t_sink = np.nan  # sink time of the criterion that passed
-    cb_lt_lo = cb_eta_rout = np.nan   # the regime test the same criterion saw
-    r_lo = r_hi = r        # min / max orbital radius over the current not-stripping streak
-    frozen = frozen_mfloor = frozen_wall = False
-    t_wall0 = t_log = time.time()   # call start; last heartbeat
+    def __init__(self, host, numProfile0, xv0, tmax, step_frac, dt_growth_max,
+                 strip_number_max, floor_orbit_frac, dt_abs_frac, max_steps,
+                 revir_fallback, epsh, gamma, alpha, beta_h, second_order,
+                 f2, chi_v, t_dyn_mode, truncation, tail_n, tail_xi,
+                 lt_choice, label, early_terminate, dynamical_friction,
+                 r_stop, dens_redges, dens_tedges, dens_kernels,
+                 freeze_strip, freeze_orbits, freeze_tdyn, freeze_nstep,
+                 freeze_rspan, freeze_mfrac, freeze_tsink, log_every):
+        if label is None:
+            label = ('1st+2nd order heating (revirial)' if second_order
+                     else '1st order heating (revirial)')
+        assert cfg.Mres is not None, "cfg.Mres must be set before calling"
+        assert truncation in ('hard', 'kazantzidis', 'powerlaw'), truncation
+        self.tmax = tmax
+        self.step_frac, self.dt_growth_max = step_frac, dt_growth_max
+        self.strip_number_max, self.floor_orbit_frac = strip_number_max, floor_orbit_frac
+        self.max_steps, self.revir_fallback = max_steps, revir_fallback
+        self.epsh, self.gamma, self.alpha, self.beta_h = epsh, gamma, alpha, beta_h
+        self.t_dyn_mode, self.truncation = t_dyn_mode, truncation
+        self.tail_n, self.tail_xi, self.lt_choice = tail_n, tail_xi, lt_choice
+        self.label, self.early_terminate = label, early_terminate
+        self.dynamical_friction, self.r_stop = dynamical_friction, r_stop
+        self.freeze_strip, self.freeze_orbits = freeze_strip, freeze_orbits
+        self.freeze_tdyn, self.freeze_nstep = freeze_tdyn, freeze_nstep
+        self.freeze_rspan, self.freeze_mfrac = freeze_rspan, freeze_mfrac
+        self.freeze_tsink, self.log_every = freeze_tsink, log_every
+        self.potential = host
+        self.dt_abs = dt_abs_frac * tmax
+        self.c2 = np.sqrt(2.) * f2 * (1. + chi_v) if second_order else 0.
 
-    # dt-weighted residence histogram (optional): caller supplies the radial and
-    # time bin edges, so the grid is chosen for the ensemble's orbits, not fixed here.
-    # dens_kernels adds one kernel-weighted companion histogram per callable w(r, v)
-    # (see EvolutionResult.dens_hist_k); the stellar physics stays with the caller.
-    dens_on = dens_redges is not None and dens_tedges is not None
-    if dens_on:
-        dens_redges = np.asarray(dens_redges, float)
-        dens_tedges = np.asarray(dens_tedges, float)
-        dens_hist = np.zeros((len(dens_redges) - 1, len(dens_tedges) - 1))
-        dens_hist_k = (np.zeros((len(dens_kernels),) + dens_hist.shape)
-                       if dens_kernels else None)
-    else:
-        dens_hist = None
-        dens_hist_k = None
+        self.ref = numProfile0
+        self.r_ref, self.M_ref, self.sig2_ref = _reference_arrays(self.ref, self.c2)
+        self.rmax0, self.vmax0 = self.ref.rmax, self.ref.Vmax
 
-    while t < tmax - dt_abs:
-        if nstep >= max_steps:
+        self.o = orbit(xv0)
+        self.r = np.sqrt(xv0[0]**2 + xv0[2]**2)
+        self.m = self.m0 = self.ref.Mh
+        self.Q = 0.
+        self.tt_int = np.zeros((3, 3))
+        self.hr_prev = None
+        self.lt_min = np.inf
+        self.lt = cfg.Rres
+        self.r_p1 = self.r_p2 = None  # apocenter detector (r local max)
+        self.omega_p = self.ref.omega_p
+
+        self.t_list, self.r_list, self.m_list, self.xv_list = [], [], [], []
+        self.vmax_list, self.rmax_list, self.lt_list = [], [], []
+        self.apo_list = []                       # True where the step re-virialized (apocenter)
+        self.clamp_list, self.cw_list, self.cwr_list = [], [], []  # revir: shells, worst %, r
+        self.ct_list = []                        # revir reshape: shells heated (denom)
+        self.ec_list, self.ecw_list, self.ecwr_list = [], [], []   # per-step expansion clamp
+        self.ect_list = []                       # per-step: shells heated (denom)
+        self.cur_vmax, self.cur_rmax = self.ref.Vmax, self.ref.rmax
+        self.t_last_revir = 0.
+        self.r_apo_ref = self.r   # running-max radius: the fallback's stable apocenter clock
+        self.dt_prev = np.inf
+        self.nstep = 0
+        self.t = 0.
+
+        # circuit breaker: freeze a tight, no-longer-stripping orbit. cb_streak counts
+        # consecutive re-virializations (~orbits) whose fractional mass loss stayed below
+        # freeze_strip; when it reaches freeze_orbits and the orbit is tight (t_dyn at the
+        # apocenter below freeze_tdyn) or the step budget is spent, the loop breaks and
+        # the settled state is returned frozen. Off unless freeze_strip is set.
+        self.cb_on = freeze_strip is not None
+        self.cb_streak, self.cb_m_ref = 0, None
+        self.cb_tsink_next = -np.inf  # next time the sink-time criterion is worth evaluating
+        self.cb_t_sink = np.nan  # sink time of the criterion that passed
+        self.cb_lt_lo = self.cb_eta_rout = np.nan   # the regime test the same criterion saw
+        self.r_lo = self.r_hi = self.r  # min / max radius over the current not-stripping streak
+        self.frozen = self.frozen_mfloor = self.frozen_budget = False
+        self.t_wall0 = self.t_log = time.time()   # call start; last heartbeat
+
+        # dt-weighted residence histogram (optional): caller supplies the radial and
+        # time bin edges, so the grid is chosen for the ensemble's orbits, not fixed here.
+        # dens_kernels adds one kernel-weighted companion histogram per callable w(r, v)
+        # (see EvolutionResult.dens_hist_k); the stellar physics stays with the caller.
+        self.dens_kernels = dens_kernels
+        self.dens_on = dens_redges is not None and dens_tedges is not None
+        if self.dens_on:
+            self.dens_redges = np.asarray(dens_redges, float)
+            self.dens_tedges = np.asarray(dens_tedges, float)
+            self.dens_hist = np.zeros((len(self.dens_redges) - 1,
+                                       len(self.dens_tedges) - 1))
+            self.dens_hist_k = (np.zeros((len(dens_kernels),) + self.dens_hist.shape)
+                                if dens_kernels else None)
+        else:
+            self.dens_redges = dens_redges
+            self.dens_tedges = dens_tedges
+            self.dens_hist = None
+            self.dens_hist_k = None
+
+    def step(self):
+        """Advance this subhalo by one accepted timestep. Returns False when the run
+        is over (disrupted, parked at r_stop, mass floor with early_terminate, or a
+        circuit-breaker freeze), True to keep going. Raises the same
+        PericentreUnresolvedError / HeatingUnbindsError the single-subhalo loop does,
+        with the residence and terminal state attached."""
+        if self.nstep >= self.max_steps:
             err = PericentreUnresolvedError(
-                f"exceeded max_steps={max_steps} at t={t:.3f}/{tmax} Gyr")
-            err.dens_hist, err.t_last, err.r_last = dens_hist, t, r
-            err.m_last = m
-            err.dens_hist_k = dens_hist_k
-            err.r_lo, err.r_hi = r_lo, r_hi          # settled span, for residence backfill
+                f"exceeded max_steps={self.max_steps} at t={self.t:.3f}/{self.tmax} Gyr")
+            err.dens_hist, err.t_last, err.r_last = self.dens_hist, self.t, self.r
+            err.m_last = self.m
+            err.dens_hist_k = self.dens_hist_k
+            err.r_lo, err.r_hi = self.r_lo, self.r_hi  # settled span, for residence backfill
             raise err
 
         # periodic heartbeat (off unless log_every set): a breadcrumb of the orbital state
         # so a run that stalls -- grinding a tight orbit -- can be diagnosed from the log
         # after the fact. Checked ~every 1000 steps to keep time() off the hot path.
-        if log_every is not None and (nstep & 1023) == 0:
+        if self.log_every is not None and (self.nstep & 1023) == 0:
             now = time.time()
-            if now - t_log >= log_every:
-                print(f"[evolve_heating_revirial] {label}: t={t:.3f}/{tmax:.1f} Gyr "
-                      f"r={r:.4g} kpc m={m:.4g} nstep={nstep} wall={now - t_wall0:.0f}s",
-                      flush=True)
-                t_log = now
+            if now - self.t_log >= self.log_every:
+                print(f"[evolve_heating_revirial] {self.label}: "
+                      f"t={self.t:.3f}/{self.tmax:.1f} Gyr "
+                      f"r={self.r:.4g} kpc m={self.m:.4g} nstep={self.nstep} "
+                      f"wall={now - self.t_wall0:.0f}s", flush=True)
+                self.t_log = now
 
-        t_orb = tdyn(potential, r)
-        dt_min = max(dt_abs, floor_orbit_frac * t_orb)
+        t_orb = tdyn(self.potential, self.r)
+        dt_min = max(self.dt_abs, self.floor_orbit_frac * t_orb)
         # disrupted: the accumulated (or trial) heating unbinds the analytic
         # profile -> no tidal radius; drive m to the floor and terminate.
         disrupted = False
-        if r > cfg.Rres and m > cfg.Mres:
+        if self.r > cfg.Rres and self.m > cfg.Mres:
             try:
-                exp_pred = _ExpandedProfile(r_ref, M_ref, sig2_ref, Q, c2)
-                T_strip_pred, _, _ = _t_strip(exp_pred, potential, o.xv,
-                                              lt_choice, t_dyn_mode, t_orb)
+                exp_pred = _ExpandedProfile(self.r_ref, self.M_ref, self.sig2_ref,
+                                            self.Q, self.c2)
+                T_strip_pred, _, _ = _t_strip(exp_pred, self.potential, self.o.xv,
+                                              self.lt_choice, self.t_dyn_mode, t_orb)
             except HeatingUnbindsError:
                 disrupted, T_strip_pred = True, np.inf
         else:
             T_strip_pred = np.inf
-        dt = min(step_frac * t_orb, step_frac * T_strip_pred / alpha,
-                 dt_growth_max * dt_prev, tmax - t)
+        dt = min(self.step_frac * t_orb, self.step_frac * T_strip_pred / self.alpha,
+                 self.dt_growth_max * self.dt_prev, self.tmax - self.t)
         dt = max(dt, dt_min)
 
         # defaults so a terminal-break step (r<=Rres / r_stop) leaves the
         # accumulators unchanged rather than referencing unset trial vars
-        Q_trial, tt_int_trial, tidalHR = Q, tt_int, hr_prev
-        strip_number, lt_step, M_at_lt = 0., lt, 0.
+        Q_trial, tt_int_trial, tidalHR = self.Q, self.tt_int, self.hr_prev
+        strip_number, lt_step, M_at_lt = 0., self.lt, 0.
         expand_tally = {}
-        t0, xv0_step = o.t, o.xv.copy()
+        t0, xv0_step = self.o.t, self.o.xv.copy()
         while True:
-            o.t, o.xv = t0, xv0_step.copy()
-            o.integrate(t + dt, potential, m if dynamical_friction else None)
-            xv = o.xv
+            self.o.t, self.o.xv = t0, xv0_step.copy()
+            self.o.integrate(self.t + dt, self.potential,
+                             self.m if self.dynamical_friction else None)
+            xv = self.o.xv
             r_new = np.sqrt(xv[0]**2 + xv[2]**2)
-            if r_new <= cfg.Rres or (r_stop is not None and r_new < r_stop):
+            if r_new <= cfg.Rres or (self.r_stop is not None and r_new < self.r_stop):
                 break
             V = np.sqrt(xv[3]**2 + xv[4]**2 + xv[5]**2)
             x, y, z_c = xv[0] * np.cos(xv[1]), xv[0] * np.sin(xv[1]), xv[2]
-            tt_cur = tidalTensor(potential, [x, y, z_c])
-            tt_int_trial = _cumulant_step(tt_int, tt_cur, beta_h, t_orb, dt)
+            tt_cur = tidalTensor(self.potential, [x, y, z_c])
+            tt_int_trial = _cumulant_step(self.tt_int, tt_cur, self.beta_h, t_orb, dt)
             T_shock = r_new / V if V > 0. else 1e10
-            adiabatic = (1. + (omega_p * T_shock)**2)**(-gamma)
-            tidalHR = (epsh / 3) * adiabatic * np.sum(tt_cur * tt_int_trial)
-            dQ = 0.5 * ((tidalHR if hr_prev is None else hr_prev) + tidalHR) * dt
-            Q_trial = max(Q + dQ, 0.)
+            adiabatic = (1. + (self.omega_p * T_shock)**2)**(-self.gamma)
+            tidalHR = (self.epsh / 3) * adiabatic * np.sum(tt_cur * tt_int_trial)
+            dQ = 0.5 * ((tidalHR if self.hr_prev is None else self.hr_prev) + tidalHR) * dt
+            Q_trial = max(self.Q + dQ, 0.)
 
-            if m <= cfg.Mres or disrupted:
+            if self.m <= cfg.Mres or disrupted:
                 strip_number, lt_step, M_at_lt, T_strip = 0., cfg.Rres, 0., np.inf
             else:
                 try:
-                    exp = _ExpandedProfile(r_ref, M_ref, sig2_ref, Q_trial, c2,
+                    exp = _ExpandedProfile(self.r_ref, self.M_ref, self.sig2_ref,
+                                           Q_trial, self.c2,
                                            tally=(expand_tally := {}))
                 except HeatingUnbindsError:
                     # the trial heating unbinds the profile; a smaller step lowers
@@ -1345,75 +1409,83 @@ def evolve_heating_revirial(host, numProfile0, xv0, tmax=10.,
                     strip_number, lt_step, M_at_lt, T_strip = 0., cfg.Rres, 0., np.inf
                 else:
                     T_strip, lt_step, M_at_lt = _t_strip(
-                        exp, potential, xv, lt_choice, t_dyn_mode, t_orb)
-                    strip_number = alpha * dt / T_strip
-            if strip_number > strip_number_max and dt > dt_min:
+                        exp, self.potential, xv, self.lt_choice, self.t_dyn_mode, t_orb)
+                    strip_number = self.alpha * dt / T_strip
+            if strip_number > self.strip_number_max and dt > dt_min:
                 dt = max(0.5 * dt, dt_min)
                 continue
-            if strip_number > strip_number_max:
+            if strip_number > self.strip_number_max:
                 err = PericentreUnresolvedError(
-                    f"strip number={strip_number:.1f} > {strip_number_max} at "
-                    f"dt_min={dt_min:.2e} Gyr, t={t:.3f} Gyr; unresolvable")
-                err.dens_hist, err.t_last, err.r_last = dens_hist, t, r
-                err.m_last = m
-                err.dens_hist_k = dens_hist_k
+                    f"strip number={strip_number:.1f} > {self.strip_number_max} at "
+                    f"dt_min={dt_min:.2e} Gyr, t={self.t:.3f} Gyr; unresolvable")
+                err.dens_hist, err.t_last, err.r_last = self.dens_hist, self.t, self.r
+                err.m_last = self.m
+                err.dens_hist_k = self.dens_hist_k
                 raise err
             break
 
-        t += dt
-        r = r_new
+        self.t += dt
+        self.r = r_new
         xv_step = xv.copy()  # full 6D cylindrical state at the accepted step
-        r_apo_ref = max(r_apo_ref, r_new)
-        if cb_on:
-            r_lo, r_hi = min(r_lo, r_new), max(r_hi, r_new)   # radial span over the streak
-        Q, tt_int, hr_prev = Q_trial, tt_int_trial, tidalHR
+        self.r_apo_ref = max(self.r_apo_ref, r_new)
+        if self.cb_on:
+            # radial span over the streak
+            self.r_lo, self.r_hi = min(self.r_lo, r_new), max(self.r_hi, r_new)
+        self.Q, self.tt_int, self.hr_prev = Q_trial, tt_int_trial, tidalHR
         # residence: m is the mass carried through this step (King62 strips below);
         # deposit it at the accepted orbital radius, all step outcomes included.
-        if dens_on:
+        if self.dens_on:
             v_step = (np.sqrt(xv_step[3]**2 + xv_step[4]**2 + xv_step[5]**2)
-                      if dens_hist_k is not None else None)
-            _dens_accumulate(dens_hist, dens_redges, dens_tedges, r_new, m,
-                             t - 0.5 * dt, dt,
-                             hist_k=dens_hist_k, kernels=dens_kernels, v=v_step)
+                      if self.dens_hist_k is not None else None)
+            _dens_accumulate(self.dens_hist, self.dens_redges, self.dens_tedges,
+                             r_new, self.m, self.t - 0.5 * dt, dt,
+                             hist_k=self.dens_hist_k, kernels=self.dens_kernels,
+                             v=v_step)
 
         if disrupted:
-            m = cfg.Mres
-            t_list.append(t); r_list.append(r_new); m_list.append(m); xv_list.append(xv_step)
-            vmax_list.append(cur_vmax); rmax_list.append(cur_rmax); lt_list.append(lt)
-            apo_list.append(False)
-            clamp_list.append(np.nan); cw_list.append(np.nan); cwr_list.append(np.nan)
-            ct_list.append(np.nan)
-            ec_list.append(expand_tally.get('shells', np.nan))
-            ecw_list.append(expand_tally.get('worst_pct', np.nan))
-            ecwr_list.append(expand_tally.get('worst_r', np.nan))
-            ect_list.append(expand_tally.get('total', np.nan))
-            break
+            self.m = cfg.Mres
+            self.t_list.append(self.t); self.r_list.append(r_new)
+            self.m_list.append(self.m); self.xv_list.append(xv_step)
+            self.vmax_list.append(self.cur_vmax); self.rmax_list.append(self.cur_rmax)
+            self.lt_list.append(self.lt)
+            self.apo_list.append(False)
+            self.clamp_list.append(np.nan); self.cw_list.append(np.nan)
+            self.cwr_list.append(np.nan)
+            self.ct_list.append(np.nan)
+            self.ec_list.append(expand_tally.get('shells', np.nan))
+            self.ecw_list.append(expand_tally.get('worst_pct', np.nan))
+            self.ecwr_list.append(expand_tally.get('worst_r', np.nan))
+            self.ect_list.append(expand_tally.get('total', np.nan))
+            return False
         if r_new <= cfg.Rres:
-            dt_prev = dt
-            continue
-        if r_stop is not None and r_new < r_stop:
+            self.dt_prev = dt
+            return True
+        if self.r_stop is not None and r_new < self.r_stop:
             # parked at the decay/stall radius: record the terminal state (bound
             # mass preserved, not floored) and stop before plunging to the cusp.
-            t_list.append(t); r_list.append(r_new); m_list.append(m); xv_list.append(xv_step)
-            vmax_list.append(cur_vmax); rmax_list.append(cur_rmax)
-            lt_list.append(lt); apo_list.append(False)
-            clamp_list.append(np.nan); cw_list.append(np.nan); cwr_list.append(np.nan)
-            ct_list.append(np.nan)
-            ec_list.append(np.nan); ecw_list.append(np.nan); ecwr_list.append(np.nan)
-            ect_list.append(np.nan)
-            break
+            self.t_list.append(self.t); self.r_list.append(r_new)
+            self.m_list.append(self.m); self.xv_list.append(xv_step)
+            self.vmax_list.append(self.cur_vmax); self.rmax_list.append(self.cur_rmax)
+            self.lt_list.append(self.lt); self.apo_list.append(False)
+            self.clamp_list.append(np.nan); self.cw_list.append(np.nan)
+            self.cwr_list.append(np.nan)
+            self.ct_list.append(np.nan)
+            self.ec_list.append(np.nan); self.ecw_list.append(np.nan)
+            self.ecwr_list.append(np.nan)
+            self.ect_list.append(np.nan)
+            return False
 
-        if m > cfg.Mres:
+        if self.m > cfg.Mres:
             # King62 removes only mass bound beyond lt. M(<lt) is read off the
             # analytically expanded profile, whose total mass is the last
             # re-virialization's bound mass (mass-conserving expansion) and so
             # exceeds the King62-reduced m; capping it at m keeps the relaxation
             # one-sided -- a lt enclosing all bound mass strips nothing, rather
             # than relaxing m back up.
-            m_lt = min(M_at_lt, m)
-            m = max(m_lt + (m - m_lt) * np.exp(-strip_number), cfg.Mres)
-            lt = lt_step
-            lt_min = min(lt_min, lt)
+            m_lt = min(M_at_lt, self.m)
+            self.m = max(m_lt + (self.m - m_lt) * np.exp(-strip_number), cfg.Mres)
+            self.lt = lt_step
+            self.lt_min = min(self.lt_min, self.lt)
 
         # re-virialize at apocenter (r local max): apply the accumulated heating in
         # one shell expansion and reshape to bound mass m. The fallback (for near-
@@ -1423,38 +1495,41 @@ def evolve_heating_revirial(host, numProfile0, xv0, tmax=10.,
         # eccentric orbit that already has a well-defined apocenter.
         step_clamp = (np.nan, np.nan, np.nan)
         step_total = np.nan
-        apo = (r_p1 is not None and r_p2 is not None
-               and r_p1 > r_p2 and r_p1 > r_new)
-        did_revir = ((apo or t - t_last_revir >= revir_fallback
-                      * tdyn(potential, r_apo_ref))
-                     and Q > 0. and m > cfg.Mres)
+        apo = (self.r_p1 is not None and self.r_p2 is not None
+               and self.r_p1 > self.r_p2 and self.r_p1 > r_new)
+        did_revir = ((apo or self.t - self.t_last_revir >= self.revir_fallback
+                      * tdyn(self.potential, self.r_apo_ref))
+                     and self.Q > 0. and self.m > cfg.Mres)
         if did_revir:
-            lt_join = lt_min if np.isfinite(lt_min) else lt
+            lt_join = self.lt_min if np.isfinite(self.lt_min) else self.lt
             try:
-                ref, m, tally = _revirialize(ref, Q, c2, m, lt_join,
-                                             truncation, tail_n, tail_xi)
+                self.ref, self.m, tally = _revirialize(
+                    self.ref, self.Q, self.c2, self.m, lt_join,
+                    self.truncation, self.tail_n, self.tail_xi)
             except HeatingUnbindsError as err:
                 # the accumulated heating unbinds the profile at re-virialization. Carry the
                 # residence and terminal orbital state so a caller can record the evolution up
                 # to here and classify the outcome, as PericentreUnresolvedError does; the
                 # engine still raises (the profile has no tidal radius past this point).
-                err.dens_hist, err.t_last, err.r_last, err.m_last = dens_hist, t, r, m
-                err.dens_hist_k = dens_hist_k
-                err.r_lo, err.r_hi = r_lo, r_hi
+                err.dens_hist, err.t_last = self.dens_hist, self.t
+                err.r_last, err.m_last = self.r, self.m
+                err.dens_hist_k = self.dens_hist_k
+                err.r_lo, err.r_hi = self.r_lo, self.r_hi
                 raise
             step_clamp = (tally['shells'], tally['worst_pct'], tally['worst_r'])
             step_total = tally['total']
-            r_ref, M_ref, sig2_ref = _reference_arrays(ref, c2)
-            omega_p = ref.omega_p
-            cur_vmax, cur_rmax = ref.Vmax, ref.rmax
-            Q, tt_int, hr_prev, lt_min = 0., np.zeros((3, 3)), None, np.inf
-            t_last_revir = t
+            self.r_ref, self.M_ref, self.sig2_ref = _reference_arrays(self.ref, self.c2)
+            self.omega_p = self.ref.omega_p
+            self.cur_vmax, self.cur_rmax = self.ref.Vmax, self.ref.rmax
+            self.Q, self.tt_int, self.hr_prev = 0., np.zeros((3, 3)), None
+            self.lt_min = np.inf
+            self.t_last_revir = self.t
             # relative-mass-floor freeze: below the floor the remnant's remaining
             # deposit anywhere is bounded by freeze_mfrac * m0 * (tmax - t), so no
             # orbit-shape gate is needed (see the docstring).
-            if freeze_mfrac is not None and m < freeze_mfrac * m0:
-                frozen = frozen_mfloor = True
-            if cb_on:
+            if self.freeze_mfrac is not None and self.m < self.freeze_mfrac * self.m0:
+                self.frozen = self.frozen_mfloor = True
+            if self.cb_on:
                 # freeze only a genuinely settled clump. Count consecutive orbits that shed
                 # less than freeze_strip of their bound mass; a stripping orbit resets the
                 # streak. Not-stripping is not enough: the orbit radius must also stay within
@@ -1464,18 +1539,21 @@ def evolve_heating_revirial(host, numProfile0, xv0, tmax=10.,
                 # an orbit): those rare passages are real central residence and must keep being
                 # integrated even though DF is off there (clamped log) and no mass strips.
                 # Freeze when the streak is long, the radius settled, and the orbit is tight
-                # (t_dyn at the outer radius below freeze_tdyn) or the wall-clock budget spent.
-                loss = 0. if cb_m_ref is None else (cb_m_ref - m) / cb_m_ref
-                if loss < freeze_strip:
-                    cb_streak += 1
+                # (t_dyn at the outer radius below freeze_tdyn) or the step budget spent.
+                loss = (0. if self.cb_m_ref is None
+                        else (self.cb_m_ref - self.m) / self.cb_m_ref)
+                if loss < self.freeze_strip:
+                    self.cb_streak += 1
                 else:
-                    cb_streak, r_lo, r_hi = 0, r_new, r_new       # reset streak + radial span
-                cb_m_ref = m
-                settled = (r_hi - r_lo) <= freeze_rspan * r_hi
-                tight = freeze_tdyn is not None and tdyn(potential, r_hi) < freeze_tdyn
-                slow = (freeze_walltime is not None
-                        and time.time() - t_wall0 > freeze_walltime)
-                if cb_streak >= freeze_orbits and settled:
+                    # reset streak + radial span
+                    self.cb_streak, self.r_lo, self.r_hi = 0, r_new, r_new
+                self.cb_m_ref = self.m
+                settled = (self.r_hi - self.r_lo) <= self.freeze_rspan * self.r_hi
+                tight = (self.freeze_tdyn is not None
+                         and tdyn(self.potential, self.r_hi) < self.freeze_tdyn)
+                spent = (self.freeze_nstep is not None
+                         and self.nstep > self.freeze_nstep)
+                if self.cb_streak >= self.freeze_orbits and settled:
                     if tight:
                         # the streak shows past quiescence only; with DF on,
                         # a settled orbit can still decay into the stripping
@@ -1487,107 +1565,122 @@ def evolve_heating_revirial(host, numProfile0, xv0, tmax=10.,
                         # streak criteria would already have frozen -- and
                         # memoized: a failed test cannot pass before
                         # T_rem shrinks below t_sink/safety.
-                        if freeze_tsink is None or not dynamical_friction:
-                            frozen = True
-                        elif t >= cb_tsink_next:
+                        if self.freeze_tsink is None or not self.dynamical_friction:
+                            self.frozen = True
+                        elif self.t >= self.cb_tsink_next:
                             regime = {}
                             r_ev = _freeze_event_radius(
-                                ref, potential, m, r_lo, r_stop, lt_choice,
-                                freeze_tsink.get('eta', 1.2), tally=regime)
+                                self.ref, self.potential, self.m, self.r_lo,
+                                self.r_stop, self.lt_choice,
+                                self.freeze_tsink.get('eta', 1.2), tally=regime)
                             t_sink = (np.inf if r_ev is None
-                                      else 0. if r_ev >= r_lo
-                                      else df_sink_time(potential, m, r_lo, r_ev))
-                            safety = freeze_tsink.get('safety', 2.)
-                            if t_sink > safety * (tmax - t):
-                                frozen = True
-                                cb_t_sink = t_sink
-                                cb_lt_lo = regime.get('lt_lo', np.nan)
-                                cb_eta_rout = regime.get('eta_rout', np.nan)
+                                      else 0. if r_ev >= self.r_lo
+                                      else df_sink_time(self.potential, self.m,
+                                                        self.r_lo, r_ev))
+                            safety = self.freeze_tsink.get('safety', 2.)
+                            if t_sink > safety * (self.tmax - self.t):
+                                self.frozen = True
+                                self.cb_t_sink = t_sink
+                                self.cb_lt_lo = regime.get('lt_lo', np.nan)
+                                self.cb_eta_rout = regime.get('eta_rout', np.nan)
                             else:
                                 # earliest time it could pass with unchanged
                                 # state; re-check at least every 0.5 Gyr (mass
                                 # loss weakens the drag and lengthens t_sink)
-                                cb_tsink_next = min(tmax - t_sink / safety,
-                                                   t + 0.5)
-                    if not frozen and slow:
-                        frozen = frozen_wall = True
+                                self.cb_tsink_next = min(self.tmax - t_sink / safety,
+                                                         self.t + 0.5)
+                    if not self.frozen and spent:
+                        self.frozen = self.frozen_budget = True
 
         # Vmax/rmax step-update at re-virialization; carry between (aligned to t).
-        t_list.append(t); r_list.append(r_new); m_list.append(m); xv_list.append(xv_step)
-        vmax_list.append(cur_vmax); rmax_list.append(cur_rmax); lt_list.append(lt)
-        apo_list.append(did_revir)
-        clamp_list.append(step_clamp[0]); cw_list.append(step_clamp[1])
-        cwr_list.append(step_clamp[2])
-        ct_list.append(step_total)
-        ec_list.append(expand_tally.get('shells', np.nan))
-        ecw_list.append(expand_tally.get('worst_pct', np.nan))
-        ecwr_list.append(expand_tally.get('worst_r', np.nan))
-        ect_list.append(expand_tally.get('total', np.nan))
-        r_p2, r_p1 = r_p1, r_new
-        dt_prev = dt
-        nstep += 1
-        if early_terminate and m <= cfg.Mres:
-            break
-        if frozen:            # circuit breaker: settled + no longer stripping
-            break
+        self.t_list.append(self.t); self.r_list.append(r_new)
+        self.m_list.append(self.m); self.xv_list.append(xv_step)
+        self.vmax_list.append(self.cur_vmax); self.rmax_list.append(self.cur_rmax)
+        self.lt_list.append(self.lt)
+        self.apo_list.append(did_revir)
+        self.clamp_list.append(step_clamp[0]); self.cw_list.append(step_clamp[1])
+        self.cwr_list.append(step_clamp[2])
+        self.ct_list.append(step_total)
+        self.ec_list.append(expand_tally.get('shells', np.nan))
+        self.ecw_list.append(expand_tally.get('worst_pct', np.nan))
+        self.ecwr_list.append(expand_tally.get('worst_r', np.nan))
+        self.ect_list.append(expand_tally.get('total', np.nan))
+        self.r_p2, self.r_p1 = self.r_p1, r_new
+        self.dt_prev = dt
+        self.nstep += 1
+        if self.early_terminate and self.m <= cfg.Mres:
+            return False
+        if self.frozen:       # circuit breaker: settled + no longer stripping
+            return False
+        return True
 
-    # Flush heating accumulated since the last apocenter into a final
-    # re-virialization, so the reported final (m, Vmax, rmax, profile) describe one
-    # self-consistent equilibrium rather than a current m against a stale last-
-    # apocenter structure. If the run ends mid-orbit this is the equilibrium the
-    # subhalo relaxes toward (settling takes ~a dynamical time). Skipped once
-    # disrupted (m at the floor) -- there is nothing to settle.
-    if Q > 0. and m > cfg.Mres and t_list:
-        lt_join = lt_min if np.isfinite(lt_min) else lt
-        ref, m, tally = _revirialize(ref, Q, c2, m, lt_join, truncation, tail_n, tail_xi)
-        m_list[-1], vmax_list[-1], rmax_list[-1] = m, ref.Vmax, ref.rmax
-        apo_list[-1] = True   # the flushed final state is a re-virialized equilibrium
-        clamp_list[-1], cw_list[-1], cwr_list[-1] = (
-            tally['shells'], tally['worst_pct'], tally['worst_r'])
-        ct_list[-1] = tally['total']
+    def finish(self):
+        """Flush the pending heating into a closing re-virialization and assemble the
+        EvolutionResult. Call once, after the driver stops stepping."""
+        # Flush heating accumulated since the last apocenter into a final
+        # re-virialization, so the reported final (m, Vmax, rmax, profile) describe one
+        # self-consistent equilibrium rather than a current m against a stale last-
+        # apocenter structure. If the run ends mid-orbit this is the equilibrium the
+        # subhalo relaxes toward (settling takes ~a dynamical time). Skipped once
+        # disrupted (m at the floor) -- there is nothing to settle.
+        if self.Q > 0. and self.m > cfg.Mres and self.t_list:
+            lt_join = self.lt_min if np.isfinite(self.lt_min) else self.lt
+            self.ref, self.m, tally = _revirialize(
+                self.ref, self.Q, self.c2, self.m, lt_join,
+                self.truncation, self.tail_n, self.tail_xi)
+            self.m_list[-1] = self.m
+            self.vmax_list[-1], self.rmax_list[-1] = self.ref.Vmax, self.ref.rmax
+            # the flushed final state is a re-virialized equilibrium
+            self.apo_list[-1] = True
+            self.clamp_list[-1], self.cw_list[-1], self.cwr_list[-1] = (
+                tally['shells'], tally['worst_pct'], tally['worst_r'])
+            self.ct_list[-1] = tally['total']
 
-    # Final equilibrium profile sampled onto a log grid over the bound extent.
-    # The per-dt loop tracks only scalars; the revirial cadence emits one profile
-    # snapshot -- the settled remnant rho(r)/M(r) for callers that inspect the
-    # profile (the calibration likelihood ignores these fields).
-    if np.isfinite(ref.rh) and ref.rh > cfg.Rres:
-        rg = np.logspace(np.log10(cfg.Rres), np.log10(ref.rh), 100)
-        r_grid = rg[None, :]
-        rho_grid = np.asarray(ref.rho(rg), float)[None, :]
-        M_grid = np.asarray(ref.M(rg), float)[None, :]
-        snap_steps = np.asarray([nstep])
-    else:
-        r_grid = rho_grid = M_grid = np.zeros((1, 1))
-        snap_steps = np.asarray([])
+        # Final equilibrium profile sampled onto a log grid over the bound extent.
+        # The per-dt loop tracks only scalars; the revirial cadence emits one profile
+        # snapshot -- the settled remnant rho(r)/M(r) for callers that inspect the
+        # profile (the calibration likelihood ignores these fields).
+        if np.isfinite(self.ref.rh) and self.ref.rh > cfg.Rres:
+            rg = np.logspace(np.log10(cfg.Rres), np.log10(self.ref.rh), 100)
+            r_grid = rg[None, :]
+            rho_grid = np.asarray(self.ref.rho(rg), float)[None, :]
+            M_grid = np.asarray(self.ref.M(rg), float)[None, :]
+            snap_steps = np.asarray([self.nstep])
+        else:
+            r_grid = rho_grid = M_grid = np.zeros((1, 1))
+            snap_steps = np.asarray([])
 
-    return EvolutionResult(
-        t=np.asarray(t_list), r=np.asarray(r_list), m=np.asarray(m_list),
-        vmax=np.asarray(vmax_list), rmax=np.asarray(rmax_list),
-        lt=np.asarray(lt_list),
-        r_grid=r_grid, rho_snapshots=rho_grid,
-        M_snapshots=M_grid, snapshot_steps=snap_steps,
-        rmax0=rmax0, vmax0=vmax0, label=label,
-        xv=np.asarray(xv_list).reshape(-1, 6),
-        apo=np.asarray(apo_list, dtype=bool),
-        clamp=np.asarray(clamp_list), clamp_total=np.asarray(ct_list),
-        clamp_worst=np.asarray(cw_list), clamp_worst_r=np.asarray(cwr_list),
-        expand_clamp=np.asarray(ec_list), expand_clamp_total=np.asarray(ect_list),
-        expand_clamp_worst=np.asarray(ecw_list),
-        expand_clamp_worst_r=np.asarray(ecwr_list),
-        dens_hist=dens_hist,
-        dens_hist_k=dens_hist_k,
-        frozen=frozen,
-        frozen_wall=frozen_wall,
-        frozen_mfloor=frozen_mfloor,
-        # a breaker freeze breaks the loop on the spot, so r_lo here is still the streak
-        # minimum the sink-time criterion measured from. The mass-floor freeze evaluates
-        # no streak -- and with the breaker off r_lo is never updated at all -- so it has
-        # no such radius to report.
-        freeze_r_lo=(r_lo if frozen and not frozen_mfloor else np.nan),
-        freeze_t_sink=cb_t_sink,
-        freeze_lt_lo=cb_lt_lo,
-        freeze_eta_rout=cb_eta_rout,
-    )
+        return EvolutionResult(
+            t=np.asarray(self.t_list), r=np.asarray(self.r_list),
+            m=np.asarray(self.m_list),
+            vmax=np.asarray(self.vmax_list), rmax=np.asarray(self.rmax_list),
+            lt=np.asarray(self.lt_list),
+            r_grid=r_grid, rho_snapshots=rho_grid,
+            M_snapshots=M_grid, snapshot_steps=snap_steps,
+            rmax0=self.rmax0, vmax0=self.vmax0, label=self.label,
+            xv=np.asarray(self.xv_list).reshape(-1, 6),
+            apo=np.asarray(self.apo_list, dtype=bool),
+            clamp=np.asarray(self.clamp_list), clamp_total=np.asarray(self.ct_list),
+            clamp_worst=np.asarray(self.cw_list),
+            clamp_worst_r=np.asarray(self.cwr_list),
+            expand_clamp=np.asarray(self.ec_list),
+            expand_clamp_total=np.asarray(self.ect_list),
+            expand_clamp_worst=np.asarray(self.ecw_list),
+            expand_clamp_worst_r=np.asarray(self.ecwr_list),
+            dens_hist=self.dens_hist,
+            dens_hist_k=self.dens_hist_k,
+            frozen=self.frozen,
+            frozen_budget=self.frozen_budget,
+            frozen_mfloor=self.frozen_mfloor,
+            # a breaker freeze breaks the loop on the spot, so r_lo here is still the
+            # streak minimum the sink-time criterion measured from. The mass-floor freeze
+            # evaluates no streak -- and with the breaker off r_lo is never updated at
+            # all -- so it has no such radius to report.
+            freeze_r_lo=(self.r_lo if self.frozen and not self.frozen_mfloor else np.nan),
+            freeze_t_sink=self.cb_t_sink,
+            freeze_lt_lo=self.cb_lt_lo,
+            freeze_eta_rout=self.cb_eta_rout,
+        )
 
 
 # ---plotting
