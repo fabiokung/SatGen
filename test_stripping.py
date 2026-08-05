@@ -1,5 +1,5 @@
 """
-Unit and smoke tests for evolve_heating() in stripping_common.py
+Unit and smoke tests for evolve_heating() in tidal_engine.py
 and for NumericProfile / SIS in subhalo_functions.py.
 
 Run with:
@@ -12,8 +12,9 @@ import pytest
 import config as cfg
 from profiles import NFW, Vcirc as standalone_Vcirc, tdyn as standalone_tdyn
 import stripping_common as sc
-from stripping_common import EvolutionResult
+import tidal_engine as te
 from subhalo_functions import NumericProfile, SIS, heat_profile, _log_pchip
+from tidal_engine import EvolutionResult
 
 
 # ---------------------------------------------------------------------------
@@ -75,7 +76,7 @@ def _finite_entries_positive(arr):
 class TestFirstOrder:
     def test_smoke(self, host, p0, xv0_eccentric, t_dyn_mode):
         """run completes, returns EvolutionResult with sane arrays"""
-        res = sc.evolve_heating(host, p0, xv0_eccentric,
+        res = te.evolve_heating(host, p0, xv0_eccentric,
                                 tmax=5., Nstep=200, second_order=False,
                                 t_dyn_mode=t_dyn_mode)
         assert isinstance(res, EvolutionResult)
@@ -90,10 +91,10 @@ class TestFirstOrder:
 
     def test_deterministic(self, host, p0, xv0_eccentric, t_dyn_mode):
         """two identical runs must produce bit-identical output"""
-        r1 = sc.evolve_heating(host, p0, xv0_eccentric,
+        r1 = te.evolve_heating(host, p0, xv0_eccentric,
                                tmax=5., Nstep=200, second_order=False,
                                t_dyn_mode=t_dyn_mode)
-        r2 = sc.evolve_heating(host, p0, xv0_eccentric,
+        r2 = te.evolve_heating(host, p0, xv0_eccentric,
                                tmax=5., Nstep=200, second_order=False,
                                t_dyn_mode=t_dyn_mode)
         np.testing.assert_array_equal(r1.m, r2.m)
@@ -101,7 +102,7 @@ class TestFirstOrder:
 
     def test_explicit_false_kwarg(self, host, p0, xv0_eccentric, t_dyn_mode):
         """explicit second_order=False label kwarg must not crash"""
-        res = sc.evolve_heating(host, p0, xv0_eccentric,
+        res = te.evolve_heating(host, p0, xv0_eccentric,
                                 tmax=5., Nstep=200, second_order=False,
                                 label='test-first-order', t_dyn_mode=t_dyn_mode)
         assert res.label == 'test-first-order'
@@ -114,7 +115,7 @@ class TestFirstOrder:
 class TestSecondOrder:
     def test_smoke(self, host, p0, xv0_eccentric, t_dyn_mode):
         """second_order=True completes with sane arrays"""
-        res = sc.evolve_heating(host, p0, xv0_eccentric,
+        res = te.evolve_heating(host, p0, xv0_eccentric,
                                 tmax=5., Nstep=200, second_order=True,
                                 t_dyn_mode=t_dyn_mode)
         assert isinstance(res, EvolutionResult)
@@ -125,10 +126,10 @@ class TestSecondOrder:
 
     def test_more_aggressive_than_first_order(self, host, p0, xv0_eccentric, t_dyn_mode):
         """second-order heating should strip at least as much as first-order"""
-        r1 = sc.evolve_heating(host, p0, xv0_eccentric,
+        r1 = te.evolve_heating(host, p0, xv0_eccentric,
                                tmax=5., Nstep=200, second_order=False,
                                t_dyn_mode=t_dyn_mode)
-        r2 = sc.evolve_heating(host, p0, xv0_eccentric,
+        r2 = te.evolve_heating(host, p0, xv0_eccentric,
                                tmax=5., Nstep=200, second_order=True,
                                t_dyn_mode=t_dyn_mode)
         # final bound mass: second-order <= first-order (or very close)
@@ -141,14 +142,14 @@ class TestSecondOrder:
 
 class TestCircularOrbit:
     def test_first_order_circular(self, host, p0, xv0_circular, t_dyn_mode):
-        res = sc.evolve_heating(host, p0, xv0_circular,
+        res = te.evolve_heating(host, p0, xv0_circular,
                                 tmax=5., Nstep=200, second_order=False,
                                 t_dyn_mode=t_dyn_mode)
         assert res.m[-1] > 0.
         assert _finite_positive(res.m)
 
     def test_second_order_circular(self, host, p0, xv0_circular, t_dyn_mode):
-        res = sc.evolve_heating(host, p0, xv0_circular,
+        res = te.evolve_heating(host, p0, xv0_circular,
                                 tmax=5., Nstep=200, second_order=True,
                                 t_dyn_mode=t_dyn_mode)
         assert res.m[-1] > 0.
@@ -165,7 +166,7 @@ class TestSmoothness:
         log-step is a robust check that tolerates the (physical) big drops at
         each peri shock without being fooled by per-step noise.
         """
-        res = sc.evolve_heating(host, p0, xv0_eccentric,
+        res = te.evolve_heating(host, p0, xv0_eccentric,
                                 tmax=50., Nstep=2000, second_order=True,
                                 t_dyn_mode=t_dyn_mode)
         rmax0 = res.rmax0
@@ -187,13 +188,13 @@ class TestTimestep:
     def test_timestep_too_large(self, host, p0, xv0_eccentric, t_dyn_mode):
         """too few steps → dt > 0.5*t_dyn at pericentre → ValueError"""
         with pytest.raises(ValueError, match="dt/t_dyn"):
-            sc.evolve_heating(host, p0, xv0_eccentric,
+            te.evolve_heating(host, p0, xv0_eccentric,
                               tmax=10., Nstep=50, second_order=False,
                               t_dyn_mode=t_dyn_mode)
 
     def test_timestep_ok(self, host, p0, xv0_eccentric, t_dyn_mode):
         """adequate Nstep must not raise"""
-        res = sc.evolve_heating(host, p0, xv0_eccentric,
+        res = te.evolve_heating(host, p0, xv0_eccentric,
                                 tmax=5., Nstep=200, second_order=False,
                                 t_dyn_mode=t_dyn_mode)
         assert res.m[-1] > 0.
@@ -334,7 +335,7 @@ class TestNumericProfileSplines:
         hSIS = SIS(3.7e12)
         eta = (50. / 1.022) / hSIS.Vc
         xv0, _ = sc.make_orbit(hSIS, R0=200., z0=0., eta=eta)
-        res = sc.evolve_heating(
+        res = te.evolve_heating(
             hSIS, NumericProfile(rvals, sat.M(rvals)), xv0,
             tmax=30., Nstep=10000, epsh=3., gamma=1.5,
             second_order=True, n_snapshots=10, t_dyn_mode=t_dyn_mode,
@@ -377,7 +378,7 @@ class TestNumericProfileSplines:
         eta = (50. / 1.022) / hSIS.Vc
         xv0, _ = sc.make_orbit(hSIS, R0=200., z0=0., eta=eta)
 
-        res = sc.evolve_heating(
+        res = te.evolve_heating(
             hSIS, NumericProfile(rvals, sat.M(rvals)), xv0,
             tmax=10., Nstep=5000, epsh=3., gamma=1.5,
             second_order=True, n_snapshots=10, t_dyn_mode=t_dyn_mode,
@@ -460,7 +461,7 @@ class TestSnapshotGrid:
     def test_r_grid_per_snapshot(self, host, p0, xv0_eccentric, t_dyn_mode):
         """r_grid is (n_snapshots, n_radii) and each row covers the bound
         profile at that snapshot."""
-        res = sc.evolve_heating(host, p0, xv0_eccentric,
+        res = te.evolve_heating(host, p0, xv0_eccentric,
                                 tmax=5., Nstep=200, second_order=False,
                                 n_snapshots=10, t_dyn_mode=t_dyn_mode)
         assert res.r_grid.ndim == 2
@@ -474,7 +475,7 @@ class TestSnapshotGrid:
     def test_M_snapshots_no_flat_regions(self, host, p0, xv0_eccentric, t_dyn_mode):
         """M(<r) on each snapshot grid must not contain large flat segments
         (which would indicate boundary extrapolation)."""
-        res = sc.evolve_heating(host, p0, xv0_eccentric,
+        res = te.evolve_heating(host, p0, xv0_eccentric,
                                 tmax=5., Nstep=200, second_order=True,
                                 n_snapshots=10, t_dyn_mode=t_dyn_mode)
         for i in range(res.M_snapshots.shape[0]):

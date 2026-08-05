@@ -106,6 +106,7 @@ def run_one(spec):
     so the Pool can pickle it."""
     import config as cfg
     import stripping_common as sc
+    import tidal_engine as te
     import stripping_galacticus as sg
     from subhalo_functions import (NumericProfile, ShellClampWarning,
                                    truncate_kazantzidis)
@@ -128,7 +129,7 @@ def run_one(spec):
                                           r_decay=rvir, slope=s_rvir)
             res = sg.evolve_galacticus(hNFW, infall, xv0, rvir, **kw)
         else:
-            res = sc.evolve_heating(hNFW, NumericProfile(rvals, M_sub), xv0,
+            res = te.evolve_heating(hNFW, NumericProfile(rvals, M_sub), xv0,
                                     truncation=spec['model'], **kw, **spec['tail'])
     clamped = [w for w in caught if issubclass(w.category, ShellClampWarning)]
     shells = sum(int(re.search(r'clamped (\d+) shell', str(w.message)).group(1))  # type: ignore[union-attr]

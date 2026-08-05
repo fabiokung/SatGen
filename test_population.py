@@ -3,6 +3,7 @@ import pytest
 
 import config as cfg
 import stripping_common as sc
+import tidal_engine as te
 from population import clump_field, evolve_population
 from subhalo_functions import NumericProfile
 
@@ -22,7 +23,7 @@ TMAX = 3.
 
 
 def _solo(host, num0, xv0, **kw):
-    return sc.evolve_heating_revirial(host, num0, xv0, tmax=TMAX, **ENGINE, **kw)
+    return te.evolve_heating_revirial(host, num0, xv0, tmax=TMAX, **ENGINE, **kw)
 
 
 def test_uncoupled_population_matches_separate_runs(pop_setup):

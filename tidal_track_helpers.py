@@ -9,6 +9,7 @@ from profiles import NFW, Vcirc
 from orbit import orbit
 from subhalo_functions import NumericProfile
 import stripping_common as sc
+import tidal_engine as te
 
 
 def eta_for_rp_ra(host, R0, rp_ra):
@@ -55,7 +56,7 @@ def evolve_one(params):
     # T_dyn,sub(lt) (the tidal-tensor cumulant always decays on the host
     # orbital time); this exposes the post-pericentre quiescent stairsteps
     # in (rmax, vmax) that flag the transition into deep stripping.
-    res = sc.evolve_heating(
+    res = te.evolve_heating(
         hNFW, NumericProfile(rvals, M_sub_arr), xv0,
         tmax=30., Nstep=30000,
         epsh=3., gamma=1.5, beta_h=1., alpha=1.,

@@ -23,6 +23,7 @@ from profiles import NFW
 from subhalo_functions import NumericProfile, truncate_kazantzidis
 from orbit import orbit
 import stripping_common as sc
+import tidal_engine as te
 
 
 @pytest.fixture
@@ -46,11 +47,11 @@ def _run(setup, truncation, second_order=False, engine='uniform'):
     hNFW, rvals, M_sub, xv0_20 = setup
     sub = NumericProfile(rvals, M_sub)
     if engine == 'revirial':
-        return sc.evolve_heating_revirial(
+        return te.evolve_heating_revirial(
             hNFW, sub, xv0_20, tmax=12., step_frac=0.02,
             epsh=0.0741, gamma=0., beta_h=0.278, alpha=3.93, t_dyn_mode='sub_lt',
             second_order=second_order, truncation=truncation)
-    return sc.evolve_heating(
+    return te.evolve_heating(
         hNFW, sub, xv0_20, tmax=12., Nstep=12000,
         epsh=0.0741, gamma=0., beta_h=0.278, alpha=3.93, t_dyn_mode='sub_lt',
         second_order=second_order, truncation=truncation)
@@ -68,11 +69,11 @@ def test_dens_hist_conserves_residence_and_localizes(du24_setup):
     sub = NumericProfile(rvals, M_sub)
     redges = np.logspace(-4, np.log10(500.), 60)
     tedges = np.linspace(0., 12., 6)                     # 5 time chunks
-    res = sc.evolve_heating_revirial(
+    res = te.evolve_heating_revirial(
         hNFW, sub, xv0_20, tmax=12., step_frac=0.02, epsh=0.0741, gamma=0.,
         beta_h=0.278, alpha=3.93, t_dyn_mode='sub_lt', truncation='hard',
         dens_redges=redges, dens_tedges=tedges)
-    bare = sc.evolve_heating_revirial(
+    bare = te.evolve_heating_revirial(
         hNFW, NumericProfile(rvals, M_sub), xv0_20, tmax=12., step_frac=0.02,
         epsh=0.0741, gamma=0., beta_h=0.278, alpha=3.93, t_dyn_mode='sub_lt',
         truncation='hard')
@@ -104,10 +105,10 @@ def test_dens_kernels_weighted_residence(du24_setup):
     kw = dict(tmax=12., step_frac=0.02, epsh=0.0741, gamma=0., beta_h=0.278,
               alpha=3.93, t_dyn_mode='sub_lt', truncation='hard',
               dens_redges=redges, dens_tedges=tedges)
-    res = sc.evolve_heating_revirial(
+    res = te.evolve_heating_revirial(
         hNFW, NumericProfile(rvals, M_sub), xv0_20,
         dens_kernels=[lambda r, v: 1., lambda r, v: v], **kw)
-    bare = sc.evolve_heating_revirial(hNFW, NumericProfile(rvals, M_sub), xv0_20, **kw)
+    bare = te.evolve_heating_revirial(hNFW, NumericProfile(rvals, M_sub), xv0_20, **kw)
 
     Hk = res.dens_hist_k
     assert Hk is not None and Hk.shape == (2, len(redges) - 1, len(tedges) - 1)
@@ -163,12 +164,12 @@ def test_powerlaw_tail_survives_at_calibrated_params(du24_setup, engine):
     hNFW, rvals, M_sub, xv0_20 = du24_setup
     sub = NumericProfile(rvals, M_sub)
     if engine == 'revirial':
-        res = sc.evolve_heating_revirial(
+        res = te.evolve_heating_revirial(
             hNFW, sub, xv0_20, tmax=12., step_frac=0.02,
             epsh=0.0708, gamma=0.0094, beta_h=0.906, alpha=0.171, f2=0.188,
             t_dyn_mode='sub_lt', second_order=True, truncation='powerlaw')
     else:
-        res = sc.evolve_heating(
+        res = te.evolve_heating(
             hNFW, sub, xv0_20, tmax=12., Nstep=12000,
             epsh=0.0708, gamma=0.0094, beta_h=0.906, alpha=0.171, f2=0.188,
             t_dyn_mode='sub_lt', second_order=True, truncation='powerlaw')
@@ -248,10 +249,10 @@ def test_expanded_profile_raises_when_heating_unbinds():
     r_ref = prof.ri
     M_ref = np.asarray(prof.M(r_ref), float)
     sig2 = np.zeros_like(r_ref)
-    sc._ExpandedProfile(r_ref, M_ref, sig2, Q=1e-20, c2=0.)   # gentle: intact
+    te._ExpandedProfile(r_ref, M_ref, sig2, Q=1e-20, c2=0.)   # gentle: intact
     Q_huge = 1e10 * cfg.G * prof.Mh / prof.rh                 # unbinds the halo
     with pytest.raises(HeatingUnbindsError):
-        sc._ExpandedProfile(r_ref, M_ref, sig2, Q=Q_huge, c2=0.)
+        te._ExpandedProfile(r_ref, M_ref, sig2, Q=Q_huge, c2=0.)
 
 
 def test_revirial_heating_unbinds_disrupts_gracefully(du24_setup):
@@ -267,7 +268,7 @@ def test_revirial_heating_unbinds_disrupts_gracefully(du24_setup):
     M_core = np.where(rvals < rc, 4. / 3. * np.pi * rvals ** 3 * rho0,
                       np.asarray(sat.M(rvals), float))
     sub = NumericProfile(rvals, M_core)
-    res = sc.evolve_heating_revirial(
+    res = te.evolve_heating_revirial(
         hNFW, sub, xv0_20, tmax=12., step_frac=0.02, epsh=6., gamma=0.,
         beta_h=1., alpha=1., t_dyn_mode='sub_lt', truncation='hard',
         lt_choice='Tormen98')
@@ -280,7 +281,7 @@ def test_revirial_heating_unbinds_disrupts_gracefully(du24_setup):
 
 def _final_mass_ratio(setup, nstep, alpha=3.93):
     hNFW, rvals, M_sub, xv0_20 = setup
-    res = sc.evolve_heating(
+    res = te.evolve_heating(
         hNFW, NumericProfile(rvals, M_sub), xv0_20,
         tmax=12., Nstep=nstep, epsh=0.0741, gamma=0., beta_h=0.278,
         alpha=alpha, t_dyn_mode='sub_lt', second_order=True,
@@ -309,7 +310,7 @@ def test_strip_cfl_guard_raises_on_coarse_step(du24_setup):
     threshold while the subhalo is actively stripping."""
     hNFW, rvals, M_sub, xv0_20 = du24_setup
     with pytest.raises(ValueError, match=r"alpha\*dt/T_strip"):
-        sc.evolve_heating(
+        te.evolve_heating(
             hNFW, NumericProfile(rvals, M_sub), xv0_20,
             tmax=12., Nstep=2000, epsh=0.0741, gamma=0., beta_h=0.278,
             alpha=50., t_dyn_mode='sub_lt', second_order=True,
@@ -324,7 +325,7 @@ def test_r_stop_parks_and_early_terminates(du24_setup):
     xv0, _ = sc.make_orbit(hNFW, R0=0.5 * hNFW.rh, z0=0., eta=0.3)  # eccentric
     r0 = np.hypot(xv0[0], xv0[2])
     rstop = 0.6 * r0                       # pericentre < r_stop < r0
-    res = sc.evolve_heating(
+    res = te.evolve_heating(
         hNFW, NumericProfile(rvals, M_sub), xv0, tmax=12., Nstep=2000,
         epsh=0.0741, gamma=0., beta_h=0.278, alpha=3.93, t_dyn_mode='sub_lt',
         truncation='hard', dynamical_friction=False, r_stop=rstop)
@@ -343,7 +344,7 @@ def _cb_run(du24_setup, **cb):
     so the other criteria can be tested in isolation; the radial-span gate has its own test."""
     hNFW, rvals, M_sub, xv0_20 = du24_setup
     cb.setdefault('freeze_rspan', 1.0)
-    return sc.evolve_heating_revirial(
+    return te.evolve_heating_revirial(
         hNFW, NumericProfile(rvals, M_sub), xv0_20, tmax=12., step_frac=0.02,
         epsh=0.0741, gamma=0., beta_h=0.278, alpha=3.93, t_dyn_mode='sub_lt',
         truncation='hard', **cb)
@@ -458,7 +459,7 @@ def test_mass_floor_freeze_reports_no_streak_radius(du24_setup):
     radius: reporting the running r_lo there would hand back the launch radius."""
     hNFW, rvals, M_sub, xv0_20 = du24_setup
     m0 = M_sub[-1]
-    res = sc.evolve_heating_revirial(
+    res = te.evolve_heating_revirial(
         hNFW, NumericProfile(rvals, M_sub), xv0_20, tmax=12., step_frac=0.02,
         epsh=0.0741, gamma=0., beta_h=0.278, alpha=3.93, t_dyn_mode='sub_lt',
         truncation='hard', freeze_mfrac=0.5)
@@ -510,7 +511,7 @@ def test_evolve_heating_df_off_matches_collisionless(du24_setup):
     hNFW, rvals, M_sub, xv0_20 = du24_setup
     ns = 12000
     timesteps = np.linspace(0., 12., ns + 1)[1:]
-    res_off = sc.evolve_heating(
+    res_off = te.evolve_heating(
         hNFW, NumericProfile(rvals, M_sub), xv0_20, tmax=12., Nstep=ns,
         epsh=0.0741, gamma=0., beta_h=0.278, alpha=3.93, t_dyn_mode='sub_lt',
         second_order=True, truncation='kazantzidis', dynamical_friction=False)
@@ -520,7 +521,7 @@ def test_evolve_heating_df_off_matches_collisionless(du24_setup):
     fin = np.isfinite(res_off.r)
     assert np.allclose(res_off.r[fin], r_bare[fin], rtol=1e-9, atol=0.), \
         "DF-off orbit must match the bare collisionless integration"
-    res_on = sc.evolve_heating(
+    res_on = te.evolve_heating(
         hNFW, NumericProfile(rvals, M_sub), xv0_20, tmax=12., Nstep=ns,
         epsh=0.0741, gamma=0., beta_h=0.278, alpha=3.93, t_dyn_mode='sub_lt',
         second_order=True, truncation='kazantzidis', dynamical_friction=True)
@@ -531,7 +532,7 @@ def test_evolve_heating_df_off_matches_collisionless(du24_setup):
 
 def _revir(setup, **kw):
     hNFW, rvals, M_sub, xv0_20 = setup
-    return sc.evolve_heating_revirial(
+    return te.evolve_heating_revirial(
         hNFW, NumericProfile(rvals, M_sub), xv0_20, tmax=12.,
         epsh=0.0741, gamma=0., beta_h=0.278, alpha=3.93, t_dyn_mode='sub_lt',
         second_order=True, truncation='hard', **kw)
@@ -581,7 +582,7 @@ def test_revirial_fallback_revirializes_without_apocenter(du24_setup):
     profile repeatedly during the plunge."""
     def run(fb):
         hNFW, rvals, M_sub, xv0_20 = du24_setup
-        return sc.evolve_heating_revirial(
+        return te.evolve_heating_revirial(
             hNFW, NumericProfile(rvals, M_sub), xv0_20, tmax=1.5, step_frac=0.02,
             revir_fallback=fb, epsh=0.0741, gamma=0., beta_h=0.278, alpha=3.93,
             t_dyn_mode='sub_lt', second_order=True, truncation='hard',
@@ -631,7 +632,7 @@ def test_revirial_disrupted_run_last_step_not_apo(du24_setup):
     hNFW, rvals, M_sub, xv0_20 = du24_setup
     sub0 = NumericProfile(rvals, M_sub)
     cfg.Mres = 0.3 * sub0.Mh              # high floor: the deep 1/20 disrupts
-    res = sc.evolve_heating_revirial(
+    res = te.evolve_heating_revirial(
         hNFW, sub0, xv0_20, tmax=37., step_frac=0.02,
         epsh=0.0741, gamma=0., beta_h=0.278, alpha=3.93, t_dyn_mode='sub_lt',
         second_order=True, truncation='hard', early_terminate=True)
@@ -646,7 +647,7 @@ def test_revirial_r_stop_parks(du24_setup):
     xv0, _ = sc.make_orbit(hNFW, R0=0.5 * hNFW.rh, z0=0., eta=0.3)
     r0 = np.hypot(xv0[0], xv0[2])
     rstop = 0.6 * r0
-    res = sc.evolve_heating_revirial(
+    res = te.evolve_heating_revirial(
         hNFW, NumericProfile(rvals, M_sub), xv0, tmax=12., step_frac=0.05,
         epsh=0.0741, gamma=0., beta_h=0.278, alpha=3.93, t_dyn_mode='sub_lt',
         truncation='hard', dynamical_friction=False, r_stop=rstop)
@@ -661,15 +662,45 @@ def test_revirial_raises_pericentre_unresolved_over_budget(du24_setup):
     OverstripError, so an `except OverstripError` handler catches it while the
     distinct type flags an unresolvable orbit."""
     hNFW, rvals, M_sub, xv0_20 = du24_setup
-    with pytest.raises(sc.OverstripError) as ei:
-        sc.evolve_heating_revirial(
+    with pytest.raises(te.OverstripError) as ei:
+        te.evolve_heating_revirial(
             hNFW, NumericProfile(rvals, M_sub), xv0_20, tmax=12., step_frac=0.02,
             max_steps=50, epsh=0.0741, gamma=0., beta_h=0.278, alpha=3.93,
             t_dyn_mode='sub_lt', second_order=True, truncation='hard')
-    assert issubclass(sc.PericentreUnresolvedError, sc.OverstripError)
+    assert issubclass(te.PericentreUnresolvedError, te.OverstripError)
     # the raise carries the terminal bound mass alongside dens_hist/t_last/r_last
     m_last = ei.value.m_last
     assert np.isfinite(m_last) and cfg.Mres < m_last <= NumericProfile(rvals, M_sub).Mh
+    # the radial span rides along too, so an analysis can backfill the residence bins
+    # the halted orbit never reached
+    assert ei.value.r_hi >= ei.value.r_lo > 0.
+
+
+def test_revirial_unbind_carries_the_evolution_so_far(du24_setup, monkeypatch):
+    """Heating that unbinds the profile at a re-virialization still raises -- there is no
+    tidal radius past that point -- but the error carries the residence, the terminal
+    orbital state, and the breaker's settled span, so a caller can keep what the run
+    accumulated instead of discarding it."""
+    from subhalo_functions import HeatingUnbindsError
+    hNFW, rvals, M_sub, xv0_20 = du24_setup
+    redges = np.logspace(np.log10(1e-3), np.log10(hNFW.rh), 20)
+    tedges = np.linspace(0., 12., 6)
+
+    def unbind(*args, **kwargs):
+        raise HeatingUnbindsError("heating unbinds the profile")
+
+    monkeypatch.setattr(te, '_revirialize', unbind)
+    with pytest.raises(HeatingUnbindsError) as ei:
+        te.evolve_heating_revirial(
+            hNFW, NumericProfile(rvals, M_sub), xv0_20, tmax=12., step_frac=0.02,
+            epsh=0.0741, gamma=0., beta_h=0.278, alpha=3.93, t_dyn_mode='sub_lt',
+            truncation='hard', freeze_strip=0.99, freeze_rspan=1.0,
+            dens_redges=redges, dens_tedges=tedges)
+    err = ei.value
+    assert err.dens_hist is not None and err.dens_hist.sum() > 0.
+    assert err.t_last > 0. and err.r_last > 0.
+    assert cfg.Mres < err.m_last <= NumericProfile(rvals, M_sub).Mh
+    assert 0. < err.r_lo <= err.r_hi
 
 
 def test_revirial_disruption_terminates_without_revirializing(du24_setup):
@@ -680,7 +711,7 @@ def test_revirial_disruption_terminates_without_revirializing(du24_setup):
     hNFW, rvals, M_sub, xv0_20 = du24_setup
     sub0 = NumericProfile(rvals, M_sub)
     cfg.Mres = 0.3 * sub0.Mh              # high floor: the deep 1/20 crosses it
-    res = sc.evolve_heating_revirial(
+    res = te.evolve_heating_revirial(
         hNFW, sub0, xv0_20, tmax=37., step_frac=0.02,
         epsh=0.0741, gamma=0., beta_h=0.278, alpha=3.93, t_dyn_mode='sub_lt',
         second_order=True, truncation='hard', early_terminate=True)
@@ -771,7 +802,7 @@ def test_cumulant_step_matches_closed_form():
     beta_h, t_orb, dt, N = 3.0, 1.7, 0.01, 500
     G = np.zeros_like(g)
     for _ in range(N):
-        G = sc._cumulant_step(G, g, beta_h, t_orb, dt)
+        G = te._cumulant_step(G, g, beta_h, t_orb, dt)
     t = N * dt
     G_analytic = (t_orb * g / beta_h) * (1. - np.exp(-beta_h * t / t_orb))
     assert np.allclose(G, G_analytic, rtol=1e-12, atol=0.)
@@ -783,7 +814,7 @@ def test_cumulant_step_positive_where_euler_flips():
     # (0, G_0].
     G0 = np.full((3, 3), 2.0)
     g = np.zeros((3, 3))
-    Gx = sc._cumulant_step(G0, g, beta_h=2.0, t_orb=1.0, dt=1.0)
+    Gx = te._cumulant_step(G0, g, beta_h=2.0, t_orb=1.0, dt=1.0)
     assert np.all(Gx > 0.) and np.all(Gx < G0)
     euler = G0 + (g - 2.0 * G0 / 1.0) * 1.0
     assert np.all(euler < 0.)
@@ -795,7 +826,7 @@ def test_cumulant_step_zero_beta_is_riemann_sum():
     t_orb, dt, N = 1.0, 0.01, 300
     G = np.zeros_like(g)
     for _ in range(N):
-        G = sc._cumulant_step(G, g, 0.0, t_orb, dt)
+        G = te._cumulant_step(G, g, 0.0, t_orb, dt)
     assert np.allclose(G, g * (N * dt), rtol=1e-13)
 
 
@@ -806,16 +837,16 @@ def test_cumulant_step_beta_to_zero_limit():
     g = np.array([[1.0, 0.3, 0.0], [0.3, -0.5, 0.2], [0.0, 0.2, 0.4]])
     t_orb, dt = 1.7, 0.05
     riemann = G0 + g * dt
-    assert np.array_equal(sc._cumulant_step(G0, g, 0.0, t_orb, dt), riemann)
+    assert np.array_equal(te._cumulant_step(G0, g, 0.0, t_orb, dt), riemann)
     # error is O(beta_h) above the roundoff floor of (t_orb g/beta_h)(1-e^{-b}):
     # each 100x drop in beta_h shrinks the gap to the beta_h=0 integral ~100x
-    errs = [np.abs(sc._cumulant_step(G0, g, b, t_orb, dt) - riemann).max()
+    errs = [np.abs(te._cumulant_step(G0, g, b, t_orb, dt) - riemann).max()
             for b in (1e-1, 1e-3, 1e-6)]
     assert errs[0] < 1e-2
     assert errs[1] < 0.05 * errs[0] and errs[2] < 0.05 * errs[1]
     # expm1 keeps the small-beta_h forcing weight accurate: no 0/0 blow-up and
     # the step still matches the beta_h=0 integral to ~machine precision
-    G_tiny = sc._cumulant_step(G0, g, 1e-12, t_orb, dt)
+    G_tiny = te._cumulant_step(G0, g, 1e-12, t_orb, dt)
     assert np.all(np.isfinite(G_tiny)) and np.abs(G_tiny - riemann).max() < 1e-12
 
 
@@ -827,7 +858,7 @@ def test_cumulant_step_dt_to_zero_matches_euler():
     beta_h, t_orb = 6.0, 1.1
 
     def gap(dt):
-        ex = sc._cumulant_step(G0, g, beta_h, t_orb, dt)
+        ex = te._cumulant_step(G0, g, beta_h, t_orb, dt)
         eu = G0 + (g - beta_h * G0 / t_orb) * dt
         return np.abs(ex - eu).max()
 
@@ -846,7 +877,7 @@ def test_cumulant_step_more_accurate_than_euler():
     b = beta_h * dt / t_orb
     G_eq = t_orb * g / beta_h
     analytic = G0 * np.exp(-b) + G_eq * (1. - np.exp(-b))
-    err_exact = np.abs(sc._cumulant_step(G0, g, beta_h, t_orb, dt) - analytic).max()
+    err_exact = np.abs(te._cumulant_step(G0, g, beta_h, t_orb, dt) - analytic).max()
     euler = G0 + (g - beta_h * G0 / t_orb) * dt
     err_euler = np.abs(euler - analytic).max()
     assert err_exact < 1e-14
@@ -858,7 +889,7 @@ def test_heating_stepper_trapezoidal_increment():
     # first-order path: the per-step energy amplitude eps_r(r)/r^2 is the
     # trapezoidal time-integral of the heating rate, (hr_prev + hr)/2 * dt. The
     # first step has no left sample and falls back to the rectangle hr*dt.
-    st = sc._HeatingStepper(None, second_order=False)
+    st = te._HeatingStepper(None, second_order=False)
     dt = 0.1
     hrs = [2.0, 4.0, 6.0, 3.0]
     amp = [st.step(dt, hr, r=1.0, t_now=0., t_orb=1.0)[0](1.0) for hr in hrs]
@@ -875,7 +906,7 @@ def test_heating_stepper_trapezoidal_H_spans_reset():
         rh = 1.0
         _sig2 = staticmethod(lambda r_: np.zeros_like(np.asarray(r_, float)))
 
-    st = sc._HeatingStepper(_Stub(), second_order=True)
+    st = te._HeatingStepper(_Stub(), second_order=True)
     dt = 0.1
     st.step(dt, 2.0, r=3.0, t_now=0.0, t_orb=1.0)   # rectangle: H = 2*dt
     st.step(dt, 4.0, r=2.0, t_now=0.1, t_orb=1.0)   # trap: H += (2+4)/2*dt
@@ -902,7 +933,7 @@ def test_heating_stepper_trapezoidal_is_second_order():
 
     def errs(N):
         dt = T / N
-        st = sc._HeatingStepper(_Stub(), second_order=True)
+        st = te._HeatingStepper(_Stub(), second_order=True)
         rect = 0.
         for t in np.linspace(0., T, N + 1)[1:]:
             st.step(dt, f(t), r=1.0, t_now=t, t_orb=1e9)  # t_orb huge: no reset
@@ -953,13 +984,13 @@ def test_df_sink_time_clamped_log():
         r_st = brentq(lambda r: h.M(r) - m, 1e-6, 10.)
         r_st10 = brentq(lambda r: h.M(r) - 10. * m, 1e-6, 10.)
         # path above both stall radii: finite, and the heavier mass sinks faster
-        t = sc.df_sink_time(h, m, 10. * r_st10, 2. * r_st10)
+        t = te.df_sink_time(h, m, 10. * r_st10, 2. * r_st10)
         assert np.isfinite(t) and t > 0.
-        t_heavy = sc.df_sink_time(h, 10. * m, 10. * r_st10, 2. * r_st10)
+        t_heavy = te.df_sink_time(h, 10. * m, 10. * r_st10, 2. * r_st10)
         assert t_heavy < t
         # path crossing the stall: the drag vanishes there, the orbit cannot pass
-        assert sc.df_sink_time(h, m, 10. * r_st, 0.5 * r_st) == np.inf
-        assert sc.df_sink_time(h, m, r_st, r_st) == np.inf
+        assert te.df_sink_time(h, m, 10. * r_st, 0.5 * r_st) == np.inf
+        assert te.df_sink_time(h, m, r_st, r_st) == np.inf
     finally:
         cfg.lnL_type, cfg.lnL_pref = saved
 

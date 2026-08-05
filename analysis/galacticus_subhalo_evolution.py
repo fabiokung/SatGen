@@ -28,6 +28,7 @@ import numpy as np
 import config as cfg
 import cosmo as co
 import stripping_common as sc
+import tidal_engine as te
 from model_params import CHI_V
 from profiles import NFW
 from subhalo_functions import NumericProfile
@@ -174,7 +175,7 @@ def run_node(G, nid, params, n_snapshots=40, step_frac=0.01):
         alpha='conc', n_snapshots=n_snapshots, label='SatGen Green/DASH')
 
     rvals = np.logspace(np.log10(cfg.Rres), np.log10(ic['sub'].rh), 200)
-    hard = sc.evolve_heating_revirial(
+    hard = te.evolve_heating_revirial(
         host, NumericProfile(rvals, ic['sub'].M(rvals)), xv0,
         tmax=tmax, step_frac=step_frac, truncation='hard', second_order=True,
         t_dyn_mode='sub_lt', chi_v=CHI_V, lt_choice='Tormen98',

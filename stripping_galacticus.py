@@ -1,5 +1,5 @@
 # Decoupled-ledger tidal evolution (Mode B) -- a one-off experiment kept
-# separate from stripping_common.evolve_heating.
+# separate from tidal_engine.evolve_heating.
 #
 # Unlike evolve_heating, here heating is the *sole* reshaper of the density
 # profile: heat_profile (Du+24 monotonic shell expansion) runs every step and
@@ -19,7 +19,7 @@ from profiles import tdyn
 from orbit import orbit
 import evolve as ev
 from subhalo_functions import heat_profile, tidalTensor
-from stripping_common import _HeatingStepper, EvolutionResult
+from tidal_engine import _HeatingStepper, EvolutionResult
 
 
 def _bound_omega_p(profile, m_bound, r_vir):

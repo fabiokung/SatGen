@@ -5,8 +5,8 @@ import heapq
 import numpy as np
 
 import config as cfg
-from stripping_common import (HeatingUnbindsError, PericentreUnresolvedError,
-                              _dens_accumulate, _SubhaloRun)
+from subhalo_functions import HeatingUnbindsError
+from tidal_engine import PericentreUnresolvedError, _dens_accumulate, _SubhaloRun
 
 
 def _snap_track(tsnap, t, y, y0, y_tail):
