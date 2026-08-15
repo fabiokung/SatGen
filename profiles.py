@@ -2508,8 +2508,8 @@ class Hernquist(object):
         """
         r = np.sqrt(R**2.+z**2.)
         x = r/self.a
-        sigmasqr = cfg.GMb/(12.*self.a)*(12.*x*(1.+x)**3*np.log(1.+1./x)\
-            -(x/(1.+x))*(25.+52.*x+42.*x**2+12.*x**3)) 
+        sigmasqr = self.GMb/(12.*self.a)*(12.*x*(1.+x)**3*np.log(1.+1./x)\
+            -(x/(1.+x))*(25.+52.*x+42.*x**2+12.*x**3))
         return np.sqrt(sigmasqr)
 
 class exp(object):
