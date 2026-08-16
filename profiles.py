@@ -2512,11 +2512,343 @@ class Hernquist(object):
             -(x/(1.+x))*(25.+52.*x+42.*x**2+12.*x**3))
         return np.sqrt(sigmasqr)
 
+class Dehnen(object):
+    """
+    Class that implements the Dehnen (1993) profile:
+
+        rho(r) = (3-gamma) M / (4 pi a^3) * x^-gamma (1+x)^(gamma-4)
+
+    in a cylindrical frame (R,phi,z), where
+
+        r = sqrt(R^2 + z^2)
+        x = r/a
+        a: scale radius
+        M: TOTAL mass (the profile has finite mass at any gamma < 3)
+        gamma: inner logarithmic density slope, 0 <= gamma < 2
+
+    gamma = 0 is the cored member and gamma = 1 is Hernquist (1990).
+    gamma = 2 is excluded: the potential picks up a logarithm there and
+    the circular velocity loses its interior maximum.
+
+    Unlike NFW the mass is finite, so M is the total and .rh is a derived
+    spherical-overdensity radius rather than the defining one.
+
+    Syntax:
+
+        halo = Dehnen(M,a,gamma=0.,Delta=200.,z=0.)
+
+    where
+
+        M: total mass [M_sun] (float)
+        a: scale radius [kpc] (float)
+        gamma: inner density slope (float) (default 0.)
+        Delta: spherical overdensity with respect to the critical
+            density of the universe, used only to derive .rh
+            (default 200.)
+        z: redshift (float) (default 0.)
+
+    Attributes:
+
+        .Mh: total mass [M_sun]
+        .a, .rs, .r0: scale radius [kpc]
+        .gamma: inner density slope
+        .Deltah, .rhoc, .rhoh: overdensity definition and densities
+        .rh: radius enclosing Delta times the critical density [kpc]
+        .ch: rh/a, the analogue of a concentration
+        .rho0: (3-gamma) M / (4 pi a^3) [M_sun kpc^-3]
+        .rmax: radius of maximum circular velocity, (2-gamma) a [kpc]
+        .Vmax: maximum circular velocity [kpc/Gyr]
+        .s001: logarithmic density slope at 0.01 rh
+
+    Methods:
+
+        .rho(R,z=0.): density [M_sun kpc^-3] at radius r=sqrt(R^2+z^2)
+        .s(R,z=0.): logarithmic density slope at radius r=sqrt(R^2+z^2)
+        .M(R,z=0.): mass [M_sun] enclosed in radius r=sqrt(R^2+z^2)
+        .rhobar(R,z=0.): mean density [M_sun kpc^-3] within r=sqrt(R^2+z^2)
+        .tdyn(R,z=0.): dyn. time [Gyr] within radius r=sqrt(R^2+z^2)
+        .Phi(R,z=0.): potential [(kpc/Gyr)^2] at radius r=sqrt(R^2+z^2)
+        .fgrav(R,z): grav. acceleration [(kpc/Gyr)^2 kpc^-1] at (R,z)
+        .Vcirc(R,z=0.): circ. vel. [kpc/Gyr] at radius r=sqrt(R^2+z^2)
+        .sigma(R,z=0.): vel. dispersion [kpc/Gyr] at r=sqrt(R^2+z^2),
+            exact isotropic Jeans, gamma = 0 and 1 only
+        .d2Phidr2(R,z=0.): second radial derivative of potential [1/Gyr^2]
+    """
+    def __init__(self,M,a,gamma=0.,Delta=200.,z=0.):
+        """
+        Initialize Dehnen profile.
+
+        Syntax:
+
+            halo = Dehnen(M,a,gamma=0.,Delta=200.,z=0.)
+        """
+        if not 0. <= gamma < 2.:
+            raise ValueError("Dehnen: gamma must be in [0,2), got %g" % gamma)
+        # input attributes
+        self.Mh = M
+        self.a = a
+        self.rs = a
+        self.r0 = a
+        self.gamma = gamma
+        self.Deltah = Delta
+        self.z = z
+        #
+        # derived attributes
+        self.rhoc = co.rhoc(z,cfg.h,cfg.Om,cfg.OL)
+        self.rhoh = self.Deltah * self.rhoc
+        self.rho0 = (3.-gamma)*M / (cfg.FourPi*a**3.)
+        self.GM = cfg.G * M
+        self.rh = self.Findrh()
+        self.ch = self.rh / self.a
+        self.rmax = (2.-gamma) * self.a
+        self.Vmax = self.Vcirc(self.rmax)
+        self.s001 = self.s(0.01*self.rh)
+    def Findrh(self):
+        """
+        Radius [kpc] within which the average density is Delta times the
+        critical density.
+
+        rhobar(r) = 3 M (r/(r+a))^(3-gamma) / (4 pi r^3) is strictly
+        decreasing, so the root is unique when it exists. For gamma = 0 the
+        central average density is finite (3M/4 pi a^3), so a halo diffuse
+        enough to sit below Delta rhoc everywhere has no such radius at all
+        -- that is a badly posed host, not a solver failure, so it raises.
+
+        Syntax:
+
+            .Findrh()
+        """
+        # M(<r) < M everywhere, so rhobar(r) < 3M/(4 pi r^3): the root is
+        # strictly inside the radius that bound would give
+        r_out = (3.*self.Mh / (cfg.FourPi*self.rhoh))**(1./3.)
+        r_in = 1e-12 * self.a
+        if self.rhobar(r_in) <= self.rhoh:
+            raise ValueError(
+                "Dehnen: no radius encloses Delta = %g times rhoc; central\
+ average density %.4g < %.4g M_sun kpc^-3"
+                % (self.Deltah, self.rhobar(r_in), self.rhoh))
+        return brentq(lambda r: self.rhobar(r)-self.rhoh, r_in, r_out,
+                      xtol=1e-12*r_out, rtol=1e-14)
+    def rho(self,R,z=0.):
+        """
+        Density [M_sun kpc^-3] at radius r = sqrt(R^2 + z^2).
+
+        Syntax:
+
+            .rho(R,z=0.)
+
+        where
+
+            R: R-coordinate [kpc] (float or array)
+            z: z-coordinate [kpc] (float or array)
+                (default=0., i.e., if z is not specified otherwise, the
+                first argument R is also the halo-centric radius r)
+        """
+        r = np.sqrt(R**2.+z**2.)
+        x = r / self.a
+        return self.rho0 * x**-self.gamma * (1.+x)**(self.gamma-4.)
+    def s(self,R,z=0.):
+        """
+        Logarithmic density slope
+
+            - d ln rho / d ln r
+
+        at radius r = sqrt(R^2 + z^2). Runs from gamma at the centre to 4
+        at large radius.
+
+        Syntax:
+
+            .s(R,z=0.)
+
+        where
+
+            R: R-coordinate [kpc] (float or array)
+            z: z-coordinate [kpc] (float or array)
+                (default=0., i.e., if z is not specified otherwise, the
+                first argument R is also the halo-centric radius r)
+        """
+        r = np.sqrt(R**2.+z**2.)
+        x = r / self.a
+        return self.gamma + (4.-self.gamma)*x/(1.+x)
+    def M(self,R,z=0.):
+        """
+        Mass [M_sun] within radius r = sqrt(R^2 + z^2).
+
+        Syntax:
+
+            .M(R,z=0.)
+
+        where
+
+            R: R-coordinate [kpc] (float or array)
+            z: z-coordinate [kpc] (float or array)
+                (default=0., i.e., if z is not specified otherwise, the
+                first argument R is also the halo-centric radius r)
+        """
+        r = np.sqrt(R**2.+z**2.)
+        x = r / self.a
+        return self.Mh * (x/(1.+x))**(3.-self.gamma)
+    def rhobar(self,R,z=0.):
+        """
+        Average density [M_sun kpc^-3] within radius r = sqrt(R^2 + z^2).
+
+        Syntax:
+
+            .rhobar(R,z=0.)
+
+        where
+
+            R: R-coordinate [kpc] (float or array)
+            z: z-coordinate [kpc] (float or array)
+                (default=0., i.e., if z is not specified otherwise, the
+                first argument R is also the halo-centric radius r)
+        """
+        r = np.sqrt(R**2.+z**2.)
+        return 3.*self.M(r) / (cfg.FourPi*r**3.)
+    def tdyn(self,R,z=0.):
+        """
+        Dynamical time [Gyr] within radius r = sqrt(R^2 + z^2).
+
+        Syntax:
+
+            .tdyn(R,z=0.)
+
+        where
+
+            R: R-coordinate [kpc] (float or array)
+            z: z-coordinate [kpc] (float or array)
+                (default=0., i.e., if z is not specified otherwise, the
+                first argument R is also the halo-centric radius r)
+        """
+        return np.sqrt(cfg.ThreePiOverSixteenG / self.rhobar(R,z))
+    def Phi(self,R,z=0.):
+        """
+        Potential [(kpc/Gyr)^2] at radius r = sqrt(R^2 + z^2).
+
+        Phi(r) = - G M / [(2-gamma) a] [1 - (r/(r+a))^(2-gamma)], which is
+        finite at the centre for gamma < 2 and vanishes at infinity.
+
+        Syntax:
+
+            .Phi(R,z=0.)
+
+        where
+
+            R: R-coordinate [kpc] (float or array)
+            z: z-coordinate [kpc] (float or array)
+                (default=0., i.e., if z is not specified otherwise, the
+                first argument R is also the halo-centric radius r)
+        """
+        r = np.sqrt(R**2.+z**2.)
+        x = r / self.a
+        p = 2. - self.gamma
+        return -self.GM/(p*self.a) * (1. - (x/(1.+x))**p)
+    def fgrav(self,R,z):
+        """
+        gravitational acceleration [(kpc/Gyr)^2 kpc^-1] at location (R,z)
+
+            [- d Phi(R,z) / d R, 0, - d Phi(R,z) / d z]
+
+        Syntax:
+
+            .fgrav(R,z)
+
+        where
+
+            R: R-coordinate [kpc] (float or array)
+            z: z-coordinate [kpc] (float or array)
+
+        Note that unlike the other methods, where z is optional with a
+        default of 0, here z must be specified.
+
+        Return:
+
+            R-component of gravitational acceleration
+            phi-component of gravitational acceleration
+            z-component of gravitational acceleration
+        """
+        r = np.sqrt(R**2.+z**2.)
+        fac = -cfg.G*self.M(r) / r**3.
+        return fac*R, fac*0., fac*z
+    def Vcirc(self,R,z=0.):
+        """
+        Circular velocity [kpc/Gyr] at radius r = sqrt(R^2 + z^2).
+
+        Syntax:
+
+            .Vcirc(R,z=0.)
+
+        where
+
+            R: R-coordinate [kpc] (float or array)
+            z: z-coordinate [kpc] (float or array)
+                (default=0., i.e., if z is not specified otherwise, the
+                first argument R is also the halo-centric radius r)
+        """
+        r = np.sqrt(R**2.+z**2.)
+        return np.sqrt(cfg.G*self.M(r)/r)
+    def sigma(self,R,z=0.):
+        """
+        Velocity dispersion [kpc/Gyr] at radius r = sqrt(R^2 + z^2), from
+        the isotropic Jeans equation, exactly.
+
+        rho sigma_r^2 = int_r^inf rho G M / r'^2 dr' reduces to
+        sigma_r^2 = G M a^-5 x^gamma (r+a)^(4-gamma) J(t), t = r/(r+a),
+        J = int_t^1 s^(1-2gamma) (1-s)^4 ds -- elementary for half-integer
+        gamma. Only the two members this code uses are implemented, each in
+        the form that avoids cancelling J against itself at large radius.
+        gamma = 1 reproduces Hernquist (1990) eq. 10.
+
+        Syntax:
+
+            .sigma(R,z=0.)
+
+        where
+
+            R: R-coordinate [kpc] (float or array)
+            z: z-coordinate [kpc] (float or array)
+                (default=0., i.e., if z is not specified otherwise, the
+                first argument R is also the halo-centric radius r)
+        """
+        r = np.sqrt(R**2.+z**2.)
+        if self.gamma == 0.:
+            u = self.a / (r+self.a)
+            return np.sqrt(self.GM/(r+self.a) * (1./5. - u/6.))
+        elif self.gamma == 1.:
+            x = r / self.a
+            sigmasqr = self.GM/(12.*self.a)*(12.*x*(1.+x)**3*np.log(1.+1./x)\
+                -(x/(1.+x))*(25.+52.*x+42.*x**2+12.*x**3))
+            return np.sqrt(sigmasqr)
+        raise NotImplementedError(
+            "Dehnen.sigma is implemented for gamma = 0 and 1, not %g"
+            % self.gamma)
+    def d2Phidr2(self,R,z=0.):
+        """
+        Second radial derivative of the gravitational potential [1/Gyr^2]
+        computed at r = sqrt(R^2 + z^2).
+
+        Syntax:
+
+            .d2Phidr2(R,z=0.)
+
+        where
+
+            R: R-coordinate [kpc] (float or array)
+            z: z-coordinate [kpc] (float or array)
+                (default=0., i.e., if z is not specified otherwise, the
+                first argument R is also the halo-centric radius r)
+        """
+        r = np.sqrt(R**2.+z**2.)
+        x = r / self.a
+        g = self.gamma
+        return self.GM/self.a**3. * x**-g * (1.+x)**(g-4.) \
+            * ((1.-g)*(1.+x) + (g-3.)*x)
+
 class exp(object):
     """
     Class that implements the exponential disk profile:
 
-        Sigma(r) = Sigma_0 exp(-x), x = r/a  
+        Sigma(r) = Sigma_0 exp(-x), x = r/a
     
     in a cylindrical frame (R,phi,z), where 
     
