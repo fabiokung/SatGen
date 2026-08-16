@@ -67,8 +67,8 @@ def test_total_work_is_the_sum_not_n_times_the_slowest(pop_setup):
     out = evolve_population(host, [dict(prof=num0, xv0=xv) for xv in xvs],
                             tmax=TMAX, tsnap=np.linspace(0., TMAX, 7), **ENGINE)
     assert list(out['n_step']) == [r.t.size for r in solo]
-    n_lockstep = len(xvs) * max(r.t.size for r in solo)
-    assert out['n_step'].sum() < n_lockstep
+    n_global_dt = len(xvs) * max(r.t.size for r in solo)
+    assert out['n_step'].sum() < n_global_dt
 
 
 def test_one_subhalo_raising_does_not_kill_the_population(pop_setup):
@@ -127,3 +127,136 @@ def test_clump_field_conserves_mass_and_tracks_the_population(pop_setup):
     assert f['M_enc'][-1, 0] == pytest.approx(out['m_init'].sum())
     assert (f['rho'] >= 0.).all() and (f['sigma'] >= 0.).all()
     assert f['frac'].shape == f['M_enc'].shape
+
+
+def test_engine_advances_a_time_dependent_host(pop_setup):
+    """A host with set_time must be advanced on the subhalo's clock: the engine calls
+    set_time(t) once per step, so a factor that turns on at t > 0 changes the orbit.
+    Both halves matter -- the hook being called at all, and the potential actually
+    differing from the static run."""
+    host, num0, xvs = pop_setup
+    from profiles import NFW
+    from subhalo_functions import CorrectedHost
+
+    times = []
+
+    class Recording(CorrectedHost):
+        def set_time(self, t):
+            times.append(t)
+            super().set_time(t)
+
+    rk = np.geomspace(1e-2 * host.rh, host.rh, 15)
+    g = np.vstack([np.ones(len(rk)), np.full(len(rk), 1.3)])  # 30% heavier after 1 Gyr
+    th = Recording(host, rk, [0., 1., TMAX], g)
+    res_t = _solo(th, num0, xvs[0])
+    assert len(times) > 100, "set_time was never called on the engine hot path"
+    assert times == sorted(times)
+    res_s = _solo(host, num0, xvs[0])
+    r_t = np.interp(2.5, res_t.t, res_t.r)
+    r_s = np.interp(2.5, res_s.t, res_s.r)
+    assert abs(r_t - r_s) > 1e-3 * r_s, "time-dependent factor left the orbit unchanged"
+
+
+def test_noop_barriers_leave_the_run_identical(pop_setup):
+    """Barriers synchronize the schedule, not the physics: steps are never truncated at
+    a barrier, so with a do-nothing callback every subhalo's trajectory and residence
+    must match the unbarriered run exactly."""
+    host, num0, xvs = pop_setup
+    redges = np.logspace(np.log10(1e-3), np.log10(host.rh), 25)
+    tedges = np.linspace(0., TMAX, 7)
+    kw = dict(dens_redges=redges, dens_tedges=tedges, keep_results=True)
+    ref = evolve_population(host, [dict(prof=num0, xv0=xv) for xv in xvs],
+                            tmax=TMAX, **kw, **ENGINE)
+    seen = []
+    out = evolve_population(host, [dict(prof=num0, xv0=xv) for xv in xvs],
+                            tmax=TMAX, barriers=tedges[1:-1],
+                            on_barrier=lambda t, runs: seen.append(t),
+                            **kw, **ENGINE)
+    assert seen == list(tedges[1:-1])
+    for a, b in zip(ref['results'], out['results']):
+        for f in ('t', 'r', 'm'):
+            x, y = getattr(a, f), getattr(b, f)
+            assert x.shape == y.shape and (x == y).all(), f
+    assert (ref['dens_hist'] == out['dens_hist']).all()
+
+
+def test_per_run_hists_sum_to_the_shared_one(pop_setup):
+    """share_hist=False keeps each subhalo's residence on its own run (needed when the
+    members carry different abundance weights); their sum must reproduce the shared
+    total, held tails included."""
+    host, num0, xvs = pop_setup
+    redges = np.logspace(np.log10(1e-3), np.log10(host.rh), 25)
+    tedges = np.linspace(0., TMAX, 7)
+    kw = dict(dens_redges=redges, dens_tedges=tedges)
+    shared = evolve_population(host, [dict(prof=num0, xv0=xv) for xv in xvs],
+                               tmax=TMAX, **kw, **ENGINE)
+    per = evolve_population(host, [dict(prof=num0, xv0=xv) for xv in xvs],
+                            tmax=TMAX, share_hist=False, keep_results=True,
+                            **kw, **ENGINE)
+    assert np.allclose(per['dens_hist'], shared['dens_hist'], rtol=1e-12, atol=0.)
+    assert np.allclose(sum(r.dens_hist for r in per['results']),
+                       shared['dens_hist'], rtol=1e-12, atol=0.)
+
+
+def test_checkpoint_resume_reproduces_the_uninterrupted_run(pop_setup):
+    """A checkpoint taken at a barrier and passed back as resume_state must continue
+    to the exact terminal state of the uninterrupted run -- the queue is rebuilt from
+    the run clocks at every segment boundary, so resuming there adds nothing. The
+    state round-trips through pickle, which is what a production checkpoint does."""
+    import pickle
+    import profiles as pr
+    host, num0, xvs = pop_setup
+    heavy = pr.NFW(2. * host.Mh, 10., Delta=200.)
+    redges = np.logspace(np.log10(1e-3), np.log10(host.rh), 25)
+    tedges = np.linspace(0., TMAX, 7)
+
+    def swap(t_b, runs):
+        for r in runs:
+            r.potential = heavy
+
+    kw = dict(dens_redges=redges, dens_tedges=tedges, share_hist=False,
+              keep_results=True, barriers=tedges[1:-1], on_barrier=swap)
+    ref = evolve_population(host, [dict(prof=num0, xv0=xv) for xv in xvs],
+                            tmax=TMAX, **kw, **ENGINE)
+
+    blob = {}
+
+    class Interrupt(Exception):
+        pass
+
+    def ckpt(t_b, state):
+        blob['state'] = pickle.dumps(state)
+        if t_b >= tedges[2]:
+            raise Interrupt
+
+    with pytest.raises(Interrupt):
+        evolve_population(host, [dict(prof=num0, xv0=xv) for xv in xvs],
+                          tmax=TMAX, checkpoint_fn=ckpt, **kw, **ENGINE)
+    out = evolve_population(host, [dict(prof=num0, xv0=xv) for xv in xvs],
+                            tmax=TMAX, resume_state=pickle.loads(blob['state']),
+                            **kw, **ENGINE)
+    for a, b in zip(ref['results'], out['results']):
+        for f in ('t', 'r', 'm', 'xv'):
+            x, y = getattr(a, f), getattr(b, f)
+            assert x.shape == y.shape and (x == y).all(), f
+    assert (ref['dens_hist'] == out['dens_hist']).all()
+    assert list(ref['n_step']) == list(out['n_step'])
+    assert list(ref['status']) == list(out['status'])
+
+
+def test_barrier_potential_swap_changes_the_evolution(pop_setup):
+    """The coupling contract: a callback that swaps run.potential must be honored by
+    the next segment. A doubled-mass host from the first barrier on has to leave a
+    different terminal state than the static run."""
+    import profiles as pr
+    host, num0, xvs = pop_setup
+    heavy = pr.NFW(2. * host.Mh, 10., Delta=200.)
+
+    def swap(t_b, runs):
+        for r in runs:
+            r.potential = heavy
+    static = evolve_population(host, [dict(prof=num0, xv0=xvs[0])], tmax=TMAX,
+                               **ENGINE)
+    moved = evolve_population(host, [dict(prof=num0, xv0=xvs[0])], tmax=TMAX,
+                              barriers=[TMAX / 3.], on_barrier=swap, **ENGINE)
+    assert moved['m_final'][0] != static['m_final'][0]

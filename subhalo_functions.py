@@ -214,6 +214,9 @@ class NumericProfile(object):
         self.rh = np.max(ri)
         self.Mh = np.max(Mr)
 
+        self._build_interps()
+
+    def _build_interps(self):
         # log-log PCHIP for M and rho. Power-law cusps (M ~ r^2-3,
         # rho ~ r^-1.5) become straight lines in log-log so PCHIP is exact
         # between knots; linear-axis PCHIP carries O(h^2) error there.
@@ -231,6 +234,19 @@ class NumericProfile(object):
                                   clamp_below='zero', clamp_above='zero',
                                   leading_only=True)
                        or PchipInterpolator(self.ri, self.rhovals, extrapolate=False))
+
+    # the interpolants are _log_pchip closures and cannot pickle; they are pure
+    # functions of (ri, Mr), so drop them (and the lazy caches) on serialization
+    # and rebuild on load -- value-identical by construction
+    def __getstate__(self):
+        d = self.__dict__.copy()
+        for k in ('MInt', 'rhoInt', '_rmax_vmax', '_sig2', '_rhalf_omega'):
+            d.pop(k, None)
+        return d
+
+    def __setstate__(self, d):
+        self.__dict__.update(d)
+        self._build_interps()
 
     # rmax/Vmax, r_half/omega_p, and sigma_r^2 are deferred: the forward model
     # builds an intermediate heated profile every step (heat_profile) on which
@@ -379,6 +395,184 @@ class NumericProfile(object):
         else:
             integ = cfg.G*quad(lambda x: self.rho(x)*self.M(x)/x**2,r,self.rh)[0]
         return np.sqrt(integ/self.rho(r))
+
+
+class CorrectedHost(object):
+    """Spherical host with a tabulated multiplicative enclosed-mass correction:
+
+        M(<r, t) = base.M(r) * g(r, t)
+
+    g carries a time-dependent mass redistribution on top of an analytic base
+    profile (the base keeps the cusp and the dynamic range exact; g is an O(1)
+    smooth factor). g is PCHIP-interpolated in ln r between the knots, held at
+    the edge values outside them, and piecewise-constant in time on the node
+    intervals: set_time(t) selects the active interval, and the engine calls it
+    once per accepted step, so the potential is static within a step.
+
+    f and kappa expose a separate drag background: rho_df = rho_smooth +
+    kappa * rho_correction with rho_smooth = (1-f) rho_base. Chandrasekhar drag
+    on mass M through field particles of mass m_f scales as (M + m_f), so
+    kappa = 2 is the exact factor when the correction is made of clumps of the
+    satellite's own mass; kappa = 1 reproduces the stock fDF everywhere.
+    profiles.fDF reads rho_df when the host defines f.
+
+    M is interpolated as ln M_tot vs ln r (PCHIP through the knot products
+    M_base(r_k) g_k): PCHIP preserves monotone data, so a non-decreasing set of
+    knot masses gives a non-decreasing M(r) EVERYWHERE, not just at the knots --
+    interpolating g and multiplying can dip between knots even when every knot
+    rises. The cost is that g = 1 reproduces the base profile exactly at the
+    knots and to log-log-PCHIP accuracy between them (power-law segments are
+    exact; the NFW turnover contributes a small residual).
+
+    Raises at build where the knot masses decrease outward: a non-monotone
+    enclosed mass is an unphysical field (negative shell mass), and it must
+    surface as the field-construction error it is.
+    """
+    def __init__(self, base, r_knots, tnodes, g, f=None, kappa=1., n_check=400):
+        r_knots = np.asarray(r_knots, float)
+        tnodes = np.asarray(tnodes, float)
+        g = np.atleast_2d(np.asarray(g, float))
+        if g.shape != (len(tnodes) - 1, len(r_knots)):
+            raise ValueError(f"g{g.shape} must be (len(tnodes)-1, len(r_knots))"
+                             f" = {(len(tnodes) - 1, len(r_knots))}")
+        if np.any(np.diff(r_knots) <= 0.) or np.any(np.diff(tnodes) <= 0.):
+            raise ValueError("r_knots and tnodes must be strictly increasing")
+        if not np.all(np.isfinite(g)) or np.any(g <= 0.):
+            raise ValueError("g must be finite and positive")
+        self.base = base
+        self.r_knots, self.tnodes = r_knots, tnodes
+        self.g = g
+        self.f, self.kappa = f, kappa
+        self.rh = base.rh
+        self.z = getattr(base, 'z', 0.)
+        self._node_cache = {}
+        # knot masses must be non-decreasing at every node; log-log PCHIP then
+        # keeps M(r) non-decreasing between knots too
+        self._Mk = np.asarray(base.M(r_knots), float)
+        for j in range(g.shape[0]):
+            Mj = self._Mk * g[j]
+            bad = np.diff(Mj) < -1e-9 * Mj[:-1]
+            if bad.any():
+                k = int(np.flatnonzero(bad)[0])
+                raise ValueError(
+                    f"CorrectedHost: knot mass decreases at node {j}, "
+                    f"r ~ {r_knots[k]:.4g} kpc (g falls faster than base.M rises)")
+        self._j = -1
+        self.set_time(tnodes[0])
+
+    def _interp(self, j):
+        # ln M_tot(ln r) through the knot products, monotone-preserving
+        cached = self._node_cache.get(j)
+        if cached is None:
+            spl = PchipInterpolator(np.log(self.r_knots),
+                                    np.log(self._Mk * self.g[j]),
+                                    extrapolate=False)
+            cached = (spl, spl.derivative())
+            self._node_cache[j] = cached
+        return cached
+
+    def set_time(self, t):
+        """Select the node interval containing t (clamped to the tabulated range).
+        Cheap no-op while t stays inside the current interval."""
+        j = int(np.clip(np.searchsorted(self.tnodes, t, side='right') - 1,
+                        0, self.g.shape[0] - 1))
+        if j != self._j:
+            self._j = j
+            self._sig_spline = None
+
+    @property
+    def Mh(self):
+        return float(self.base.Mh * self.g[self._j, -1])
+
+    def M(self, R, z=0.):
+        # inside the knots: the log-log spline; outside: base scaled by the edge g
+        r = np.asarray(np.sqrt(R**2 + z**2), float)
+        scalar = r.ndim == 0
+        r = np.atleast_1d(r)
+        lr = np.log(r)
+        spl, _ = self._interp(self._j)
+        lo, hi = np.log(self.r_knots[0]), np.log(self.r_knots[-1])
+        out = np.empty_like(r)
+        below, above = lr <= lo, lr >= hi
+        mid = ~(below | above)
+        out[below] = self.base.M(r[below]) * self.g[self._j, 0]
+        out[above] = self.base.M(r[above]) * self.g[self._j, -1]
+        if mid.any():
+            out[mid] = np.exp(spl(lr[mid]))
+        return out[0] if scalar else out
+
+    def rho(self, R, z=0.):
+        # rho = M dlnM/dlnr / (4 pi r^3) inside; base rho scaled by edge g outside
+        r = np.asarray(np.sqrt(R**2 + z**2), float)
+        scalar = r.ndim == 0
+        r = np.atleast_1d(r)
+        lr = np.log(r)
+        spl, dspl = self._interp(self._j)
+        lo, hi = np.log(self.r_knots[0]), np.log(self.r_knots[-1])
+        out = np.empty_like(r)
+        below, above = lr <= lo, lr >= hi
+        mid = ~(below | above)
+        out[below] = self.base.rho(r[below]) * self.g[self._j, 0]
+        out[above] = self.base.rho(r[above]) * self.g[self._j, -1]
+        if mid.any():
+            out[mid] = (np.exp(spl(lr[mid])) * dspl(lr[mid])
+                        / (cfg.FourPi * r[mid]**3))
+        return out[0] if scalar else out
+
+    def rho_df(self, R, z=0.):
+        """Background density for dynamical friction: the smooth component plus
+        kappa times the correction component (equal-mass drag factor)."""
+        if self.f is None:
+            return self.rho(R, z)
+        rho_s = (1. - self.f) * self.base.rho(np.sqrt(R**2 + z**2))
+        return rho_s + self.kappa * (self.rho(R, z) - rho_s)
+
+    def rhobar(self, R, z=0.):
+        r = np.sqrt(R**2 + z**2)
+        return self.M(r) / (cfg.FourPiOverThree * r**3)
+
+    def tdyn(self, R, z=0.):
+        return np.sqrt(cfg.ThreePiOverSixteenG / self.rhobar(R, z))
+
+    def fgrav(self, R, z=0.):
+        r = np.sqrt(R**2 + z**2)
+        fac = -cfg.G * self.M(r) / r**2
+        return fac * R / r, 0., fac * z / r
+
+    def Vcirc(self, R, z=0.):
+        r = np.sqrt(R**2 + z**2)
+        return np.sqrt(np.maximum(cfg.G * self.M(r) / r, 0.))
+
+    def _jeans(self):
+        # sigma_r^2 = (1/rho) int_r^out rho G M / r'^2 dr', isotropic, rebuilt per
+        # node on first use; spline in ln r
+        if self._sig_spline is None:
+            rr = np.geomspace(self.r_knots[0] / 10., 10. * self.rh, 300)
+            rho = np.maximum(np.asarray(self.rho(rr), float), 0.)
+            integ = rho * cfg.G * np.asarray(self.M(rr), float) / rr**2
+            cum = np.concatenate([[0.], np.cumsum(
+                0.5 * (integ[1:] + integ[:-1]) * np.diff(rr))])
+            sig2 = np.zeros_like(rr)
+            np.divide(cum[-1] - cum, rho, out=sig2, where=rho > 0.)
+            self._sig_spline = InterpolatedUnivariateSpline(
+                np.log(rr), np.sqrt(np.maximum(sig2, 0.)), k=3, ext=3)
+        return self._sig_spline
+
+    def sigma(self, R, z=0.):
+        r = np.sqrt(R**2 + z**2)
+        return self._jeans()(np.log(r))
+
+    def Phi(self, R, z=0.):
+        # -G [ M(<r)/r + int_r^out 4 pi r' rho dr' ], on the Jeans grid
+        r = np.sqrt(R**2 + z**2)
+        rr = np.geomspace(self.r_knots[0] / 10., 10. * self.rh, 300)
+        rho = np.maximum(np.asarray(self.rho(rr), float), 0.)
+        integ = cfg.FourPi * rr * rho
+        cum = np.concatenate([[0.], np.cumsum(
+            0.5 * (integ[1:] + integ[:-1]) * np.diff(rr))])
+        outer = np.interp(np.log(np.clip(r, rr[0], rr[-1])), np.log(rr),
+                          cum[-1] - cum)
+        return -cfg.G * (self.M(r) / r + outer)
 
 
 def _clamp_monotone(ri, Menc, perturb, tally=None):

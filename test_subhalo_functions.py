@@ -713,3 +713,116 @@ class TestTidalTensor:
         T = tidalTensor(host, [50., 30., 20.])
         assert isinstance(T, np.ndarray)
         assert T.shape == (3, 3)
+
+
+# ---------------------------------------------------------------------------
+# CorrectedHost
+# ---------------------------------------------------------------------------
+
+class TestCorrectedHost:
+    """Host = base NFW x tabulated enclosed-mass factor g(r, t)."""
+
+    @pytest.fixture(scope="class")
+    def base(self):
+        return NFW(1e9, 24.6, Delta=200.)
+
+    def _knots(self, base, n=20):
+        return np.geomspace(1e-2, base.rh, n)
+
+    def test_unit_factor_reproduces_base(self, base):
+        # exact at the knots; between them M is the log-log PCHIP of the knot
+        # masses (the price of guaranteed monotone M(r) -- interpolating g and
+        # multiplying can dip between rising knots). Measured at 20 knots:
+        # M to 2.5e-4, rho to 4.2e-3, Vcirc to 1.3e-4.
+        from subhalo_functions import CorrectedHost
+        rk = self._knots(base)
+        h = CorrectedHost(base, rk, [0., 1.], np.ones((1, len(rk))))
+        assert np.allclose(h.M(rk), base.M(rk), rtol=1e-12)
+        r = np.geomspace(2e-2, 0.9 * base.rh, 40)
+        assert np.allclose(h.M(r), base.M(r), rtol=5e-4)
+        assert np.allclose(h.rho(r), base.rho(r), rtol=1e-2)
+        assert np.allclose(h.Vcirc(r), base.Vcirc(r), rtol=3e-4)
+        fR, _, fz = h.fgrav(r, 0.5 * r)
+        gR, _, gz = base.fgrav(r, 0.5 * r)
+        assert np.allclose(fR, gR, rtol=1e-3) and np.allclose(fz, gz, rtol=1e-3)
+        # Jeans sigma against the base's quad integral, away from grid edges
+        for rr in (0.05, 0.3, 2.0):
+            assert h.sigma(rr) == pytest.approx(float(base.sigma(rr)), rel=0.02)
+
+    def test_monotone_between_knots(self, base):
+        # the reason for the log-log form: a factor dropping steeply between
+        # rising knot masses must NOT produce a decreasing M(r) anywhere
+        from subhalo_functions import CorrectedHost
+        rk = self._knots(base)
+        g = np.ones((1, len(rk)))
+        # steepest bump the knot masses allow (adjacent M ratio ~ 1.9): g falls
+        # 1.8 -> 1 across one segment, knot masses still rise
+        g[0, 5] = 1.8
+        h = CorrectedHost(base, rk, [0., 1.], g)
+        r = np.geomspace(rk[0], rk[-1], 4000)
+        assert np.all(np.diff(h.M(r)) >= -1e-9 * h.M(r)[:-1])
+
+    def test_constant_factor_scales_mass(self, base):
+        from subhalo_functions import CorrectedHost
+        rk = self._knots(base)
+        h = CorrectedHost(base, rk, [0., 1.], np.full((1, len(rk)), 1.5))
+        r = np.geomspace(2e-2, 0.9 * base.rh, 20)
+        assert np.allclose(h.M(r), 1.5 * base.M(r), rtol=5e-4)
+        assert np.allclose(h.rho(r), 1.5 * base.rho(r), rtol=1e-2)
+
+    def test_set_time_selects_node(self, base):
+        from subhalo_functions import CorrectedHost
+        rk = self._knots(base)
+        g = np.vstack([np.ones(len(rk)), np.full(len(rk), 2.)])
+        h = CorrectedHost(base, rk, [0., 1., 2.], g)
+        r = 0.3
+        h.set_time(0.5)
+        m0 = float(h.M(r))
+        h.set_time(1.5)
+        assert float(h.M(r)) == pytest.approx(2. * m0, rel=1e-12)
+        h.set_time(-5.)   # clamps to first node
+        assert float(h.M(r)) == pytest.approx(m0, rel=1e-12)
+        h.set_time(99.)   # clamps to last node
+        assert float(h.M(r)) == pytest.approx(2. * m0, rel=1e-12)
+
+    def test_non_monotone_mass_raises(self, base):
+        from subhalo_functions import CorrectedHost
+        rk = self._knots(base)
+        g = np.ones((1, len(rk)))
+        g[0, 10:] = 0.05     # M(<r) would drop by 20x across one knot span
+        with pytest.raises(ValueError, match="decreases"):
+            CorrectedHost(base, rk, [0., 1.], g)
+
+    def test_rho_df_kappa(self, base):
+        from subhalo_functions import CorrectedHost
+        rk = self._knots(base)
+        f = 0.1
+        g = np.full((1, len(rk)), 1.2)           # correction 20% above base
+        h1 = CorrectedHost(base, rk, [0., 1.], g, f=f, kappa=1.)
+        h2 = CorrectedHost(base, rk, [0., 1.], g, f=f, kappa=2.)
+        r = 0.3
+        rho_s = (1. - f) * float(base.rho(r))
+        rho_c = float(h1.rho(r)) - rho_s
+        assert float(h1.rho_df(r)) == pytest.approx(float(h1.rho(r)), rel=1e-12)
+        assert float(h2.rho_df(r)) == pytest.approx(rho_s + 2. * rho_c, rel=1e-10)
+
+    def test_fdf_reads_rho_df(self, base):
+        # kappa = 2 must raise the drag by the clump component's share, through
+        # the public fDF path the engine uses
+        import profiles as pr
+        from subhalo_functions import CorrectedHost
+        rk = self._knots(base)
+        f, m = 0.1, 1e5
+        g = np.full((1, len(rk)), 1.2)
+        old = cfg.lnL_type, cfg.lnL_pref
+        cfg.lnL_type, cfg.lnL_pref = 6, 1.0
+        try:
+            xv = np.array([0.3, 0., 0., 0., 10., 0.])
+            a1 = pr.fDF(CorrectedHost(base, rk, [0., 1.], g, f=f, kappa=1.), xv, m)
+            a2 = pr.fDF(CorrectedHost(base, rk, [0., 1.], g, f=f, kappa=2.), xv, m)
+        finally:
+            cfg.lnL_type, cfg.lnL_pref = old
+        h = CorrectedHost(base, rk, [0., 1.], g, f=f, kappa=1.)
+        expect = float(h.rho_df(0.3) + (h.rho(0.3) - (1. - f) * base.rho(0.3))) \
+            / float(h.rho_df(0.3))
+        assert a2[1] / a1[1] == pytest.approx(expect, rel=1e-10)

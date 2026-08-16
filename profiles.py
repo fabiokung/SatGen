@@ -3777,8 +3777,12 @@ def fDF(potential,xv,m):
         Vrel = np.sqrt(VrelR**2.+Vrelphi**2.+Vrelz**2.)
         Vrel = max(Vrel,cfg.eps) # safety
         X = Vrel / (cfg.Root2 * p.sigma(R,z))
-        fac_s = p.rho(R,z) * (cfg.lnL_pref * lnL) * ( erf(X) - \
-            cfg.TwoOverRootPi*X*np.exp(-X**2.) ) / Vrel**3 
+        # a host may carry a drag background distinct from its total density
+        # (rho_df: equal-mass clump component entering with the Chandrasekhar
+        # (M + m_field)/M factor, see subhalo_functions.CorrectedHost)
+        rho_bg = p.rho_df(R,z) if hasattr(p,'rho_df') else p.rho(R,z)
+        fac_s = rho_bg * (cfg.lnL_pref * lnL) * ( erf(X) - \
+            cfg.TwoOverRootPi*X*np.exp(-X**2.) ) / Vrel**3
         #fac_s = 2.*fac_s # <<< test: enhance DF by a factor of 2
         #fac_s = 0.5*fac_s # <<< test: weaken DF by half
         sR += fac_s * VrelR 

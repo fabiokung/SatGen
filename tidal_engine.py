@@ -875,6 +875,13 @@ class _SubhaloRun:
             raise self._attach_state(err, span=True)
         self._heartbeat()
 
+        # a time-dependent host (CorrectedHost) advances on the subhalo's own clock;
+        # within the step the potential is static, so the integrator error control
+        # and the trial/reject corrector see one consistent field
+        set_time = getattr(self.potential, 'set_time', None)
+        if set_time is not None:
+            set_time(self.t)
+
         t_orb = tdyn(self.potential, self.r)
         dt_min = max(self.dt_abs, self.floor_orbit_frac * t_orb)
         dt, disrupted = self._predict_dt(t_orb, dt_min)

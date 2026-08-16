@@ -57,7 +57,9 @@ def _status(run, res, exc):
 
 def evolve_population(host, subhalos, tmax=10., tsnap=None,
                       dens_redges=None, dens_tedges=None, dens_kernels=None,
-                      hold_terminal=True, keep_results=False, **engine_kw):
+                      hold_terminal=True, keep_results=False, barriers=None,
+                      on_barrier=None, share_hist=True, checkpoint_fn=None,
+                      resume_state=None, **engine_kw):
     """Evolve a whole population of subhalos together in one host, each on its own
     adaptive timestep.
 
@@ -69,10 +71,30 @@ def evolve_population(host, subhalos, tmax=10., tsnap=None,
     Scheduling is a due-time queue: every subhalo carries its own clock, and the one
     furthest behind takes the next step. Total work is then the sum of the per-subhalo
     step counts, the same as evolving them separately -- a global minimum timestep would
-    instead cost N times the most demanding subhalo's count. Nothing couples the subhalos
-    yet, so this is numerically identical to N separate evolve_heating_revirial runs; the
-    queue exists so that a coupling term has one place to read the population's state
-    from, and so that the realization is the unit of work and of output.
+    instead cost N times the most demanding subhalo's count. Without a coupling this is
+    numerically identical to N separate evolve_heating_revirial runs; the queue exists so
+    that a coupling term has one place to read the population's state from, and so that
+    the realization is the unit of work and of output.
+
+    barriers/on_barrier is that coupling hook: at each barrier time every live subhalo is
+    brought to (or just past) the barrier before any starts a step beyond it, then
+    on_barrier(t_b, runs) runs -- the one place to read the whole population's state
+    (run.t, run.r, run.m, run.dens_hist) and swap run.potential for the next segment.
+    Steps are never truncated at a barrier (dt stays the subhalo's own), so with a no-op
+    callback the trajectories are identical to the unbarriered run.
+
+    share_hist=False keeps each subhalo's residence histogram on its own run (a
+    population whose members carry different abundance weights needs per-subhalo
+    residence); the returned 'dens_hist' is then their sum, and held tails are deposited
+    per run. The default shares one array across the population (one realization, no
+    weights).
+
+    checkpoint_fn(t_b, state) is called after each barrier's on_barrier; the state dict
+    (runs, excs, live, t_done), passed back as resume_state to a later call with the
+    same subhalos and parameters, continues from that barrier. The queue is rebuilt
+    from the run clocks at every segment boundary anyway, so a resumed run is identical
+    to an uninterrupted one. Serialization is the caller's (per-step kernels are
+    closures: strip run.dens_kernels before pickling, re-attach after).
 
     An exception from one subhalo terminates that subhalo, not the run: the residence and
     terminal state it carries are kept and it leaves the queue. A subhalo that froze or
@@ -80,19 +102,18 @@ def evolve_population(host, subhalos, tmax=10., tsnap=None,
     since it has stopped being integrated but has not left the host.
 
     Returns a dict: 'dens_hist'/'dens_hist_k' are the residence summed over the whole
-    population (the realization is the population, so no weights); 'tsnap' with
-    'r_snaps'/'m_snaps'/'v_snaps' (n_sub, n_snap) is the field over time; 'status',
-    'n_step', 't_last', 'r_last', 'm_final', 'vmax', 'rmax' are per subhalo. With
-    keep_results, 'results' carries every subhalo's full EvolutionResult -- affordable
-    for a few hundred subhalos, not for a large population.
+    population; 'tsnap' with 'r_snaps'/'m_snaps'/'v_snaps' (n_sub, n_snap) is the field
+    over time; 'status', 'n_step', 't_last', 'r_last', 'm_final', 'vmax', 'rmax' are per
+    subhalo. With keep_results, 'results' carries every subhalo's full EvolutionResult --
+    affordable for a few hundred subhalos, not for a large population.
     """
     subhalos = list(subhalos)
     n = len(subhalos)
     tsnap = np.asarray(dens_tedges if tsnap is None else tsnap, float)
     dens_on = dens_redges is not None and dens_tedges is not None
 
-    runs = []
-    for sub in subhalos:
+    runs = [] if resume_state is None else resume_state['runs']
+    for sub in (subhalos if resume_state is None else ()):
         kw = dict(engine_kw)
         kw.update({k: v for k, v in sub.items() if k not in ('prof', 'xv0')})
         runs.append(_SubhaloRun(
@@ -117,37 +138,67 @@ def evolve_population(host, subhalos, tmax=10., tsnap=None,
             raise TypeError(f"unknown engine parameters: {sorted(kw)}")
 
     # One shared residence histogram, written in place by every subhalo, so the
-    # realization total costs one array instead of n. Per-subhalo residence is not
-    # recoverable from it -- that is the output contract, not an oversight.
+    # realization total costs one array instead of n; per-subhalo residence is then not
+    # recoverable from it. share_hist=False leaves each run its own histogram (built by
+    # _SubhaloRun) and sums them at the end instead.
     if dens_on:
-        pop_hist = np.zeros((len(np.asarray(dens_redges)) - 1,
-                             len(np.asarray(dens_tedges)) - 1))
-        pop_hist_k = (np.zeros((len(dens_kernels),) + pop_hist.shape)
-                      if dens_kernels else None)
-        for run in runs:
-            run.dens_hist = pop_hist
-            run.dens_hist_k = pop_hist_k
+        if resume_state is not None and share_hist:
+            # one blob pickles the shared array once; the runs still reference it
+            pop_hist, pop_hist_k = runs[0].dens_hist, runs[0].dens_hist_k
+        else:
+            pop_hist = np.zeros((len(np.asarray(dens_redges)) - 1,
+                                 len(np.asarray(dens_tedges)) - 1))
+            pop_hist_k = (np.zeros((len(dens_kernels),) + pop_hist.shape)
+                          if dens_kernels else None)
+            if share_hist:
+                for run in runs:
+                    run.dens_hist = pop_hist
+                    run.dens_hist_k = pop_hist_k
     else:
         pop_hist = pop_hist_k = None
 
     # due-time queue: pop the subhalo furthest behind, advance it by its own step, push
-    # it back at its new time. One heap entry per live subhalo, never a stale one.
-    heap = [(run.t, i) for i, run in enumerate(runs)
-            if run.t < run.tmax - run.dt_abs]
-    heapq.heapify(heap)
-    excs = [None] * n
-    while heap:
-        _, i = heapq.heappop(heap)
-        run = runs[i]
-        try:
-            alive = run.step()
-        except (PericentreUnresolvedError, HeatingUnbindsError) as exc:
-            # this subhalo is done, the population is not: keep what it accumulated and
-            # drop it from the queue
-            excs[i] = exc
+    # it back at its new time. One heap entry per live subhalo, never a stale one. With
+    # barriers the queue drains one segment at a time; a subhalo whose accepted step
+    # lands past the barrier simply waits there for the next segment.
+    if resume_state is None:
+        excs = [None] * n
+        live = [run.t < run.tmax - run.dt_abs for run in runs]
+        t_done = -np.inf
+    else:
+        excs, live = resume_state['excs'], resume_state['live']
+        t_done = float(resume_state['t_done'])
+        assert len(runs) == n, "resume_state does not match subhalos"
+    edges = ([] if barriers is None
+             else sorted(float(b) for b in np.atleast_1d(barriers) if b < tmax))
+    for t_stop in edges + [np.inf]:
+        if t_stop <= t_done:
             continue
-        if alive and run.t < run.tmax - run.dt_abs:
-            heapq.heappush(heap, (run.t, i))
+        heap = [(runs[i].t, i) for i in range(n)
+                if live[i] and runs[i].t < t_stop]
+        heapq.heapify(heap)
+        while heap:
+            _, i = heapq.heappop(heap)
+            run = runs[i]
+            try:
+                alive = run.step()
+            except (PericentreUnresolvedError, HeatingUnbindsError) as exc:
+                # this subhalo is done, the population is not: keep what it accumulated
+                # and drop it from the queue
+                excs[i] = exc
+                live[i] = False
+                continue
+            if not alive or run.t >= run.tmax - run.dt_abs:
+                live[i] = False
+                continue
+            if run.t < t_stop:
+                heapq.heappush(heap, (run.t, i))
+        if np.isfinite(t_stop):
+            if on_barrier is not None:
+                on_barrier(t_stop, runs)
+            if checkpoint_fn is not None:
+                checkpoint_fn(t_stop, dict(runs=runs, excs=excs, live=live,
+                                           t_done=t_stop))
 
     out = dict(tsnap=tsnap, n_sub=n,
                status=np.empty(n, dtype=object), n_step=np.zeros(n, int),
@@ -196,9 +247,17 @@ def evolve_population(host, subhalos, tmax=10., tsnap=None,
         # a held subhalo stopped being integrated but is still in the host: keep it
         # depositing at its settled radius for the rest of the run
         if dens_on and hold_terminal and (held or exc is not None) and t_last < tsnap[-1]:
-            _hold_residence(pop_hist, np.asarray(dens_redges, float), tsnap,
-                            r_last, m_last, t_last, hist_k=pop_hist_k,
+            _hold_residence(run.dens_hist if not share_hist else pop_hist,
+                            np.asarray(dens_redges, float), tsnap,
+                            r_last, m_last, t_last,
+                            hist_k=run.dens_hist_k if not share_hist else pop_hist_k,
                             kernels=dens_kernels, v=v_last)
+
+    if dens_on and not share_hist:
+        for run in runs:
+            pop_hist += run.dens_hist
+            if pop_hist_k is not None:
+                pop_hist_k += run.dens_hist_k
 
     if results is not None:
         out['results'] = results
