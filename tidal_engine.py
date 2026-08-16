@@ -263,10 +263,24 @@ def _truncate_hard(newProfile, m_new):
     m_new = min(m_new, float(newProfile.M(newProfile.rh)))  # keep bisect bracket valid
     rmaxNew = brentq(lambda r_: float(newProfile.M(r_)) - m_new,
                      newProfile.ri[0], newProfile.rh, xtol=1e-8)
-    rvals_new = np.logspace(np.log10(max(cfg.Rres, float(newProfile.ri[0]))),
-                            np.log10(rmaxNew), len(newProfile.ri))
-    Mr_new = newProfile.M(rvals_new)
-    Mr_new[-1] = m_new  # heat_profile spline can land M(rmaxNew) slightly off m_new
+    r_lo = max(cfg.Rres, float(newProfile.ri[0]))
+    if rmaxNew <= r_lo * (1. + 1e-6):
+        # extreme stripping drives the bound extent onto the inner grid edge: a
+        # log grid over a ~zero-width span degenerates, and there is no
+        # resolvable remnant to rebuild. Same terminal semantics as heating
+        # unbinding the profile -- the engine attaches the evolution so far and
+        # the caller records the fate.
+        raise HeatingUnbindsError(
+            f"truncation collapses to the inner grid edge (rmaxNew="
+            f"{rmaxNew:.3g} <= r_lo={r_lo:.3g} kpc): no resolvable bound extent")
+    rvals_new = np.logspace(np.log10(r_lo), np.log10(rmaxNew), len(newProfile.ri))
+    # the spline M and the brentq root are two estimates of the same edge; on a
+    # deeply-stripped remnant the knot spacing can drop below brentq's absolute
+    # xtol, so pinning the endpoint alone can land it below its neighbour. Cap
+    # the whole array at m_new first (min with a constant keeps it
+    # non-decreasing at any scale), then pin.
+    Mr_new = np.minimum(np.asarray(newProfile.M(rvals_new), float), m_new)
+    Mr_new[-1] = m_new
     return NumericProfile(rvals_new, Mr_new)
 
 

@@ -1021,3 +1021,50 @@ def test_freeze_records_the_regime_test_it_ran(du24_setup):
     plain = _cb_run(du24_setup, freeze_strip=0.99, freeze_orbits=2, freeze_tdyn=1e9)
     assert plain.frozen is True
     assert np.isnan(plain.freeze_lt_lo) and np.isnan(plain.freeze_eta_rout)
+
+
+def test_truncate_hard_collapsed_extent_raises_heating_unbinds():
+    """Extreme stripping can drive the bound extent onto the inner grid edge (a
+    deep clump-field host does this); the reshape must surface the engine's
+    handled terminal, not a bare NumericProfile ValueError that kills a worker
+    with the residence lost."""
+    import config as cfg
+    from profiles import NFW
+    from subhalo_functions import HeatingUnbindsError, NumericProfile
+    from tidal_engine import _truncate_hard
+    old = cfg.Rres
+    cfg.Rres = 1e-6
+    try:
+        nfw = NFW(1e6, 20., Delta=200.)
+        ri = np.logspace(-5, np.log10(nfw.rh), 200)
+        prof = NumericProfile(ri, nfw.M(ri))
+        with pytest.raises(HeatingUnbindsError, match="inner grid edge"):
+            _truncate_hard(prof, float(prof.M(prof.ri[0])))
+    finally:
+        cfg.Rres = old
+
+
+def test_truncate_hard_endpoint_pin_stays_monotone_on_compressed_grid():
+    """On a deeply-stripped remnant the rebuild grid's knot spacing drops below
+    brentq's absolute xtol, so the endpoint pin Mr[-1] = m_new can land below
+    its neighbour and NumericProfile rejects the enclosed mass. The cap-then-pin
+    reconciliation must keep the array non-decreasing at any scale."""
+    import config as cfg
+    from profiles import NFW
+    from subhalo_functions import NumericProfile
+    from tidal_engine import _truncate_hard
+    old = cfg.Rres
+    cfg.Rres = 1e-7
+    try:
+        nfw = NFW(1e6, 20., Delta=200.)
+        # grid spanning [1, 2] * 1e-6 kpc: 200 knots, spacing ~3.5e-9 < xtol 1e-8.
+        # The fracs are measured failure points of the bare endpoint pin (225 of
+        # 600 scanned inputs fail it); a lucky frac passes un-patched.
+        ri = np.geomspace(1e-6, 2e-6, 200)
+        prof = NumericProfile(ri, nfw.M(ri))
+        for frac in (0.097, 0.105, 0.12, 0.136):
+            m_new = float(prof.M(ri[0] * (2e-6 / 1e-6)**frac))
+            out = _truncate_hard(prof, m_new)
+            assert np.all(np.diff(out.Mr) >= -1e-9 * out.Mr[:-1])
+    finally:
+        cfg.Rres = old
