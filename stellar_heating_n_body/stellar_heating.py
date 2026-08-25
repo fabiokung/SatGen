@@ -1,12 +1,14 @@
 import numba
+
 numba.config.DISABLE_JIT = False
-from numba import njit, prange
-import numpy as np
-from scipy.interpolate import CubicHermiteSpline, InterpolatedUnivariateSpline
 import time
-from tqdm import tqdm
+
+import numpy as np
+from numba import njit, prange
 from scipy.integrate import quad
+from scipy.interpolate import CubicHermiteSpline, InterpolatedUnivariateSpline
 from scipy.optimize import brentq
+from tqdm import tqdm
 
 _G_NB = np.float64(4.4985e-06)  # [kpc^3 Gyr^-2 Msun^-1]
 
@@ -140,25 +142,25 @@ class NFW(object):
 
         rho(R,z) = rho_crit * delta_char / [(r/r_s) * (1+r/r_s)^2]
                  = rho_0 / [(r/r_s) * (1+r/r_s)^2]
-    
-    in a cylindrical frame (R,phi,z), where 
-    
+
+    in a cylindrical frame (R,phi,z), where
+
         r = sqrt(R^2 + z^2)
         r_s: scale radius, at which d ln rho(r) / d ln(r) = -2
         rho_crit: critical density of the Universe
-        delta_char = Delta_halo / 3 * c^3 / f(c), where c = R_vir / r_s 
+        delta_char = Delta_halo / 3 * c^3 / f(c), where c = R_vir / r_s
             is the concentration parameter
-    
+
     Syntax:
-    
+
         halo = NFW(M,c,Delta=200.,z=0.,sf=1.)
-        
-    where 
-    
-        M: halo mass [M_sun], where halo is defined as spherical 
-            overdensity of Delta times critical density (float) 
+
+    where
+
+        M: halo mass [M_sun], where halo is defined as spherical
+            overdensity of Delta times critical density (float)
         c: halo concentration (float)
-        Delta: average overdensity of the halo, in multiples of the 
+        Delta: average overdensity of the halo, in multiples of the
             critical density of the Universe (float)
             (default 200.)
         z: redshift (float) (default 0.)
@@ -166,9 +168,9 @@ class NFW(object):
                 density of the halo while preserving its shape, used
                 when a disk is added in order to preserve total mass
                 of the system
-    
+
     Attributes:
-    
+
         .Mh: halo mass [M_sun]
         .ch: halo concentration
         .Deltah: spherical overdensity wrt instantaneous critical density
@@ -180,22 +182,22 @@ class NFW(object):
         .rmax: radius at which maximum circular velocity is reached [kpc]
         .Vmax: maximum circular velocity [kpc/Gyr]
         .s001: logarithmic density slope at 0.01 halo radius
-        
+
     Methods:
-    
+
         .rho(R,z=0.): density [M_sun kpc^-3] at radius r=sqrt(R^2+z^2)
         .s(R,z=0.): logarithmic density slope at radius r=sqrt(R^2+z^2)
         .M(R,z=0.): mass [M_sun] enclosed in radius r=sqrt(R^2+z^2)
-        .rhobar(R,z=0.): mean density [M_sun kpc^-3] within radius 
+        .rhobar(R,z=0.): mean density [M_sun kpc^-3] within radius
             r=sqrt(R^2+z^2)
         .tdyn(R,z=0.): dyn. time [Gyr] within radius r = sqrt(R^2+z^2)
         .Phi(R,z=0.): potential [(kpc/Gyr)^2] at radius r=sqrt(R^2+z^2)
-        .fgrav(R,z): grav. acceleration [(kpc/Gyr)^2 kpc^-1] at (R,z) 
+        .fgrav(R,z): grav. acceleration [(kpc/Gyr)^2 kpc^-1] at (R,z)
         .Vcirc(R,z=0.): circ. vel. [kpc/Gyr] at radius r=sqrt(R^2+z^2)
-        .sigma(R,z=0.): vel. disp. [kpc/Gyr] at radius r=sqrt(R^2+z^2)      
+        .sigma(R,z=0.): vel. disp. [kpc/Gyr] at radius r=sqrt(R^2+z^2)
         .d2Phidr2(R,z=0.): second radial derivative of potential [1/Gyr^2]
             at radius r=sqrt(R^2+r^2)
-    
+
     HISTORY: Arthur Fangzhou Jiang (2016-10-24, HUJI)
              Arthur Fangzhou Jiang (2016-10-30, HUJI)
              Arthur Fangzhou Jiang (2019-08-24, HUJI)
@@ -203,17 +205,17 @@ class NFW(object):
     def __init__(self,M,c,Delta=200.,z=0.,sf=1.):
         """
         Initialize NFW profile.
-        
+
         Syntax:
-        
+
             halo = NFW(M,c,Delta=200.,z=0.,sf=1.)
-        
+
         where
-        
-            M: halo mass [M_sun] (float), 
-            c: halo concentration (float),        
-            Delta: spherical overdensity with respect to the critical 
-                density of the universe (default is 200.)         
+
+            M: halo mass [M_sun] (float),
+            c: halo concentration (float),
+            Delta: spherical overdensity with respect to the critical
+                density of the universe (default is 200.)
             z: redshift (float)
             sf: Suppression factor used for reducing the overall
                 density of the halo while preserving its shape, used
@@ -221,7 +223,7 @@ class NFW(object):
                 of the system
         """
         # input attributes
-        self.Mh = M 
+        self.Mh = M
         self.ch = c
         self.Deltah = Delta
         self.z = z
@@ -240,87 +242,87 @@ class NFW(object):
     def f(self,x):
         """
         Auxiliary method for NFW profile: f(x) = ln(1+x) - x/(1+x)
-    
+
         Syntax:
-    
+
             .f(x)
-        
+
         where
-        
+
             x: dimensionless radius r/r_s (float or array)
         """
-        return np.log(1.+x) - x/(1.+x) 
+        return np.log(1.+x) - x/(1.+x)
     def rho(self,R,z=0.):
         """
-        Density [M_sun kpc^-3] at radius r = sqrt(R^2 + z^2). 
-            
+        Density [M_sun kpc^-3] at radius r = sqrt(R^2 + z^2).
+
         Syntax:
-        
+
             .rho(R,z=0.)
-        
+
         where
-        
+
             R: R-coordinate [kpc] (float or array)
             z: z-coordinate [kpc] (float or array)
-                (default=0., i.e., if z is not specified otherwise, the 
+                (default=0., i.e., if z is not specified otherwise, the
                 first argument R is also the halo-centric radius r)
         """
-        r = np.sqrt(R**2.+z**2.) 
+        r = np.sqrt(R**2.+z**2.)
         x = r / self.rs
         return self.rho0 / (x * (1.+x)**2.)
     def s(self,R,z=0.):
         """
-        Logarithmic density slope 
-            
-            - d ln rho / d ln r 
-        
-        at radius r = sqrt(R^2 + z^2). 
-        
+        Logarithmic density slope
+
+            - d ln rho / d ln r
+
+        at radius r = sqrt(R^2 + z^2).
+
         Syntax:
-        
+
             .s(R,z=0.)
 
         where
-        
+
             R: R-coordinate [kpc] (float or array)
             z: z-coordinate [kpc] (float or array)
-                (default=0., i.e., if z is not specified otherwise, the 
+                (default=0., i.e., if z is not specified otherwise, the
                 first argument R is also the halo-centric radius r)
         """
-        r = np.sqrt(R**2.+z**2.) 
+        r = np.sqrt(R**2.+z**2.)
         x = r / self.rs
         return 1. + 2*x / (1.+x)
     def M(self,R,z=0.):
         """
         Mass [M_sun] within radius r = sqrt(R^2 + z^2).
-            
+
         Syntax:
-        
+
             .M(R,z=0.)
-        
+
         where
-        
+
             R: R-coordinate [kpc] (float or array)
             z: z-coordinate [kpc] (float or array)
-                (default=0., i.e., if z is not specified otherwise, the 
-                first argument R is also the halo-centric radius r)       
+                (default=0., i.e., if z is not specified otherwise, the
+                first argument R is also the halo-centric radius r)
         """
         r = np.sqrt(R**2.+z**2.)
         x = r/self.rs
         return _FOUR_PI*self.rho0*self.rs**3. * self.f(x)
     def rhobar(self,R,z=0.):
         """
-        Average density [M_sun kpc^-3] within radius r = sqrt(R^2 + z^2). 
-            
+        Average density [M_sun kpc^-3] within radius r = sqrt(R^2 + z^2).
+
         Syntax:
-        
+
             .rhobar(R,z=0.)
-        
-        where 
+
+        where
             R: R-coordinate [kpc] (float or array)
             z: z-coordinate [kpc] (float or array)
-                (default=0., i.e., if z is not specified otherwise, the 
-                first argument R is also the halo-centric radius r)   
+                (default=0., i.e., if z is not specified otherwise, the
+                first argument R is also the halo-centric radius r)
         """
         r = np.sqrt(R**2.+z**2.)
         x = r/self.rs
@@ -330,29 +332,29 @@ class NFW(object):
         Dynamical time [Gyr] within radius r = sqrt(R^2 + z^2).
 
         Syntax:
-        
+
             .tdyn(R,z=0.)
-            
+
         where
             R: R-coordinate [kpc] (float or array)
             z: z-coordinate [kpc] (float or array)
-                (default=0., i.e., if z is not specified otherwise, the 
-                first argument R is also the halo-centric radius r)     
+                (default=0., i.e., if z is not specified otherwise, the
+                first argument R is also the halo-centric radius r)
         """
         return np.sqrt(_THREE_PI_OVER_16G / self.rhobar(R,z))
     def Phi(self,R,z=0.):
         """
         Potential [(kpc/Gyr)^2] at radius r = sqrt(R^2 + z^2).
-            
+
         Syntax:
-        
-            .Phi(R,z=0.)  
+
+            .Phi(R,z=0.)
 
         where
             R: R-coordinate [kpc] (float or array)
             z: z-coordinate [kpc] (float or array)
-                (default=0., i.e., if z is not specified otherwise, the 
-                first argument R is also the halo-centric radius r) 
+                (default=0., i.e., if z is not specified otherwise, the
+                first argument R is also the halo-centric radius r)
         """
         r = np.sqrt(R**2.+z**2.)
         x = r/self.rs
@@ -415,67 +417,67 @@ class NFW(object):
     def fgrav(self,R,z):
         """
         gravitational acceleration [(kpc/Gyr)^2 kpc^-1] at location (R,z)
-        
+
             [- d Phi(R,z) / d R, 0, - d Phi(R,z) / d z]
-        
+
         Syntax:
-            
+
             .fgrav(R,z)
-            
+
         where
             R: R-coordinate [kpc] (float or array)
             z: z-coordinate [kpc] (float or array)
-        
-        Note that unlike the other methods, where z is optional with a 
+
+        Note that unlike the other methods, where z is optional with a
         default of 0, here z must be specified.
-        
+
         Return:
-        
+
             R-component of gravitational acceleration
             phi-component of gravitational acceleration
             z-component of gravitational acceleration
         """
         r = np.sqrt(R**2.+z**2.)
-        x = r / self.rs   
+        x = r / self.rs
         fac = self.Phi0 * (self.f(x)/x) / r**2.
         return fac*R, fac*0., fac*z
     def Vcirc(self,R,z=0.):
         """
         Circular velocity [kpc/Gyr] at radius r = sqrt(R^2 + z^2).
-            
+
         Syntax:
-        
+
             .Vcirc(R,z=0.)
-            
+
         where
 
             R: R-coordinate [kpc] (float or array)
             z: z-coordinate [kpc] (float or array)
-                (default=0., i.e., if z is not specified otherwise, the 
-                first argument R is also the halo-centric radius r) 
+                (default=0., i.e., if z is not specified otherwise, the
+                first argument R is also the halo-centric radius r)
         """
         r = np.sqrt(R**2.+z**2.)
         return np.sqrt(r*-self.fgrav(r,0.)[0])
     def sigma(self,R,z=0.):
         """
-        Velocity dispersion [kpc/Gyr] at radius r = sqrt(R^2 + z^2), 
-        assuming isotropic velicity dispersion tensor, and following the 
+        Velocity dispersion [kpc/Gyr] at radius r = sqrt(R^2 + z^2),
+        assuming isotropic velicity dispersion tensor, and following the
         Zentner & Bullock (2003) fitting function:
-        
+
             sigma(x) = V_max 1.4393 x^0.345 / (1 + 1.1756 x^0.725)
-            
+
         where x = r/r_s.
-        
+
         Syntax:
-            
+
             .sigma(R,z=0.)
-        
+
         where
-        
+
             R: R-coordinate [kpc] (float or array)
             z: z-coordinate [kpc] (float or array)
-                (default=0., i.e., if z is not specified otherwise, the 
-                first argument R is also the halo-centric radius r) 
+                (default=0., i.e., if z is not specified otherwise, the
+                first argument R is also the halo-centric radius r)
         """
         r = np.sqrt(R**2.+z**2.)
         x = r / self.rs
@@ -483,17 +485,17 @@ class NFW(object):
     def sigma_accurate(self,R,z=0.,beta=0.):
         """
         Velocity dispersion [kpc/Gyr].
-        
+
         Syntax:
-            
+
             .sigma(R,z=0.)
-        
+
         where
-        
+
             R: R-coordinate [kpc] (float or array)
             z: z-coordinate [kpc] (float or array)
-                (default=0., i.e., if z is not specified otherwise, the 
-                first argument R is also the halo-centric radius r) 
+                (default=0., i.e., if z is not specified otherwise, the
+                first argument R is also the halo-centric radius r)
             beta: anisotropy parameter (default=0., i.e., isotropic)
         """
         r = np.sqrt(R**2.+z**2.)
@@ -527,19 +529,19 @@ class NFW(object):
         return (y1-y2)/(r1-r2)
     def d2Phidr2(self,R,z=0.):
         """
-        Second radial derivative of the gravitational potential [1/Gyr^2] 
+        Second radial derivative of the gravitational potential [1/Gyr^2]
         computed at r = sqrt(R^2 + z^2).
-            
+
         Syntax:
-        
+
             .d2Phidr2(R,z=0.)
-        
+
         where
-        
+
             R: R-coordinate [kpc] (float or array)
             z: z-coordinate [kpc] (float or array)
-                (default=0., i.e., if z is not specified otherwise, the 
-                first argument R is also the halo-centric radius r)       
+                (default=0., i.e., if z is not specified otherwise, the
+                first argument R is also the halo-centric radius r)
         """
         r = np.sqrt(R**2.+z**2.)
         x = r/self.rs
@@ -711,13 +713,15 @@ def _accel_cart_clumps_nb(pos, macho_cart, sub_Mh, sub_rs, sub_c, sub_alpha,
         x = pos[s, 0]; y = pos[s, 1]; z = pos[s, 2]
         r2 = x * x + y * y + z * z
         r  = r2 ** 0.5
-        if r < 1e-10:
+        if not (r > 1e-10):
             r = 1e-10
 
         # Host: log-linear interpolation of M_enc(r)
         log_r = np.log(r)
         t = (log_r - log_r_min) * inv_dlr
-        if t < 0.0:
+        # NaN fails every ordered comparison, so the guard must be positive: a star
+        # flung to a non-finite radius would otherwise reach int(t) and index garbage
+        if not (t >= 0.0):
             t = 0.0
         elif t > N_grid - 1 - 1e-12:
             t = N_grid - 1 - 1e-12
@@ -797,13 +801,15 @@ def _accel_cart_nb(pos, macho_cart, mMA, log_r_grid, M_enc_grid, softening_sq):
         x = pos[s, 0]; y = pos[s, 1]; z = pos[s, 2]
         r2 = x * x + y * y + z * z
         r  = r2 ** 0.5
-        if r < 1e-10:
+        if not (r > 1e-10):
             r = 1e-10
 
         # Host: log-linear interpolation of M_enc(r)
         log_r = np.log(r)
         t = (log_r - log_r_min) * inv_dlr
-        if t < 0.0:
+        # NaN fails every ordered comparison, so the guard must be positive: a star
+        # flung to a non-finite radius would otherwise reach int(t) and index garbage
+        if not (t >= 0.0):
             t = 0.0
         elif t > N_grid - 1 - 1e-12:
             t = N_grid - 1 - 1e-12
@@ -1315,6 +1321,431 @@ def stellar_simulation_clumps_nb(xvMACHO, posStar, velStar,
 
 
 @njit(parallel=True, cache=True)
+def _accel_cart_tabM_nb(pos, macho_cart, sub_Menc, log_d_grid,
+                         log_r_grid, M_enc_grid):
+    """Acceleration kernel reading each clump's enclosed mass off a table.
+
+    sub_Menc[j] is clump j's M(<d) on the shared log_d_grid at the current step, so a
+    clump of any profile -- Dekel, truncated NFW, a stripped remnant with no closed
+    form -- enters the same way. M(<d) -> 0 as d -> 0 for any physical clump, so the
+    force softens on the clump's own scale and needs no softening length.
+    """
+    N_stars = pos.shape[0]
+    N_macho = macho_cart.shape[0]
+    N_grid  = log_r_grid.shape[0]
+    N_d     = log_d_grid.shape[0]
+    log_r_min = log_r_grid[0]
+    inv_dlr   = (N_grid - 1) / (log_r_grid[N_grid - 1] - log_r_min)
+    log_d_min = log_d_grid[0]
+    inv_dld   = (N_d - 1) / (log_d_grid[N_d - 1] - log_d_min)
+    accel   = np.empty((N_stars, 3))
+
+    for s in prange(N_stars):
+        x = pos[s, 0]; y = pos[s, 1]; z = pos[s, 2]
+        r2 = x * x + y * y + z * z
+        r  = r2 ** 0.5
+        if not (r > 1e-10):
+            r = 1e-10
+
+        log_r = np.log(r)
+        t = (log_r - log_r_min) * inv_dlr
+        # NaN fails every ordered comparison, so the guard must be positive: a star
+        # flung to a non-finite radius would otherwise reach int(t) and index garbage
+        if not (t >= 0.0):
+            t = 0.0
+        elif t > N_grid - 1 - 1e-12:
+            t = N_grid - 1 - 1e-12
+        i0   = int(t)
+        frac = t - i0
+        M_r  = (1.0 - frac) * M_enc_grid[i0] + frac * M_enc_grid[i0 + 1]
+
+        fac_h = -_G_NB * M_r / (r2 * r)
+        ax = fac_h * x
+        ay = fac_h * y
+        az = fac_h * z
+
+        for j in range(N_macho):
+            if sub_Menc[j, N_d - 1] == 0.0:
+                continue
+            dx  = x - macho_cart[j, 0]
+            dy  = y - macho_cart[j, 1]
+            dz  = z - macho_cart[j, 2]
+            d2  = dx * dx + dy * dy + dz * dz
+            d   = d2 ** 0.5
+            if d < 1e-12:
+                continue
+            u = (np.log(d) - log_d_min) * inv_dld
+            if not (u > 0.0):
+                # inside the innermost tabulated radius: M ~ rho_0 d^3 would need the
+                # central density, so hold the first knot's mean density instead --
+                # still -> 0 linearly in d, and no clump carries mass this deep
+                M_sub = sub_Menc[j, 0] * (d / np.exp(log_d_min)) ** 3
+            elif u > N_d - 1 - 1e-12:
+                M_sub = sub_Menc[j, N_d - 1]
+            else:
+                k0 = int(u)
+                fd = u - k0
+                M_sub = (1.0 - fd) * sub_Menc[j, k0] + fd * sub_Menc[j, k0 + 1]
+            fac_m = -_G_NB * M_sub / (d2 * d)
+            ax += fac_m * dx
+            ay += fac_m * dy
+            az += fac_m * dz
+
+        accel[s, 0] = ax
+        accel[s, 1] = ay
+        accel[s, 2] = az
+
+    return accel
+
+
+@njit(parallel=True, cache=True)
+def _accel_cart_tabM_recoil_nb(pos, macho_cart, sub_Menc, log_d_grid,
+                                log_r_grid, M_enc_grid):
+    """Tabulated-M kernel in the HOST-CENTRED (accelerating) frame.
+
+    The host potential is pinned at the origin, so a star otherwise feels a clump's full
+    monopole pull while the host does not move. Physically the halo is pulled too, and
+    stars sitting in its well accelerate with it. Subtracting each clump's acceleration
+    AT THE ORIGIN adds the fictitious force of that frame and leaves the tidal residual,
+    which falls as r/d^3 instead of 1/d^2.
+
+    It matters only when a clump is a real fraction of the enclosed host mass: at
+    M_clump = 1e7 in this UFD the monopole is 3x the host's restoring pull at 2 pc while
+    the tidal residual is 6% of it -- a factor ~50 on the heating. For the 1e4 Msun
+    MACHOs this module was written for it is negligible.
+    """
+    N_stars = pos.shape[0]
+    N_macho = macho_cart.shape[0]
+    N_grid  = log_r_grid.shape[0]
+    N_d     = log_d_grid.shape[0]
+    log_r_min = log_r_grid[0]
+    inv_dlr   = (N_grid - 1) / (log_r_grid[N_grid - 1] - log_r_min)
+    log_d_min = log_d_grid[0]
+    inv_dld   = (N_d - 1) / (log_d_grid[N_d - 1] - log_d_min)
+    accel   = np.empty((N_stars, 3))
+
+    for s in prange(N_stars):
+        x = pos[s, 0]; y = pos[s, 1]; z = pos[s, 2]
+        r2 = x * x + y * y + z * z
+        r  = r2 ** 0.5
+        if not (r > 1e-10):
+            r = 1e-10
+
+        log_r = np.log(r)
+        t = (log_r - log_r_min) * inv_dlr
+        if not (t >= 0.0):
+            t = 0.0
+        elif t > N_grid - 1 - 1e-12:
+            t = N_grid - 1 - 1e-12
+        i0   = int(t)
+        frac = t - i0
+        M_r  = (1.0 - frac) * M_enc_grid[i0] + frac * M_enc_grid[i0 + 1]
+
+        fac_h = -_G_NB * M_r / (r2 * r)
+        ax = fac_h * x
+        ay = fac_h * y
+        az = fac_h * z
+
+        for j in range(N_macho):
+            if sub_Menc[j, N_d - 1] == 0.0:
+                continue
+            cx = macho_cart[j, 0]; cy = macho_cart[j, 1]; cz = macho_cart[j, 2]
+            dx = x - cx; dy = y - cy; dz = z - cz
+            d2 = dx * dx + dy * dy + dz * dz
+            d  = d2 ** 0.5
+            if d < 1e-12:
+                continue
+            u = (np.log(d) - log_d_min) * inv_dld
+            if not (u > 0.0):
+                M_sub = sub_Menc[j, 0] * (d / np.exp(log_d_min)) ** 3
+            elif u > N_d - 1 - 1e-12:
+                M_sub = sub_Menc[j, N_d - 1]
+            else:
+                k0 = int(u)
+                fd = u - k0
+                M_sub = (1.0 - fd) * sub_Menc[j, k0] + fd * sub_Menc[j, k0 + 1]
+            fac_m = -_G_NB * M_sub / (d2 * d)
+            ax += fac_m * dx
+            ay += fac_m * dy
+            az += fac_m * dz
+
+            # the same clump's pull ON THE HOST CENTRE, removed
+            d02 = cx * cx + cy * cy + cz * cz
+            d0  = d02 ** 0.5
+            if d0 < 1e-12:
+                continue
+            u0 = (np.log(d0) - log_d_min) * inv_dld
+            if not (u0 > 0.0):
+                M0 = sub_Menc[j, 0] * (d0 / np.exp(log_d_min)) ** 3
+            elif u0 > N_d - 1 - 1e-12:
+                M0 = sub_Menc[j, N_d - 1]
+            else:
+                k0 = int(u0)
+                f0 = u0 - k0
+                M0 = (1.0 - f0) * sub_Menc[j, k0] + f0 * sub_Menc[j, k0 + 1]
+            fac_0 = -_G_NB * M0 / (d02 * d0)
+            ax -= fac_0 * (-cx)
+            ay -= fac_0 * (-cy)
+            az -= fac_0 * (-cz)
+
+        accel[s, 0] = ax
+        accel[s, 1] = ay
+        accel[s, 2] = az
+
+    return accel
+
+
+@njit(cache=True)
+def _yoshida4_step_recoil_nb(pos_c, vel_c, macho_cart, sub_Menc, log_d_grid,
+                              log_r_grid, M_enc_grid, sub_dt, YC, YD, n_sub):
+    """n_sub Yoshida-4 sub-steps in the host-centred frame."""
+    for _ in range(n_sub):
+        pos_c = pos_c + YC[0] * vel_c * sub_dt
+        a = _accel_cart_tabM_recoil_nb(pos_c, macho_cart, sub_Menc, log_d_grid,
+                                       log_r_grid, M_enc_grid)
+        vel_c = vel_c + YD[0] * a * sub_dt
+        pos_c = pos_c + YC[1] * vel_c * sub_dt
+        a = _accel_cart_tabM_recoil_nb(pos_c, macho_cart, sub_Menc, log_d_grid,
+                                       log_r_grid, M_enc_grid)
+        vel_c = vel_c + YD[1] * a * sub_dt
+        pos_c = pos_c + YC[2] * vel_c * sub_dt
+        a = _accel_cart_tabM_recoil_nb(pos_c, macho_cart, sub_Menc, log_d_grid,
+                                       log_r_grid, M_enc_grid)
+        vel_c = vel_c + YD[2] * a * sub_dt
+        pos_c = pos_c + YC[3] * vel_c * sub_dt
+    return pos_c, vel_c
+
+
+@njit(cache=True)
+def _yoshida4_step_tabM_nb(pos_c, vel_c, macho_cart, sub_Menc, log_d_grid,
+                            log_r_grid, M_enc_grid, sub_dt, YC, YD, n_sub):
+    """n_sub Yoshida-4 sub-steps against tabulated clump M(<d)."""
+    for _ in range(n_sub):
+        pos_c = pos_c + YC[0] * vel_c * sub_dt
+        a     = _accel_cart_tabM_nb(pos_c, macho_cart, sub_Menc, log_d_grid,
+                                     log_r_grid, M_enc_grid)
+        vel_c = vel_c + YD[0] * a * sub_dt
+
+        pos_c = pos_c + YC[1] * vel_c * sub_dt
+        a     = _accel_cart_tabM_nb(pos_c, macho_cart, sub_Menc, log_d_grid,
+                                     log_r_grid, M_enc_grid)
+        vel_c = vel_c + YD[1] * a * sub_dt
+
+        pos_c = pos_c + YC[2] * vel_c * sub_dt
+        a     = _accel_cart_tabM_nb(pos_c, macho_cart, sub_Menc, log_d_grid,
+                                     log_r_grid, M_enc_grid)
+        vel_c = vel_c + YD[2] * a * sub_dt
+
+        pos_c = pos_c + YC[3] * vel_c * sub_dt
+    return pos_c, vel_c
+
+
+# The point-mass kernels (_accel_cart_nb, _accel_cart_sub_pointmass_nb) and the Dekel
+# one (_accel_cart_clumps_nb) are KEPT even though menc_from_profiles + the tabulated
+# kernel can express all three. They answer a different question -- point-like MACHOs
+# against extended clumps -- and the notebook compares the two on purpose. Do not fold
+# them into the tabulated path.
+
+
+def menc_from_profiles(profiles, log_d_grid=None, n_d=96, d_lo=1e-7, d_hi=3.0,
+                       m_bound=None):
+    """Tabulate M(<d) for a sequence of profile objects, one row each.
+
+    Takes anything exposing .M(r) -- SatGen's NumericProfile, Dekel, NFW, a stripped
+    remnant with no closed form at all. This is the boundary the njit kernels need: a
+    NumericProfile's M(r) is a lazily built scipy spline behind a Python object, and a
+    nopython kernel cannot call it, so the profile has to become an array somewhere.
+    Doing it here rather than in the caller means the drivers take profiles, not tables.
+
+    profiles may hold None for a clump that carries no mass (a disrupted remnant); that
+    row is zero and the kernels skip it. m_bound, if given, hard-truncates each row at
+    that clump's bound mass -- the 'hard' truncation the calibration was fit under.
+
+    Returns (sub_Menc, log_d_grid) with sub_Menc (n_sub, n_d).
+    """
+    if log_d_grid is None:
+        log_d_grid = np.linspace(np.log(d_lo), np.log(d_hi), n_d)
+    log_d_grid = np.ascontiguousarray(np.asarray(log_d_grid, dtype=np.float64))
+    d = np.exp(log_d_grid)
+    out = np.zeros((len(profiles), log_d_grid.size), dtype=np.float64)
+    for j, prof in enumerate(profiles):
+        if prof is None:
+            continue
+        M = np.asarray(prof.M(d), dtype=np.float64)
+        if m_bound is not None and np.isfinite(m_bound[j]):
+            M = np.minimum(M, float(m_bound[j]))
+        out[j] = M
+    return out, log_d_grid
+
+
+def _bound_mask(pos, vel, log_r_grid, Phi_grid):
+    """Stars bound to the host: E = v^2/2 + Phi(r) < 0, Phi from the same log grid the
+    force uses. Phi(inf) = 0 for NFW, so E < 0 is the escape test."""
+    r = np.maximum(np.linalg.norm(pos, axis=1), np.exp(log_r_grid[0]))
+    Phi = np.interp(np.log(r), log_r_grid, Phi_grid)
+    return 0.5 * np.sum(vel * vel, axis=1) + Phi < 0.0
+
+
+def stellar_simulation_tabM(xvMACHO, posStar, velStar, sub_Menc, log_d_grid,
+                             host, timesteps, r0i, t_Menc=None, n_substeps=None,
+                             Nsteps=None, safety=100.0, earlyStop=True,
+                             stop_at=None,
+                             t_alive=None, host_recoil=False):
+    """Yoshida-4 stellar N-body against clumps given as tabulated M(<d).
+
+    Same algorithm as stellar_simulation_clumps_nb; the clump force reads each clump's
+    enclosed mass off sub_Menc instead of evaluating a Dekel closed form, so an evolved
+    remnant with no analytic profile enters directly. Half-mass radii are reported over
+    the BOUND stars as well as over all of them -- R_0* today is a fit to the surviving
+    light profile, and under strong heating the two diverge.
+
+    Parameters
+    ----------
+    xvMACHO   : (N_sub, N_step+1, 6)         cylindrical [R,phi,z,VR,Vphi,Vz]
+    posStar   : (N_star, 3)                   initial star positions [kpc]
+    velStar   : (N_star, 3)                   initial star velocities [kpc/Gyr]
+    sub_Menc  : (N_sub, n_M, n_d)             clump M(<d) [Msun] on log_d_grid; a clump
+                                              with a zero outer value is skipped
+    t_Menc    : (n_M,) or None                times of sub_Menc; None means it shares
+                                              the trajectory grid. The profile evolves
+                                              on the stripping timescale, far slower
+                                              than the positions, so it gets its own
+                                              coarse grid and is read by interpolation
+    log_d_grid: (n_d,)                        log of the shared separation grid [kpc]
+    host      : profile with .M(r), .Phi(r)   background host potential
+    timesteps : (N_step,)                     output times [Gyr], excluding t=0
+    r0i       : float                         initial Plummer scale radius [kpc]
+    safety    : float                         omega_max * dt_sub < 1/safety
+    stop_at   : float or None                 halt once the BOUND r_half exceeds this
+                                              [kpc]; the exclusion test needs only
+                                              whether the threshold is crossed
+    t_alive   : (N_sub,) or None              time [Gyr] past which each clump stops
+                                              acting. Applied on the OUTER grid, not
+                                              folded into sub_Menc: a clump can die at
+                                              3.7e-5 Gyr, which the profile grid cannot
+                                              resolve, and interpolating it away over a
+                                              whole chunk overstates its int M dt by
+                                              orders of magnitude
+
+    Returns
+    -------
+    dict with R0star / r_half (bound, about the stars' own centroid), r_half_all (all
+    stars about the origin), r_offset (how far that centroid has moved), f_escaped,
+    xvList, timesteps
+    """
+    Nstars = len(posStar)
+    N_sub, N_ts = xvMACHO.shape[0], xvMACHO.shape[1]
+    sub_Menc   = np.asarray(sub_Menc, dtype=np.float64)
+    log_d_grid = np.ascontiguousarray(np.asarray(log_d_grid, dtype=np.float64))
+
+    t_knots_orig = np.concatenate([[0.], timesteps])
+    if Nsteps is not None and Nsteps > len(timesteps):
+        xvMACHO, timesteps = upsample(xvMACHO, timesteps, Nsteps)
+    Nsteps_actual = len(timesteps)
+    t_Menc = t_knots_orig if t_Menc is None else np.asarray(t_Menc, float)
+    # index of the M(<d) slice to read at each outer step, and its blend weight
+    tt = np.clip(np.concatenate([[0.], timesteps]), t_Menc[0], t_Menc[-1])
+    kM = np.clip(np.searchsorted(t_Menc, tt) - 1, 0, len(t_Menc) - 2)
+    wM = ((tt - t_Menc[kM]) / np.maximum(np.diff(t_Menc)[kM], 1e-300))[:, None]
+
+    R_m, phi_m, z_m = xvMACHO[:, :, 0], xvMACHO[:, :, 1], xvMACHO[:, :, 2]
+    macho_cart_all  = np.ascontiguousarray(
+        np.stack([R_m * np.cos(phi_m), R_m * np.sin(phi_m), z_m], axis=-1),
+        dtype=np.float64)
+
+    r_nb     = np.logspace(-6, 2, 1200, dtype=np.float64)
+    log_r_nb = np.ascontiguousarray(np.log(r_nb), dtype=np.float64)
+    M_enc_nb = np.ascontiguousarray(host.M(r_nb), dtype=np.float64)
+    Phi_nb   = np.ascontiguousarray(host.Phi(r_nb), dtype=np.float64)
+
+    t_alive = (np.full(N_sub, np.inf) if t_alive is None
+               else np.asarray(t_alive, float))
+    if t_alive.shape != (N_sub,):
+        raise ValueError(f"t_alive carries {t_alive.shape} entries for {N_sub} clumps")
+
+    dt_outer  = float(timesteps[0])
+    omega_max = np.sqrt(_G_NB * host.Mh / host.rs**3)
+    if n_substeps is None:
+        n_substeps = max(1, int(np.ceil(dt_outer * omega_max * safety)))
+    print(f'  omega_max = {omega_max:.1f} Gyr^-1   dt_outer = {1e3*dt_outer:.3f} Myr   '
+          f'n_substeps = {n_substeps}   force evals = {3*n_substeps*Nsteps_actual}')
+
+    pos_c = np.ascontiguousarray(posStar, dtype=np.float64)
+    vel_c = np.ascontiguousarray(velStar, dtype=np.float64)
+    YC_nb = np.ascontiguousarray(_YC, dtype=np.float64)
+    YD_nb = np.ascontiguousarray(_YD, dtype=np.float64)
+
+    r_half     = np.zeros(Nsteps_actual + 1)
+    r_half_all = np.zeros(Nsteps_actual + 1)
+    r_offset   = np.zeros(Nsteps_actual + 1)
+    f_esc      = np.zeros(Nsteps_actual + 1)
+    pos_hist   = np.empty((Nstars, Nsteps_actual + 1, 3))
+    vel_hist   = np.empty((Nstars, Nsteps_actual + 1, 3))
+
+    def record(i, p, v):
+        # r_half is measured about the STARS' OWN CENTROID, not the halo centre. A massive
+        # clump can drag the whole system bodily -- centroid offsets of 0.6 and 5.3 kpc
+        # were measured -- and an origin-relative radius reads that displacement as
+        # expansion. R0_TODAY = 24.73 pc is a fit to Segue 1's light profile about its own
+        # centre, so the centroid-relative radius is the quantity being compared to.
+        # The median, not the mean: escapers must not drag the centre.
+        b = _bound_mask(p, v, log_r_nb, Phi_nb)
+        sel = p[b] if b.any() else p
+        centre = np.median(sel, axis=0)
+        r_half_all[i] = np.percentile(np.linalg.norm(p, axis=1), 50)
+        r_half[i]     = np.percentile(np.linalg.norm(sel - centre[None, :], axis=1), 50)
+        r_offset[i]   = np.linalg.norm(centre)
+        f_esc[i]      = 1.0 - b.mean()
+        pos_hist[:, i, :], vel_hist[:, i, :] = p, v
+
+    record(0, pos_c, vel_c)
+    tprevious = 0.0
+    t1 = time.time()
+    for i, t in tqdm(enumerate(timesteps)):
+        sub_dt_i = np.float64((t - tprevious) / n_substeps)
+        mc_i = np.ascontiguousarray(macho_cart_all[:, i, :], dtype=np.float64)
+        Mi = ((1. - wM[i+1]) * sub_Menc[:, kM[i+1], :]
+              + wM[i+1] * sub_Menc[:, kM[i+1] + 1, :])
+        dead = t_alive <= t
+        if dead.any():
+            Mi = Mi.copy()
+            Mi[dead] = 0.
+        Mi = np.ascontiguousarray(Mi, dtype=np.float64)
+        step = _yoshida4_step_recoil_nb if host_recoil else _yoshida4_step_tabM_nb
+        pos_c, vel_c = step(pos_c, vel_c, mc_i, Mi, log_d_grid, log_r_nb, M_enc_nb,
+                            sub_dt_i, YC_nb, YD_nb, n_substeps)
+        tprevious = t
+        record(i + 1, pos_c, vel_c)
+        if stop_at is not None and r_half[i + 1] > stop_at:
+            r_half[i+2:], r_half_all[i+2:], f_esc[i+2:] = (
+                r_half[i+1], r_half_all[i+1], f_esc[i+1])
+            r_offset[i+2:] = r_offset[i+1]
+            pos_hist[:, i+2:, :] = pos_c[:, None, :]
+            vel_hist[:, i+2:, :] = vel_c[:, None, :]
+            break
+        if earlyStop and r_half[i + 1] > 50. * r0i:
+            r_half[i+2:], r_half_all[i+2:], f_esc[i+2:] = (
+                r_half[i+1], r_half_all[i+1], f_esc[i+1])
+            pos_hist[:, i+2:, :] = pos_c[:, None, :]
+            vel_hist[:, i+2:, :] = vel_c[:, None, :]
+            break
+    print(f'    time = {time.time() - t1:.2f} s   '
+          f'r_half {1e3*r_half[0]:.3f} -> {1e3*r_half[-1]:.3f} pc   '
+          f'f_escaped = {f_esc[-1]:.3f}')
+
+    x, y, z    = pos_hist[:, :, 0], pos_hist[:, :, 1], pos_hist[:, :, 2]
+    vx, vy, vz = vel_hist[:, :, 0], vel_hist[:, :, 1], vel_hist[:, :, 2]
+    R_h   = np.sqrt(x**2 + y**2)
+    xvList = np.stack([R_h, np.arctan2(y, x), z,
+                       (x * vx + y * vy) / np.maximum(R_h, 1e-10),
+                       (x * vy - y * vx) / np.maximum(R_h, 1e-10), vz], axis=-1)
+
+    return dict(R0star=r_half * _PLUMMER_R0_FROM_RHALF, r_half=r_half,
+                r_half_all=r_half_all, r_offset=r_offset, f_escaped=f_esc,
+                xvList=xvList, timesteps=timesteps)
+
+
+@njit(parallel=True, cache=True)
 def _accel_cart_sub_pointmass_nb(pos, macho_cart, sub_Mh,
                                   log_r_grid, M_enc_grid, softening_sq):
     """Acceleration kernel with per-subhalo point-mass forces.
@@ -1333,13 +1764,15 @@ def _accel_cart_sub_pointmass_nb(pos, macho_cart, sub_Mh,
         x = pos[s, 0]; y = pos[s, 1]; z = pos[s, 2]
         r2 = x * x + y * y + z * z
         r  = r2 ** 0.5
-        if r < 1e-10:
+        if not (r > 1e-10):
             r = 1e-10
 
         # Host: log-linear interpolation of M_enc(r)
         log_r = np.log(r)
         t = (log_r - log_r_min) * inv_dlr
-        if t < 0.0:
+        # NaN fails every ordered comparison, so the guard must be positive: a star
+        # flung to a non-finite radius would otherwise reach int(t) and index garbage
+        if not (t >= 0.0):
             t = 0.0
         elif t > N_grid - 1 - 1e-12:
             t = N_grid - 1 - 1e-12
