@@ -1398,124 +1398,6 @@ def _accel_cart_tabM_nb(pos, macho_cart, sub_Menc, log_d_grid,
     return accel
 
 
-@njit(parallel=True, cache=True)
-def _accel_cart_tabM_recoil_nb(pos, macho_cart, sub_Menc, log_d_grid,
-                                log_r_grid, M_enc_grid):
-    """Tabulated-M kernel in the HOST-CENTRED (accelerating) frame.
-
-    The host potential is pinned at the origin, so a star otherwise feels a clump's full
-    monopole pull while the host does not move. Physically the halo is pulled too, and
-    stars sitting in its well accelerate with it. Subtracting each clump's acceleration
-    AT THE ORIGIN adds the fictitious force of that frame and leaves the tidal residual,
-    which falls as r/d^3 instead of 1/d^2.
-
-    It matters only when a clump is a real fraction of the enclosed host mass: at
-    M_clump = 1e7 in this UFD the monopole is 3x the host's restoring pull at 2 pc while
-    the tidal residual is 6% of it -- a factor ~50 on the heating. For the 1e4 Msun
-    MACHOs this module was written for it is negligible.
-    """
-    N_stars = pos.shape[0]
-    N_macho = macho_cart.shape[0]
-    N_grid  = log_r_grid.shape[0]
-    N_d     = log_d_grid.shape[0]
-    log_r_min = log_r_grid[0]
-    inv_dlr   = (N_grid - 1) / (log_r_grid[N_grid - 1] - log_r_min)
-    log_d_min = log_d_grid[0]
-    inv_dld   = (N_d - 1) / (log_d_grid[N_d - 1] - log_d_min)
-    accel   = np.empty((N_stars, 3))
-
-    for s in prange(N_stars):
-        x = pos[s, 0]; y = pos[s, 1]; z = pos[s, 2]
-        r2 = x * x + y * y + z * z
-        r  = r2 ** 0.5
-        if not (r > 1e-10):
-            r = 1e-10
-
-        log_r = np.log(r)
-        t = (log_r - log_r_min) * inv_dlr
-        if not (t >= 0.0):
-            t = 0.0
-        elif t > N_grid - 1 - 1e-12:
-            t = N_grid - 1 - 1e-12
-        i0   = int(t)
-        frac = t - i0
-        M_r  = (1.0 - frac) * M_enc_grid[i0] + frac * M_enc_grid[i0 + 1]
-
-        fac_h = -_G_NB * M_r / (r2 * r)
-        ax = fac_h * x
-        ay = fac_h * y
-        az = fac_h * z
-
-        for j in range(N_macho):
-            if sub_Menc[j, N_d - 1] == 0.0:
-                continue
-            cx = macho_cart[j, 0]; cy = macho_cart[j, 1]; cz = macho_cart[j, 2]
-            dx = x - cx; dy = y - cy; dz = z - cz
-            d2 = dx * dx + dy * dy + dz * dz
-            d  = d2 ** 0.5
-            if d < 1e-12:
-                continue
-            u = (np.log(d) - log_d_min) * inv_dld
-            if not (u > 0.0):
-                M_sub = sub_Menc[j, 0] * (d / np.exp(log_d_min)) ** 3
-            elif u > N_d - 1 - 1e-12:
-                M_sub = sub_Menc[j, N_d - 1]
-            else:
-                k0 = int(u)
-                fd = u - k0
-                M_sub = (1.0 - fd) * sub_Menc[j, k0] + fd * sub_Menc[j, k0 + 1]
-            fac_m = -_G_NB * M_sub / (d2 * d)
-            ax += fac_m * dx
-            ay += fac_m * dy
-            az += fac_m * dz
-
-            # the same clump's pull ON THE HOST CENTRE, removed
-            d02 = cx * cx + cy * cy + cz * cz
-            d0  = d02 ** 0.5
-            if d0 < 1e-12:
-                continue
-            u0 = (np.log(d0) - log_d_min) * inv_dld
-            if not (u0 > 0.0):
-                M0 = sub_Menc[j, 0] * (d0 / np.exp(log_d_min)) ** 3
-            elif u0 > N_d - 1 - 1e-12:
-                M0 = sub_Menc[j, N_d - 1]
-            else:
-                k0 = int(u0)
-                f0 = u0 - k0
-                M0 = (1.0 - f0) * sub_Menc[j, k0] + f0 * sub_Menc[j, k0 + 1]
-            fac_0 = -_G_NB * M0 / (d02 * d0)
-            ax -= fac_0 * (-cx)
-            ay -= fac_0 * (-cy)
-            az -= fac_0 * (-cz)
-
-        accel[s, 0] = ax
-        accel[s, 1] = ay
-        accel[s, 2] = az
-
-    return accel
-
-
-@njit(cache=True)
-def _yoshida4_step_recoil_nb(pos_c, vel_c, macho_cart, sub_Menc, log_d_grid,
-                              log_r_grid, M_enc_grid, sub_dt, YC, YD, n_sub):
-    """n_sub Yoshida-4 sub-steps in the host-centred frame."""
-    for _ in range(n_sub):
-        pos_c = pos_c + YC[0] * vel_c * sub_dt
-        a = _accel_cart_tabM_recoil_nb(pos_c, macho_cart, sub_Menc, log_d_grid,
-                                       log_r_grid, M_enc_grid)
-        vel_c = vel_c + YD[0] * a * sub_dt
-        pos_c = pos_c + YC[1] * vel_c * sub_dt
-        a = _accel_cart_tabM_recoil_nb(pos_c, macho_cart, sub_Menc, log_d_grid,
-                                       log_r_grid, M_enc_grid)
-        vel_c = vel_c + YD[1] * a * sub_dt
-        pos_c = pos_c + YC[2] * vel_c * sub_dt
-        a = _accel_cart_tabM_recoil_nb(pos_c, macho_cart, sub_Menc, log_d_grid,
-                                       log_r_grid, M_enc_grid)
-        vel_c = vel_c + YD[2] * a * sub_dt
-        pos_c = pos_c + YC[3] * vel_c * sub_dt
-    return pos_c, vel_c
-
-
 @njit(cache=True)
 def _yoshida4_step_tabM_nb(pos_c, vel_c, macho_cart, sub_Menc, log_d_grid,
                             log_r_grid, M_enc_grid, sub_dt, YC, YD, n_sub):
@@ -1589,8 +1471,7 @@ def _bound_mask(pos, vel, log_r_grid, Phi_grid):
 def stellar_simulation_tabM(xvMACHO, posStar, velStar, sub_Menc, log_d_grid,
                              host, timesteps, r0i, t_Menc=None, n_substeps=None,
                              Nsteps=None, safety=100.0, earlyStop=True,
-                             stop_at=None,
-                             t_alive=None, host_recoil=False):
+                             stop_at=None, t_alive=None):
     """Yoshida-4 stellar N-body against clumps given as tabulated M(<d).
 
     Same algorithm as stellar_simulation_clumps_nb; the clump force reads each clump's
@@ -1711,9 +1592,9 @@ def stellar_simulation_tabM(xvMACHO, posStar, velStar, sub_Menc, log_d_grid,
             Mi = Mi.copy()
             Mi[dead] = 0.
         Mi = np.ascontiguousarray(Mi, dtype=np.float64)
-        step = _yoshida4_step_recoil_nb if host_recoil else _yoshida4_step_tabM_nb
-        pos_c, vel_c = step(pos_c, vel_c, mc_i, Mi, log_d_grid, log_r_nb, M_enc_nb,
-                            sub_dt_i, YC_nb, YD_nb, n_substeps)
+        pos_c, vel_c = _yoshida4_step_tabM_nb(
+            pos_c, vel_c, mc_i, Mi, log_d_grid, log_r_nb, M_enc_nb,
+            sub_dt_i, YC_nb, YD_nb, n_substeps)
         tprevious = t
         record(i + 1, pos_c, vel_c)
         if stop_at is not None and r_half[i + 1] > stop_at:
