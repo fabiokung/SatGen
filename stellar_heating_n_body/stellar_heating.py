@@ -552,20 +552,29 @@ class NFW(object):
 def Plummer(r, M, R0star):
     return 3. * M/(4.*np.pi * R0star**3)  / (1 + (r/R0star)**2)**(5/2)
 
-def sigmastar_Plummer(r, R0star, Mstar, profile):
+def sigmastar_Plummer(r, R0star, Mstar, profile, self_grav=False):
     """Radial velocity dispersion of Plummer stars in a Dehnen host potential.
 
     Solves the isotropic Jeans equation:
         sigma_r^2(r) = (1 / rho_*(r)) * int_r^inf rho_*(r') * G*M(r') / r'^2 dr'
     where rho_* is the Plummer profile and M(r) is from the Dehnen host.
+
+    self_grav adds the Plummer's own M(<r), matching stellar_simulation_tabM's
+    m_star_sg. The two go together: at R0star = 2 pc the stars are 22% of the enclosed
+    mass, so a sample drawn against the host alone is underbound and the system
+    contracts once it feels itself.
     """
     def integrand(rp):
-        return Plummer(rp, Mstar, R0star) * _G_NB * profile.M(rp) / rp**2
+        M = profile.M(rp)
+        if self_grav:
+            M = M + Mstar * (rp / R0star)**3 / (1. + (rp / R0star)**2)**1.5
+        return Plummer(rp, Mstar, R0star) * _G_NB * M / rp**2
     integral, _ = quad(integrand, r, np.inf, limit=80)
     rho_r = Plummer(r, Mstar, R0star)
     return np.sqrt(max(0.0, integral / rho_r)) if rho_r > 0.0 else 0.0
 
-def init_plummer(Mstar, R0star, profile, m_star=1.0, seed=None):
+def init_plummer(Mstar, R0star, profile, m_star=1.0, seed=None,
+                 self_grav=False):
     """
     Initialize N = Mstar / m_star stars following the Plummer profile.
 
@@ -585,6 +594,7 @@ def init_plummer(Mstar, R0star, profile, m_star=1.0, seed=None):
     profile : Dehnen/NFW   -- host potential used in sigmastar_Plummer
     m_star  : float        -- mass per particle [Msun]; default 1.0
     seed    : int or None  -- random seed
+    self_grav : bool       -- include the stars' own M(<r) in the Jeans solve
 
     Returns
     -------
@@ -609,7 +619,8 @@ def init_plummer(Mstar, R0star, profile, m_star=1.0, seed=None):
     ])
 
     # --- velocities: isotropic Gaussian with sigma = sigmastar_Plummer(r) ---
-    sigma = np.array([sigmastar_Plummer(ri, R0star, Mstar, profile) for ri in r])
+    sigma = np.array([sigmastar_Plummer(ri, R0star, Mstar, profile, self_grav)
+                      for ri in r])
     vel   = rng.normal(0.0, sigma[:, None], size=(N, 3))
 
     return pos, vel
