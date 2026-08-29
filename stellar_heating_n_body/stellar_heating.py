@@ -1322,13 +1322,18 @@ def stellar_simulation_clumps_nb(xvMACHO, posStar, velStar,
 
 @njit(parallel=True, cache=True)
 def _accel_cart_tabM_nb(pos, macho_cart, sub_Menc, log_d_grid,
-                         log_r_grid, M_enc_grid):
+                         log_r_grid, M_enc_grid, m_star_sg=0.0):
     """Acceleration kernel reading each clump's enclosed mass off a table.
 
     sub_Menc[j] is clump j's M(<d) on the shared log_d_grid at the current step, so a
     clump of any profile -- Dekel, truncated NFW, a stripped remnant with no closed
     form -- enters the same way. M(<d) -> 0 as d -> 0 for any physical clump, so the
     force softens on the clump's own scale and needs no softening length.
+
+    m_star_sg > 0 adds the stars' own enclosed mass to the host term: each star feels
+    m_star_sg times the number of stars inside its radius, read off the current radii
+    so it follows the stars as heating expands them. m_star_sg = 0.0 reproduces the
+    test-particle force exactly.
     """
     N_stars = pos.shape[0]
     N_macho = macho_cart.shape[0]
@@ -1339,6 +1344,15 @@ def _accel_cart_tabM_nb(pos, macho_cart, sub_Menc, log_d_grid,
     log_d_min = log_d_grid[0]
     inv_dld   = (N_d - 1) / (log_d_grid[N_d - 1] - log_d_min)
     accel   = np.empty((N_stars, 3))
+
+    rank = np.zeros(N_stars, dtype=np.int64)
+    if m_star_sg > 0.0:
+        r_all = np.empty(N_stars)
+        for s in range(N_stars):
+            r_all[s] = (pos[s, 0] ** 2 + pos[s, 1] ** 2 + pos[s, 2] ** 2) ** 0.5
+        order = np.argsort(r_all)
+        for k in range(N_stars):
+            rank[order[k]] = k
 
     for s in prange(N_stars):
         x = pos[s, 0]; y = pos[s, 1]; z = pos[s, 2]
@@ -1359,7 +1373,7 @@ def _accel_cart_tabM_nb(pos, macho_cart, sub_Menc, log_d_grid,
         frac = t - i0
         M_r  = (1.0 - frac) * M_enc_grid[i0] + frac * M_enc_grid[i0 + 1]
 
-        fac_h = -_G_NB * M_r / (r2 * r)
+        fac_h = -_G_NB * (M_r + m_star_sg * rank[s]) / (r2 * r)
         ax = fac_h * x
         ay = fac_h * y
         az = fac_h * z
@@ -1400,22 +1414,23 @@ def _accel_cart_tabM_nb(pos, macho_cart, sub_Menc, log_d_grid,
 
 @njit(cache=True)
 def _yoshida4_step_tabM_nb(pos_c, vel_c, macho_cart, sub_Menc, log_d_grid,
-                            log_r_grid, M_enc_grid, sub_dt, YC, YD, n_sub):
+                            log_r_grid, M_enc_grid, sub_dt, YC, YD, n_sub,
+                            m_star_sg=0.0):
     """n_sub Yoshida-4 sub-steps against tabulated clump M(<d)."""
     for _ in range(n_sub):
         pos_c = pos_c + YC[0] * vel_c * sub_dt
         a     = _accel_cart_tabM_nb(pos_c, macho_cart, sub_Menc, log_d_grid,
-                                     log_r_grid, M_enc_grid)
+                                     log_r_grid, M_enc_grid, m_star_sg)
         vel_c = vel_c + YD[0] * a * sub_dt
 
         pos_c = pos_c + YC[1] * vel_c * sub_dt
         a     = _accel_cart_tabM_nb(pos_c, macho_cart, sub_Menc, log_d_grid,
-                                     log_r_grid, M_enc_grid)
+                                     log_r_grid, M_enc_grid, m_star_sg)
         vel_c = vel_c + YD[1] * a * sub_dt
 
         pos_c = pos_c + YC[2] * vel_c * sub_dt
         a     = _accel_cart_tabM_nb(pos_c, macho_cart, sub_Menc, log_d_grid,
-                                     log_r_grid, M_enc_grid)
+                                     log_r_grid, M_enc_grid, m_star_sg)
         vel_c = vel_c + YD[2] * a * sub_dt
 
         pos_c = pos_c + YC[3] * vel_c * sub_dt
@@ -1471,7 +1486,7 @@ def _bound_mask(pos, vel, log_r_grid, Phi_grid):
 def stellar_simulation_tabM(xvMACHO, posStar, velStar, sub_Menc, log_d_grid,
                              host, timesteps, r0i, t_Menc=None, n_substeps=None,
                              Nsteps=None, safety=100.0, earlyStop=True,
-                             stop_at=None, t_alive=None):
+                             stop_at=None, t_alive=None, m_star_sg=0.0):
     """Yoshida-4 stellar N-body against clumps given as tabulated M(<d).
 
     Same algorithm as stellar_simulation_clumps_nb; the clump force reads each clump's
@@ -1507,6 +1522,15 @@ def stellar_simulation_tabM(xvMACHO, posStar, velStar, sub_Menc, log_d_grid,
                                               resolve, and interpolating it away over a
                                               whole chunk overstates its int M dt by
                                               orders of magnitude
+    m_star_sg : float                         per-star mass [Msun] for the stars' own
+                                              enclosed mass; 0.0 leaves them test
+                                              particles in the host + clump field. The
+                                              host M(<r) grid is tabulated once and
+                                              cannot carry it, since the stars expand as
+                                              they heat. Pairwise star-star forces are
+                                              deliberately absent: t_relax ~ 15 Myr
+                                              against a 12 Gyr run would dominate the
+                                              clump signal
 
     Returns
     -------
@@ -1594,7 +1618,7 @@ def stellar_simulation_tabM(xvMACHO, posStar, velStar, sub_Menc, log_d_grid,
         Mi = np.ascontiguousarray(Mi, dtype=np.float64)
         pos_c, vel_c = _yoshida4_step_tabM_nb(
             pos_c, vel_c, mc_i, Mi, log_d_grid, log_r_nb, M_enc_nb,
-            sub_dt_i, YC_nb, YD_nb, n_substeps)
+            sub_dt_i, YC_nb, YD_nb, n_substeps, m_star_sg)
         tprevious = t
         record(i + 1, pos_c, vel_c)
         if stop_at is not None and r_half[i + 1] > stop_at:
