@@ -159,8 +159,14 @@ class orbit(object):
             self.t = solver.t
             self.tList.append(self.t) 
             self.xvList.append(self.xv)
-        self.tArray = np.array(self.tList)
-        self.xvArray = np.array(self.xvList)
+    # built on access, not per integrate() call: the tidal engine steps the orbit
+    # one scalar t at a time, so rebuilding here costs O(n^2) over an evolution
+    @property
+    def tArray(self):
+        return np.array(self.tList)
+    @property
+    def xvArray(self):
+        return np.array(self.xvList)
 
 def f(t,y,p,m,sigmamx,Xd):
     r"""

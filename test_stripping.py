@@ -13,6 +13,7 @@ import config as cfg
 from profiles import NFW, Vcirc as standalone_Vcirc, tdyn as standalone_tdyn
 import stripping_common as sc
 import tidal_engine as te
+from orbit import orbit
 from subhalo_functions import NumericProfile, SIS, heat_profile, _log_pchip
 from tidal_engine import EvolutionResult
 
@@ -749,3 +750,33 @@ class TestLogPCHIP:
         assert np.all(np.isfinite(h.Mr))
         assert np.all(h.Mr >= 0.)
         assert np.all(np.diff(h.Mr) >= -1e-9 * h.Mh)
+
+
+class TestOrbitHistory:
+    """orbit.integrate accumulates the track in tList/xvList."""
+
+    def test_scalar_integrate_does_not_touch_history(self, host):
+        """The tidal engine advances the orbit one scalar t per step, so any
+        per-call pass over the accumulated lists is O(n^2) over an evolution.
+        A counting sequence makes the traversal visible without timing: np.array
+        indexes every element. Not a list subclass -- np.array reads a real list
+        through the C API and never calls the override."""
+        class Seq:
+            def __init__(self): self._d, self.gets = [], 0
+            def append(self, x): self._d.append(x)
+            def __len__(self): return len(self._d)
+            def __getitem__(self, i):
+                self.gets += 1
+                return self._d[i]
+
+        xv, _ = sc.make_orbit(host, R0=50., z0=0., eta=0.5)
+        o = orbit(xv)
+        o.tList, o.xvList = Seq(), Seq()
+        for _ in range(12):
+            o.integrate(o.t + 0.01, host)
+        assert o.tList.gets == 0 and o.xvList.gets == 0, (
+            f"integrate indexed the history {o.tList.gets}/{o.xvList.gets} times"
+        )
+        # the arrays still materialize on access
+        assert o.xvArray.shape == (12, 6)
+        assert o.tArray.shape == (12,)
