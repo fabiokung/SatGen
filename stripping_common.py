@@ -31,7 +31,8 @@ def make_orbit(host, R0=1., z0=0., phi0=0., VR0=0., Vz0=0., eta=1.):
 # NFW subhalo 1e9 Msun -- the gamma_subhalo=1 reference for the stripping study.
 DU24_MV_HOST, DU24_C_HOST = 1.0e12, 263.2 / 23.69   # rs=23.69, rvir=263.2 kpc (eqs.5-6)
 DU24_MV_SUB, DU24_C_SUB = 1.0e9, 26.32 / 1.279      # rs=1.279, rvir=26.32 kpc (eqs.11-12)
-DU24_ETA = {'1/5': 0.404, '1/20': 0.131}            # circularity -> R_p/R_a
+# make_orbit eta = v_phi/v_c(r0) at apocentre, not the DASH circularity L/L_c(E)
+DU24_ETA = {'1/5': 0.404, '1/20': 0.131}            # -> R_p/R_a
 
 # Du+24 set Mvir/rvir via the virial overdensity, NOT SatGen's default Delta=200.
 # Their host (eqs. 4-7) is rho0=3.797e6 Msun/kpc^3, rs=23.69, rvir=263.2, Mvir=1e12;
