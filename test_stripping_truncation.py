@@ -703,6 +703,39 @@ def test_revirial_unbind_carries_the_evolution_so_far(du24_setup, monkeypatch):
     assert 0. < err.r_lo <= err.r_hi
 
 
+def test_closing_flush_unbind_carries_the_evolution_so_far(du24_setup, monkeypatch):
+    """The closing re-virialization in finish() can unbind the profile too; that raise
+    must carry the run's residence and terminal state like one mid-run, or a caller
+    holding the clump reads t_last = 0 and an empty residence."""
+    from subhalo_functions import HeatingUnbindsError
+    hNFW, rvals, M_sub, xv0_20 = du24_setup
+    redges = np.logspace(np.log10(1e-3), np.log10(hNFW.rh), 20)
+    tedges = np.linspace(0., 12., 6)
+    revir, finish = te._revirialize, te._SubhaloRun.finish
+    flushing = []
+
+    def unbind_in_flush(*args, **kwargs):
+        if flushing:
+            raise HeatingUnbindsError("heating unbinds the profile")
+        return revir(*args, **kwargs)
+
+    def flag_finish(self):
+        flushing.append(True)
+        return finish(self)
+
+    monkeypatch.setattr(te, '_revirialize', unbind_in_flush)
+    monkeypatch.setattr(te._SubhaloRun, 'finish', flag_finish)
+    with pytest.raises(HeatingUnbindsError) as ei:
+        te.evolve_heating_revirial(
+            hNFW, NumericProfile(rvals, M_sub), xv0_20, tmax=12., step_frac=0.02,
+            epsh=0.0741, gamma=0., beta_h=0.278, alpha=3.93, t_dyn_mode='sub_lt',
+            truncation='hard', dens_redges=redges, dens_tedges=tedges)
+    err = ei.value
+    assert err.dens_hist is not None and err.dens_hist.sum() > 0.
+    assert err.t_last > 11. and err.r_last > 0.
+    assert cfg.Mres < err.m_last <= NumericProfile(rvals, M_sub).Mh
+
+
 def test_revirial_disruption_terminates_without_revirializing(du24_setup):
     """A subhalo stripped to the mass floor ends via early_terminate at m = Mres,
     with no final re-virialization -- a floored profile has no bound structure to

@@ -1204,9 +1204,12 @@ class _SubhaloRun:
         # disrupted (m at the floor) -- there is nothing to settle.
         if self.Q > 0. and self.m > cfg.Mres and self.t_list:
             lt_join = self.lt_min if np.isfinite(self.lt_min) else self.lt
-            self.ref, self.m, tally = _revirialize(
-                self.ref, self.Q, self.c2, self.m, lt_join,
-                self.truncation, self.tail_n, self.tail_xi)
+            try:
+                self.ref, self.m, tally = _revirialize(
+                    self.ref, self.Q, self.c2, self.m, lt_join,
+                    self.truncation, self.tail_n, self.tail_xi)
+            except HeatingUnbindsError as err:
+                raise self._attach_state(err, span=True)
             self.m_list[-1] = self.m
             self.vmax_list[-1], self.rmax_list[-1] = self.ref.Vmax, self.ref.rmax
             # the flushed final state is a re-virialized equilibrium
