@@ -1101,3 +1101,61 @@ def test_truncate_hard_endpoint_pin_stays_monotone_on_compressed_grid():
             assert np.all(np.diff(out.Mr) >= -1e-9 * out.Mr[:-1])
     finally:
         cfg.Rres = old
+
+
+def _ext_run(setup, ext_heat=None, tmax=4., **kw):
+    hNFW, rvals, M_sub, xv0_20 = setup
+    return te.evolve_heating_revirial(
+        hNFW, NumericProfile(rvals, M_sub), xv0_20, tmax=tmax, step_frac=0.02,
+        epsh=0.0741, gamma=0., beta_h=0.278, alpha=3.93, t_dyn_mode='sub_lt',
+        second_order=True, truncation='hard', ext_heat=ext_heat, **kw)
+
+
+def _same(a, b):
+    for f in ('t', 'r', 'm', 'vmax', 'rmax', 'lt', 'xv', 'apo'):
+        x, y = getattr(a, f), getattr(b, f)
+        assert x.shape == y.shape, f
+        assert ((x == y) | (np.isnan(x) & np.isnan(y))).all(), f
+
+
+def test_ext_heat_zero_source_is_bit_identical(du24_setup):
+    """A source that injects nothing takes the de_ext branches of the expansion and
+    the re-virialization; Q r^2 + 0 is the same float, so the run must not move."""
+    _same(_ext_run(du24_setup), _ext_run(du24_setup, lambda run, xv, r: 0. * run.r_ref))
+
+
+def test_ext_heat_r2_source_equals_the_same_rate_on_q(du24_setup, monkeypatch):
+    """E_ext = c r^2 per unit time is a constant extra dQ/dt = c on the same ledger: the
+    second-order term is taken on the sum in both, so the tracks agree to rounding."""
+    c = 2e3   # kpc^2/Gyr^3 per kpc^2, comparable to the tidal rate on this orbit
+    ext = _ext_run(du24_setup, lambda run, xv, r: c * run.r_ref**2)
+    tide = _ext_run(du24_setup)
+    heat = te._SubhaloRun._heat
+
+    def heat_plus(self, xv, r_new, t_orb, dt):
+        Q, tt, hr = heat(self, xv, r_new, t_orb, dt)
+        return Q + c * dt, tt, hr
+    monkeypatch.setattr(te._SubhaloRun, '_heat', heat_plus)
+    ref = _ext_run(du24_setup)
+    assert ext.t.size == ref.t.size
+    assert np.array_equal(ext.apo, ref.apo)
+    assert np.allclose(ext.m, ref.m, rtol=1e-8, atol=0.)
+    assert np.allclose(ext.r, ref.r, rtol=1e-8, atol=0.)
+    # and it is not the tide alone
+    assert ext.m[-1] < 0.99 * tide.m[-1]
+
+
+def test_ext_heat_ledger_records_what_was_injected(du24_setup):
+    """A uniform rate e per unit mass on every shell: each re-virialization applies e
+    times the elapsed time times the reference mass, and the tide's share is recorded
+    alongside."""
+    e = 2.
+    res = _ext_run(du24_setup, lambda run, xv, r: np.full(run.r_ref.size, e), tmax=8.)
+    t_rv, E = res.heat_ext[:, 0], res.heat_ext[:, 1]
+    assert E.size >= 2 and np.all(res.heat_host[:, 1] > 0.)
+    dt = np.diff(np.concatenate(([0.], t_rv)))
+    # reference mass at each re-virialization is the previous equilibrium's
+    m_ref = E / (e * dt)
+    assert np.isclose(m_ref[0], du24_setup[2][-1], rtol=1e-12)
+    assert np.all(np.diff(m_ref) <= 0.)
+    assert res.heat_host is not None and _ext_run(du24_setup, tmax=1.).heat_ext is None

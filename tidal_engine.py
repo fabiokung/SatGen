@@ -119,6 +119,10 @@ class EvolutionResult:
     # and the eta * (bound extent) it is compared against
     freeze_lt_lo: float = np.nan
     freeze_eta_rout: float = np.nan
+    # with an ext_heat source: (time, first-order energy [Msun kpc^2/Gyr^2]) applied at
+    # each re-virialization from the tide and from the source, (n_revir, 2)
+    heat_host: Optional[np.ndarray] = None
+    heat_ext: Optional[np.ndarray] = None
 
 
 def _dens_accumulate(hist, redges, tedges, r, m, tmid, dt,
@@ -564,15 +568,18 @@ class _ExpandedProfile:
     per-step tidal radius sees this-orbit's partial expansion consistently: outer
     shells whose injected energy exceeds their binding energy are unbound (a
     contiguous outer block), not retained, and crossings are clamped identically.
-    Shell energy Delta_eps(r) = Q r^2 + c2 sqrt(Q r^2 sigma_r^2(r)).
+    Shell energy Delta_eps(r) = Q r^2 + c2 sqrt(Q r^2 sigma_r^2(r)). de_ext, an extra
+    first-order energy per shell on r_ref, adds to Q r^2 inside the square root.
 
     Raises HeatingUnbindsError when the expansion leaves <=2 bound shells: the
     accumulated heating disrupts the profile, so there is no tidal radius to find.
     """
     __slots__ = ('rh', '_r', '_M', '_mint')
 
-    def __init__(self, r_ref, M_ref, sig2_ref, Q, c2, tally=None):
+    def __init__(self, r_ref, M_ref, sig2_ref, Q, c2, tally=None, de_ext=None):
         de = Q * r_ref**2
+        if de_ext is not None:
+            de = de + de_ext
         if c2:
             de = de + c2 * np.sqrt(np.maximum(de * sig2_ref, 0.))
         r_bound, M_bound = _expand_shells(r_ref, M_ref, de, tally=tally)
@@ -614,12 +621,24 @@ def _reference_arrays(prof, c2):
     return r_ref, M_ref, np.asarray(sig2, float)
 
 
-def _revirialize(ref, Q, c2, m, lt_join, truncation, tail_n, tail_xi):
+def _revirialize(ref, Q, c2, m, lt_join, truncation, tail_n, tail_xi, de_ext=None):
     """Expand the frozen reference by the accumulated heating (Q, 1st+2nd order) in
     one shell mapping, then reshape to bound mass m. Returns (profile, m). The join
-    for the tail sits at the orbit's deepest tidal radius (lt_join)."""
+    for the tail sits at the orbit's deepest tidal radius (lt_join). de_ext is an
+    extra first-order energy per shell on ref.ri, added to Q r^2 before the
+    second-order term."""
     def eps_fn(rr, Q=Q, c2=c2, rh=ref.rh, sig2=ref._sig2):
         rr = np.asarray(rr, float)
+        if de_ext is not None:
+            # interpolated as de_ext / r^2 in log r, which is smooth for any tide-like
+            # source (exact for de_ext ~ r^2); held at the edge past ref.rh, where no
+            # shell carries mass
+            x = np.interp(np.log(rr), np.log(ref.ri), de_ext / ref.ri**2)
+            de = Q * rr**2 + x * rr**2
+            if c2:
+                s2 = np.where(rr <= rh, np.maximum(sig2(rr), 0.), 0.)
+                de = de + c2 * np.sqrt(np.maximum(de * s2, 0.))
+            return de
         de = Q * rr**2
         if c2:
             s2 = np.where(rr <= rh, np.maximum(sig2(rr), 0.), 0.)
@@ -701,7 +720,7 @@ def evolve_heating_revirial(host, numProfile0, xv0, tmax=10.,
                             freeze_strip=None, freeze_orbits=20,
                             freeze_tdyn=None, freeze_nstep=None,
                             freeze_rspan=0.5, freeze_mfrac=None,
-                            freeze_tsink=None, log_every=None):
+                            freeze_tsink=None, log_every=None, ext_heat=None):
     """Re-virialization-cadence forward model (Pullen+14/Du+24, impulse).
 
     Heating and stripping run on their own cadences:
@@ -744,6 +763,15 @@ def evolve_heating_revirial(host, numProfile0, xv0, tmax=10.,
     leave it off wherever disruption or mass-function statistics matter.
 
     log_every (seconds) prints a periodic heartbeat of the orbital state.
+
+    ext_heat(run, xv, r) is an optional external heating source (e.g. encounters with
+    other subhalos): the first-order energy rate per unit mass [kpc^2/Gyr^3] on each
+    frozen reference radius run.r_ref, for the trial state xv at orbital radius r. It is
+    trapezoid-integrated per step next to the tidal Q and enters the same ledger,
+    Delta_eps_1(r) = Q r^2 + E_ext(r), with the second-order term taken on the sum. The
+    trial steps see it, so the strip corrector and re-virialization handle it unchanged.
+    res.heat_host / res.heat_ext then carry the first-order energy [Msun kpc^2/Gyr^2]
+    each re-virialization applied from the tide and from ext_heat.
     """
     run = _SubhaloRun(host, numProfile0, xv0, tmax, step_frac, dt_growth_max,
                       strip_number_max, floor_orbit_frac, dt_abs_frac, max_steps,
@@ -752,7 +780,8 @@ def evolve_heating_revirial(host, numProfile0, xv0, tmax=10.,
                       lt_choice, label, early_terminate, dynamical_friction,
                       r_stop, dens_redges, dens_tedges, dens_kernels,
                       freeze_strip, freeze_orbits, freeze_tdyn, freeze_nstep,
-                      freeze_rspan, freeze_mfrac, freeze_tsink, log_every)
+                      freeze_rspan, freeze_mfrac, freeze_tsink, log_every,
+                      ext_heat=ext_heat)
     while run.t < run.tmax - run.dt_abs:
         if not run.step():
             break
@@ -778,7 +807,7 @@ class _SubhaloRun:
                  lt_choice, label, early_terminate, dynamical_friction,
                  r_stop, dens_redges, dens_tedges, dens_kernels,
                  freeze_strip, freeze_orbits, freeze_tdyn, freeze_nstep,
-                 freeze_rspan, freeze_mfrac, freeze_tsink, log_every):
+                 freeze_rspan, freeze_mfrac, freeze_tsink, log_every, ext_heat=None):
         if label is None:
             label = ('1st+2nd order heating (revirial)' if second_order
                      else '1st order heating (revirial)')
@@ -811,6 +840,14 @@ class _SubhaloRun:
         self.Q = 0.
         self.tt_int = np.zeros((3, 3))
         self.hr_prev = None
+        # external heating ledger on r_ref (off when ext_heat is None): the accumulated
+        # energy per shell, the last accepted rate, and the trial pair _accept_step
+        # leaves for step() to commit
+        self.ext_heat = ext_heat
+        self.E_ext = np.zeros_like(self.r_ref) if ext_heat is not None else None
+        self.er_prev = None
+        self._ext_trial = (self.E_ext, None)
+        self.heat_host_list, self.heat_ext_list = [], []
         self.lt_min = np.inf
         self.lt = cfg.Rres
         self.r_p1 = self.r_p2 = None  # apocenter detector (r local max)
@@ -896,6 +933,8 @@ class _SubhaloRun:
             # radial span over the streak
             self.r_lo, self.r_hi = min(self.r_lo, r_new), max(self.r_hi, r_new)
         self.Q, self.tt_int, self.hr_prev = heat
+        if self.ext_heat is not None:
+            self.E_ext, self.er_prev = self._ext_trial
         self._deposit(r_new, xv_step, dt)
 
         if disrupted:
@@ -949,7 +988,7 @@ class _SubhaloRun:
         if self.r > cfg.Rres and self.m > cfg.Mres:
             try:
                 exp = _ExpandedProfile(self.r_ref, self.M_ref, self.sig2_ref,
-                                       self.Q, self.c2)
+                                       self.Q, self.c2, de_ext=self.E_ext)
                 T_strip, _, _ = _t_strip(exp, self.potential, self.o.xv,
                                          self.lt_choice, self.t_dyn_mode, t_orb)
             except HeatingUnbindsError:
@@ -973,6 +1012,7 @@ class _SubhaloRun:
         expand = {}
         t0, xv0_step = self.o.t, self.o.xv.copy()
         while True:
+            self._ext_trial = (self.E_ext, self.er_prev)
             self.o.t, self.o.xv = t0, xv0_step.copy()
             self.o.integrate(self.t + dt, self.potential,
                              self.m if self.dynamical_friction else None)
@@ -981,6 +1021,8 @@ class _SubhaloRun:
             if r_new <= cfg.Rres or (self.r_stop is not None and r_new < self.r_stop):
                 return dt, r_new, xv, (Q, tt_int, hr), strip, expand, disrupted
             Q, tt_int, hr = self._heat(xv, r_new, t_orb, dt)
+            if self.ext_heat is not None:
+                self._ext_trial = self._heat_ext(xv, r_new, dt)
 
             if self.m <= cfg.Mres or disrupted:
                 strip = 0., cfg.Rres, 0.
@@ -1023,6 +1065,13 @@ class _SubhaloRun:
         dQ = 0.5 * ((tidalHR if self.hr_prev is None else self.hr_prev) + tidalHR) * dt
         return max(self.Q + dQ, 0.), tt_int, tidalHR
 
+    def _heat_ext(self, xv, r_new, dt):
+        """Pending external heating for a trial step, trapezoid-integrated like Q.
+        Returns (E_ext, rate) on r_ref; committed only if the step is accepted."""
+        rate = np.maximum(np.asarray(self.ext_heat(self, xv, r_new), float), 0.)
+        prev = rate if self.er_prev is None else self.er_prev
+        return self.E_ext + 0.5 * (prev + rate) * dt, rate
+
     def _strip_rate(self, xv, Q, t_orb, dt):
         """King62 strip number for a trial step, with the tidal radius read off the
         ANALYTICALLY expanded profile -- this orbit's partial expansion at the trial
@@ -1031,7 +1080,7 @@ class _SubhaloRun:
         tally = {}
         try:
             exp = _ExpandedProfile(self.r_ref, self.M_ref, self.sig2_ref, Q, self.c2,
-                                   tally=tally)
+                                   tally=tally, de_ext=self._ext_trial[0])
         except HeatingUnbindsError:
             return None, tally
         T_strip, lt, M_at_lt = _t_strip(exp, self.potential, xv, self.lt_choice,
@@ -1059,7 +1108,11 @@ class _SubhaloRun:
                and self.r_p1 > self.r_p2 and self.r_p1 > r_new)
         due = apo or (self.t - self.t_last_revir >= self.revir_fallback
                       * tdyn(self.potential, self.r_apo_ref))
-        return due and self.Q > 0. and self.m > cfg.Mres
+        return due and self._pending() and self.m > cfg.Mres
+
+    def _pending(self):
+        """Heating accumulated since the last re-virialization."""
+        return self.Q > 0. or (self.E_ext is not None and bool(np.any(self.E_ext > 0.)))
 
     def _apply_heating(self, r_new):
         """Re-virialize: apply the heating accumulated since the last apocenter in one
@@ -1067,10 +1120,11 @@ class _SubhaloRun:
         expansion's clamp tally. The freeze tests run on this cadence, so a settled
         clump costs one check per orbit rather than one per step."""
         lt_join = self.lt_min if np.isfinite(self.lt_min) else self.lt
+        self._ledger()
         try:
             self.ref, self.m, tally = _revirialize(
                 self.ref, self.Q, self.c2, self.m, lt_join,
-                self.truncation, self.tail_n, self.tail_xi)
+                self.truncation, self.tail_n, self.tail_xi, de_ext=self.E_ext)
         except HeatingUnbindsError as err:
             # the accumulated heating unbinds the profile at re-virialization. The engine
             # still raises -- the profile has no tidal radius past this point -- but
@@ -1080,6 +1134,9 @@ class _SubhaloRun:
         self.omega_p = self.ref.omega_p
         self.cur_vmax, self.cur_rmax = self.ref.Vmax, self.ref.rmax
         self.Q, self.tt_int, self.hr_prev = 0., np.zeros((3, 3)), None
+        if self.ext_heat is not None:
+            self.E_ext, self.er_prev = np.zeros_like(self.r_ref), None
+            self._ext_trial = (self.E_ext, None)
         self.lt_min = np.inf
         self.t_last_revir = self.t
         # relative-mass-floor freeze: below the floor the remnant's remaining
@@ -1090,6 +1147,16 @@ class _SubhaloRun:
         if self.cb_on:
             self._update_breaker(r_new)
         return tally
+
+    def _ledger(self):
+        """With ext_heat on, record the first-order energy [Msun kpc^2/Gyr^2] about to
+        be applied from the tide (Q r^2) and from the external source, summed over the
+        reference shells."""
+        if self.ext_heat is None:
+            return
+        dM = np.diff(np.concatenate(([0.], self.M_ref)))
+        self.heat_host_list.append((self.t, float(np.sum(self.Q * self.r_ref**2 * dM))))
+        self.heat_ext_list.append((self.t, float(np.sum(self.E_ext * dM))))
 
     def _update_breaker(self, r_new):
         """Circuit breaker, one check per re-virialization: freeze only a genuinely
@@ -1202,12 +1269,13 @@ class _SubhaloRun:
         # apocenter structure. If the run ends mid-orbit this is the equilibrium the
         # subhalo relaxes toward (settling takes ~a dynamical time). Skipped once
         # disrupted (m at the floor) -- there is nothing to settle.
-        if self.Q > 0. and self.m > cfg.Mres and self.t_list:
+        if self._pending() and self.m > cfg.Mres and self.t_list:
             lt_join = self.lt_min if np.isfinite(self.lt_min) else self.lt
+            self._ledger()
             try:
                 self.ref, self.m, tally = _revirialize(
                     self.ref, self.Q, self.c2, self.m, lt_join,
-                    self.truncation, self.tail_n, self.tail_xi)
+                    self.truncation, self.tail_n, self.tail_xi, de_ext=self.E_ext)
             except HeatingUnbindsError as err:
                 raise self._attach_state(err, span=True)
             self.m_list[-1] = self.m
@@ -1262,4 +1330,8 @@ class _SubhaloRun:
             freeze_t_sink=self.cb_t_sink,
             freeze_lt_lo=self.cb_lt_lo,
             freeze_eta_rout=self.cb_eta_rout,
+            heat_host=(np.asarray(self.heat_host_list).reshape(-1, 2)
+                       if self.ext_heat is not None else None),
+            heat_ext=(np.asarray(self.heat_ext_list).reshape(-1, 2)
+                      if self.ext_heat is not None else None),
         )
